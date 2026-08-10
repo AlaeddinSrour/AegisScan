@@ -39,8 +39,11 @@ jobs:
             exit 1
           fi
 
+      - name: Create isolated build environment
+        run: python -m venv .build-venv
+
       - name: Build application
-        run: PYTHON_BIN=python ./scripts/build_macos_app.sh
+        run: PYTHON_BIN=.build-venv/bin/python ./scripts/build_macos_app.sh
 
       - name: Apply deterministic ad-hoc signature
         run: codesign --force --deep --sign - dist/AegisScan.app
