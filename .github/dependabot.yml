@@ -8,6 +8,12 @@ updates:
       python-dependencies:
         patterns:
           - "*"
+    ignore:
+      # Newer releases no longer publish Intel macOS wheels. Keep the latest
+      # universal2 generation while AegisScan ships x86_64 builds.
+      - dependency-name: cryptography
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: github-actions
     directory: /
