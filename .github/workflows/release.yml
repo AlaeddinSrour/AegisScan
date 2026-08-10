@@ -42,6 +42,9 @@ jobs:
       - name: Build application
         run: PYTHON_BIN=python ./scripts/build_macos_app.sh
 
+      - name: Apply deterministic ad-hoc signature
+        run: codesign --force --deep --sign - dist/AegisScan.app
+
       - name: Verify bundle
         shell: bash
         run: |
@@ -50,10 +53,21 @@ jobs:
           actual_arch="$(lipo -archs "$executable")"
           bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/AegisScan.app/Contents/Info.plist)"
 
-          test "$actual_arch" = "$TARGET_ARCH"
-          test "$bundle_version" = "$release_version"
+          echo "Expected architecture: $TARGET_ARCH"
+          echo "Actual architecture:   $actual_arch"
+          echo "Expected version:      $release_version"
+          echo "Bundle version:        $bundle_version"
+
+          if [[ "$actual_arch" != "$TARGET_ARCH" ]]; then
+            echo "Built executable architecture does not match the release asset name" >&2
+            exit 1
+          fi
+          if [[ "$bundle_version" != "$release_version" ]]; then
+            echo "Bundle version does not match the release tag" >&2
+            exit 1
+          fi
           "$executable" --self-test
-          codesign --verify --deep --strict dist/AegisScan.app
+          codesign --verify --deep --strict --verbose=2 dist/AegisScan.app
 
       - name: Package release asset
         shell: bash
