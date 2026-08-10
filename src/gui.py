@@ -360,12 +360,12 @@ class ScanStage(QFrame):
 
 
 def elevate(widget: QWidget, blur: int = 28, opacity: int = 85) -> None:
-    # DESIGN.md uses color-block elevation and reserves shadows for rare hover states.
+    # The interface uses color-block elevation and reserves shadows for rare hover states.
     return
 
 
 class HeroPanel(QFrame):
-    """Warm editorial hero surface from the DESIGN.md component system."""
+    """Warm editorial hero surface for the dashboard."""
 
     def __init__(self) -> None:
         super().__init__()

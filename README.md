@@ -118,8 +118,6 @@ status `2`, preventing automation from treating incomplete triage as success.
 - **Integrations** — optional GitHub pull-request publishing.
 - **Settings** — AI and audit defaults.
 
-The interface follows the component and visual rules in [`DESIGN.md`](DESIGN.md).
-
 ## Scope overrides
 
 Add repository-relative glob patterns to `.aegisscanignore` in the repository
