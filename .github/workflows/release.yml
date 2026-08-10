@@ -45,7 +45,7 @@ jobs:
       - name: Apply deterministic ad-hoc signature
         run: codesign --force --deep --sign - dist/AegisScan.app
 
-      - name: Verify bundle
+      - name: Verify architecture and version
         shell: bash
         run: |
           executable="dist/AegisScan.app/Contents/MacOS/AegisScan"
@@ -66,8 +66,12 @@ jobs:
             echo "Bundle version does not match the release tag" >&2
             exit 1
           fi
-          "$executable" --self-test
-          codesign --verify --deep --strict --verbose=2 dist/AegisScan.app
+
+      - name: Verify code signature
+        run: codesign --verify --deep --strict --verbose=2 dist/AegisScan.app
+
+      - name: Run packaged self-test
+        run: dist/AegisScan.app/Contents/MacOS/AegisScan --self-test
 
       - name: Package release asset
         shell: bash
