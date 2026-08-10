@@ -71,7 +71,17 @@ jobs:
         run: codesign --verify --deep --strict --verbose=2 dist/AegisScan.app
 
       - name: Run packaged self-test
-        run: dist/AegisScan.app/Contents/MacOS/AegisScan --self-test
+        shell: bash
+        run: |
+          set +e
+          QT_QPA_PLATFORM=offscreen dist/AegisScan.app/Contents/MacOS/AegisScan --self-test 2>&1 | tee self-test.log
+          result=${PIPESTATUS[0]}
+          set -e
+          if [[ "$result" -ne 0 ]]; then
+            message="$(tr '\n' ' ' < self-test.log | cut -c 1-1000)"
+            echo "::error title=Packaged self-test failed::$message"
+            exit "$result"
+          fi
 
       - name: Package release asset
         shell: bash
