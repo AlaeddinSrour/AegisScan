@@ -78,7 +78,9 @@ jobs:
           result=${PIPESTATUS[0]}
           set -e
           if [[ "$result" -ne 0 ]]; then
-            message="$(tr '\n' ' ' < self-test.log | cut -c 1-1000)"
+            # GitHub annotations are compact, so retain the exception at the
+            # end of the traceback instead of its less useful import preamble.
+            message="$(tail -c 3500 self-test.log | tr '\n' ' ')"
             echo "::error title=Packaged self-test failed::$message"
             exit "$result"
           fi
