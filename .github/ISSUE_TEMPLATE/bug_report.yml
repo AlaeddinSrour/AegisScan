@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible AegisScan problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove API keys, tokens, private source,
+        and other secrets from logs before submitting them.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open...
+        2. Configure...
+        3. Run...
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 14.8
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Required when running from source; enter N/A for a bundled app.
+      placeholder: Python 3.13.2
+  - type: textarea
+    id: log
+    attributes:
+      label: Sanitized audit log
+      description: Never include Gemini API keys, GitHub tokens, or private source code.
+      render: text

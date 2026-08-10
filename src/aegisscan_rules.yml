@@ -1,0 +1,48 @@
+rules:
+  - id: aegisscan.javascript.express-sequelize-taint-sqli
+    message: Express request data reaches a Sequelize raw-query sink without parameter binding.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.body.$FIELD
+          - pattern: $REQ.query.$FIELD
+          - pattern: $REQ.params.$FIELD
+          - pattern: $REQ.headers.$FIELD
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.query($QUERY, ...)
+              - pattern: $DB.query($QUERY)
+              - pattern: $DB.execute($QUERY, ...)
+              - pattern: $DB.execute($QUERY)
+          - focus-metavariable: $QUERY
+    metadata:
+      confidence: HIGH
+      category: security
+      technology: [express, sequelize]
+
+  - id: aegisscan.javascript.hardcoded-private-key
+    message: A private key is embedded directly in runtime source and must be rotated.
+    languages: [javascript, typescript]
+    severity: ERROR
+    pattern-regex: '(?i)(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:\s*:\s*[^=]+)?\s*=\s*[\x27\x22`][^\n]*(?:BEGIN[ _-]?(?:RSA[ _-]?)?PRIVATE[ _-]?KEY)'
+    metadata:
+      confidence: HIGH
+      category: secrets
+
+  - id: aegisscan.javascript.hardcoded-hmac-key
+    message: A literal HMAC key is embedded directly in runtime source and must be rotated.
+    languages: [javascript, typescript]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: $CRYPTO.createHmac($ALG, $KEY, ...)
+          - pattern: $CRYPTO.createHmac($ALG, $KEY)
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: '[\x27\x22`][A-Za-z0-9_+/=.:-]{16,}[\x27\x22`]'
+    metadata:
+      confidence: HIGH
+      category: secrets
