@@ -1,0 +1,107 @@
+name: Release macOS builds
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use vMAJOR.MINOR.PATCH format" >&2
+            exit 1
+          fi
+
+      - name: Build application
+        run: PYTHON_BIN=python ./scripts/build_macos_app.sh
+
+      - name: Verify bundle
+        shell: bash
+        run: |
+          executable="dist/AegisScan.app/Contents/MacOS/AegisScan"
+          release_version="${GITHUB_REF_NAME#v}"
+          actual_arch="$(lipo -archs "$executable")"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/AegisScan.app/Contents/Info.plist)"
+
+          test "$actual_arch" = "$TARGET_ARCH"
+          test "$bundle_version" = "$release_version"
+          "$executable" --self-test
+          codesign --verify --deep --strict dist/AegisScan.app
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          asset="AegisScan-${release_version}-macos-${TARGET_ARCH}.zip"
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent dist/AegisScan.app "release/$asset"
+          cd release
+          shasum -a 256 "$asset" > "$asset.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AegisScan-${{ matrix.arch }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_NOTES: |
+        Native Intel and Apple Silicon beta builds of AegisScan.
+
+        Requirements:
+        - macOS 12 or newer
+        - Semgrep available on the system
+        - A Gemini API key
+
+        These beta bundles are ad-hoc signed and are not Apple-notarized. Findings and generated fixes require human review.
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Publish release assets
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "AegisScan ${release_version} Beta" \
+            --notes "$RELEASE_NOTES" \
+            --prerelease \
+            --verify-tag

@@ -196,6 +196,14 @@ The build script installs development dependencies and creates
 public binary distribution requires the maintainer's Apple Developer ID signing
 and notarization workflow.
 
+### GitHub prereleases
+
+Pushing a semantic version tag such as `v0.1.0` runs
+`.github/workflows/release.yml`. GitHub builds separate native bundles on
+`macos-15-intel` and `macos-15`, verifies their actual `x86_64` and `arm64`
+architectures, and publishes both ZIP files plus SHA-256 checksums as a GitHub
+prerelease. The automated bundles are ad-hoc signed and not Apple-notarized.
+
 ## Development
 
 ```bash
