@@ -5,7 +5,7 @@
 Local-first macOS security auditing with repository-wide Semgrep discovery,
 bounded Gemini triage, an explicit evidence ledger, and guarded remediation.
 
-> **Project status:** Version 0.1.0 beta. AegisScan is suitable for evaluation and
+> **Project status:** Version 0.1.1 beta. AegisScan is suitable for evaluation and
 > development workflows, but findings and generated fixes still require human
 > review before production use.
 

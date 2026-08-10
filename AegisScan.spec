@@ -37,11 +37,12 @@ coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=True, name="AegisScan"
 app = BUNDLE(
     coll,
     name="AegisScan.app",
+    icon="assets/AegisScan.icns",
     bundle_identifier="com.aegisscan.desktop",
     info_plist={
         "CFBundleDisplayName": "AegisScan",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "1",
+        "CFBundleShortVersionString": "0.1.1",
+        "CFBundleVersion": "2",
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,
     },

@@ -55,11 +55,13 @@ jobs:
           release_version="${GITHUB_REF_NAME#v}"
           actual_arch="$(lipo -archs "$executable")"
           bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/AegisScan.app/Contents/Info.plist)"
+          bundle_icon="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' dist/AegisScan.app/Contents/Info.plist)"
 
           echo "Expected architecture: $TARGET_ARCH"
           echo "Actual architecture:   $actual_arch"
           echo "Expected version:      $release_version"
           echo "Bundle version:        $bundle_version"
+          echo "Bundle icon:           $bundle_icon"
 
           if [[ "$actual_arch" != "$TARGET_ARCH" ]]; then
             echo "Built executable architecture does not match the release asset name" >&2
@@ -67,6 +69,10 @@ jobs:
           fi
           if [[ "$bundle_version" != "$release_version" ]]; then
             echo "Bundle version does not match the release tag" >&2
+            exit 1
+          fi
+          if [[ "$bundle_icon" != "AegisScan.icns" ]] || [[ ! -f "dist/AegisScan.app/Contents/Resources/$bundle_icon" ]]; then
+            echo "AegisScan application icon is missing from the bundle" >&2
             exit 1
           fi
 
