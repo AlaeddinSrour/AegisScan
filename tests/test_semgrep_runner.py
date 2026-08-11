@@ -33,6 +33,27 @@ def test_no_results_returns_empty():
         assert str(_aegisscan_rules_path()) in command
         assert mock_run.call_args.kwargs["env"]["SEMGREP_SEND_METRICS"] == "off"
 
+
+def test_custom_exclusions_and_target_limit_are_forwarded():
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"results": []}),
+            stderr="",
+        )
+
+        run_semgrep_scan(
+            "/repo",
+            exclude_patterns=["vendor", "generated/**"],
+            max_target_bytes=2_500_000,
+        )
+
+    command = mock_run.call_args.args[0]
+    assert command.count("--exclude") == 2
+    assert command[command.index("--max-target-bytes") + 1] == "2500000"
+    assert "vendor" in command
+    assert "generated/**" in command
+
 def test_diff_aware_filtering_skips_unmodified_files():
     with patch('subprocess.run') as mock_run:
         mock_result = MagicMock()

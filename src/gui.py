@@ -64,6 +64,7 @@ from . import __version__
 from .full_scan import ScanOutcome, run_full_scan
 from .github_ops import apply_auto_fixes_with_paths, auto_fix_eligibility
 from .models import FindingDisposition, ReviewIssue
+from .semgrep_runner import DEFAULT_EXCLUDES
 
 
 APP_STYLE = """
@@ -661,6 +662,10 @@ class ScanWorker(QObject):
                 create_pull_request=bool(self.options["create_pull_request"]),
                 github_token=str(self.options["github_token"]),
                 repository=str(self.options["repository"]),
+                dependency_scan=bool(self.options["dependency_scan"]),
+                secret_scan=bool(self.options["secret_scan"]),
+                exclude_patterns=list(self.options["exclude_patterns"]),
+                max_target_bytes=int(self.options["max_target_bytes"]),
                 progress=self.progress.emit,
             )
             self.completed.emit(outcome)
@@ -906,7 +911,7 @@ class DashboardPage(QWidget):
         posture_header = QHBoxLayout()
         posture_header.addWidget(label("Protection stack", "SectionTitle"))
         posture_header.addStretch()
-        self.stack_count = label("4 / 4", "Good")
+        self.stack_count = label("7 / 7", "Good")
         posture_header.addWidget(self.stack_count)
         posture_layout.addLayout(posture_header)
         self.stack_description = label("All deterministic controls operational.", "Muted")
@@ -914,8 +919,13 @@ class DashboardPage(QWidget):
         posture_layout.addSpacing(6)
         self.engine_status = label("✓  Semgrep completeness enforced", "Good")
         posture_layout.addWidget(self.engine_status)
+        self.dependency_status = label("✓  OSV dependency scan completed", "Good")
+        posture_layout.addWidget(self.dependency_status)
+        self.secret_status = label("✓  Redacted current/history secret scan completed", "Good")
+        posture_layout.addWidget(self.secret_status)
         posture_layout.addWidget(label("✓  Every candidate receives a disposition", "Good"))
         posture_layout.addWidget(label("✓  Runtime scope classification active", "Good"))
+        posture_layout.addWidget(label("✓  Evidence-backed confirmation gate", "Good"))
         posture_layout.addWidget(label("✓  Manual-remediation safety gate", "Good"))
         posture_layout.addSpacing(5)
         self.coverage = QProgressBar()
@@ -946,26 +956,64 @@ class DashboardPage(QWidget):
         score = 100
         for issue in outcome.report.issues:
             score -= {"CRITICAL": 24, "HIGH": 12, "WARNING": 4, "INFO": 1}[issue.severity]
-        if outcome.ai_triage_degraded:
+        if outcome.audit_degraded:
             self.security_ring.set_unknown("INCOMPLETE")
-            self.engine_status.setText("!  Gemini triage incomplete; manual review required")
+            self.engine_status.setText("!  Audit coverage incomplete; review detector warnings")
             self.engine_status.setStyleSheet("color: #c64545; font-weight: 500;")
-            self.stack_count.setText("3 / 4")
+            completed_controls = 7 - len(outcome.detector_errors)
+            if outcome.ai_triage_degraded:
+                completed_controls -= 1
+            self.stack_count.setText(f"{max(0, completed_controls)} / 7")
             self.stack_count.setStyleSheet("color: #c64545; font-weight: 500;")
             self.stack_description.setText(
-                "Deterministic scanning completed, but AI triage did not cover every batch."
+                "At least one enabled detector or AI triage stage did not complete."
             )
             completed = outcome.ai_successful_batches
             attempted = outcome.ai_attempted_batches
             self.coverage.setValue(round(100 * completed / attempted) if attempted else 100)
         else:
             self.security_ring.set_score(max(0, score), "POSTURE")
-            self.engine_status.setText("✓  Semgrep completeness enforced")
+            self.engine_status.setText("✓  All enabled audit detectors completed")
             self.engine_status.setStyleSheet("")
-            self.stack_count.setText("4 / 4")
+            disabled_controls = sum(
+                (
+                    not outcome.dependency_scan_enabled,
+                    not outcome.secret_scan_enabled,
+                )
+            )
+            self.stack_count.setText(f"{7 - disabled_controls} / 7")
             self.stack_count.setStyleSheet("")
-            self.stack_description.setText("All deterministic controls operational.")
+            self.stack_description.setText(
+                "All enabled controls operational."
+                if disabled_controls
+                else "All deterministic controls operational."
+            )
             self.coverage.setValue(100)
+        self.dependency_status.setText(
+            (
+                "!  OSV dependency scan incomplete"
+                if "osv" in outcome.detector_errors
+                else "✓  OSV dependency scan completed"
+                if outcome.dependency_scan_enabled
+                else "–  OSV dependency scan disabled"
+            )
+        )
+        self.secret_status.setText(
+            (
+                "!  Secret scan incomplete"
+                if "gitleaks" in outcome.detector_errors
+                else "✓  Redacted current/history secret scan completed"
+                if outcome.secret_scan_enabled
+                else "–  Secret scan disabled"
+            )
+        )
+        for status, failed in (
+            (self.dependency_status, "osv" in outcome.detector_errors),
+            (self.secret_status, "gitleaks" in outcome.detector_errors),
+        ):
+            status.setStyleSheet(
+                "color: #c64545; font-weight: 500;" if failed else ""
+            )
 
 
 class NewScanPage(QWidget):
@@ -1031,11 +1079,38 @@ class NewScanPage(QWidget):
         option_right = QVBoxLayout()
         option_right.addWidget(label("Audit mode", "Muted"))
         mode = QComboBox()
-        mode.addItems(["Full repository · Semgrep + AI", "Semgrep triage only"])
+        mode.addItems(["Full repository · SAST + dependencies + secrets", "Custom detector set"])
         mode.model().item(1).setEnabled(False)
         option_right.addWidget(mode)
         options_row.addLayout(option_right, 1)
         config_layout.addLayout(options_row)
+
+        limits_row = QHBoxLayout()
+        limit_column = QVBoxLayout()
+        limit_column.addWidget(label("Maximum Semgrep file size (MB)", "Muted"))
+        self.max_target_mb = QSpinBox()
+        self.max_target_mb.setRange(1, 100)
+        self.max_target_mb.setValue(app.max_target_mb)
+        self.max_target_mb.valueChanged.connect(app.set_max_target_mb)
+        limit_column.addWidget(self.max_target_mb)
+        limits_row.addLayout(limit_column)
+        exclusion_column = QVBoxLayout()
+        exclusion_column.addWidget(label("Semgrep exclusions (comma-separated)", "Muted"))
+        self.exclusions = QLineEdit(app.exclusion_text)
+        self.exclusions.setPlaceholderText(".git, .venv, node_modules")
+        self.exclusions.textChanged.connect(app.set_exclusion_text)
+        exclusion_column.addWidget(self.exclusions)
+        limits_row.addLayout(exclusion_column, 1)
+        config_layout.addLayout(limits_row)
+
+        self.dependency_scan = QCheckBox("Scan dependency manifests and lockfiles with OSV-Scanner")
+        self.dependency_scan.setChecked(app.dependency_scan)
+        self.dependency_scan.toggled.connect(app.set_dependency_scan)
+        config_layout.addWidget(self.dependency_scan)
+        self.secret_scan = QCheckBox("Scan current files and Git history with redacted Gitleaks output")
+        self.secret_scan.setChecked(app.secret_scan)
+        self.secret_scan.toggled.connect(app.set_secret_scan)
+        config_layout.addWidget(self.secret_scan)
 
         self.apply_fixes = QCheckBox("Apply fixes that pass deterministic safety checks")
         self.apply_fixes.setChecked(app.apply_fixes)
@@ -1672,6 +1747,24 @@ class SettingsPage(QWidget):
         self.batch.setValue(app.batch_size)
         self.batch.valueChanged.connect(app.set_batch_size)
         audit_layout.addWidget(self.batch)
+        audit_layout.addWidget(label("Maximum Semgrep file size (MB)", "Muted"))
+        self.max_target_mb = QSpinBox()
+        self.max_target_mb.setRange(1, 100)
+        self.max_target_mb.setValue(app.max_target_mb)
+        self.max_target_mb.valueChanged.connect(app.set_max_target_mb)
+        audit_layout.addWidget(self.max_target_mb)
+        audit_layout.addWidget(label("Semgrep exclusions (comma-separated)", "Muted"))
+        self.exclusions = QLineEdit(app.exclusion_text)
+        self.exclusions.textChanged.connect(app.set_exclusion_text)
+        audit_layout.addWidget(self.exclusions)
+        self.dependency_scan = QCheckBox("Enable OSV dependency scanning")
+        self.dependency_scan.setChecked(app.dependency_scan)
+        self.dependency_scan.toggled.connect(app.set_dependency_scan)
+        audit_layout.addWidget(self.dependency_scan)
+        self.secret_scan = QCheckBox("Enable current/history secret scanning")
+        self.secret_scan.setChecked(app.secret_scan)
+        self.secret_scan.toggled.connect(app.set_secret_scan)
+        audit_layout.addWidget(self.secret_scan)
         self.auto_fix = QCheckBox("Apply safe fixes by default")
         self.auto_fix.setChecked(app.apply_fixes)
         self.auto_fix.toggled.connect(app.set_apply_fixes)
@@ -1688,6 +1781,8 @@ class SettingsPage(QWidget):
         about_layout.addWidget(label("✓  Runtime / fixture scope classification", "Good"))
         about_layout.addWidget(label("✓  Evidence-backed confirmation gate", "Good"))
         about_layout.addWidget(label("✓  Manual secret-remediation gate", "Good"))
+        about_layout.addWidget(label("✓  OSV dependency advisory matching", "Good"))
+        about_layout.addWidget(label("✓  Redacted current/history secret detection", "Good"))
         grid.addWidget(about, 1, 0, 1, 2)
         layout.addLayout(grid)
         layout.addStretch()
@@ -1709,6 +1804,16 @@ class AegisScanWindow(QMainWindow):
             self.settings.value("github_repository", os.getenv("GITHUB_REPOSITORY", ""))
         )
         self.batch_size = int(self.settings.value("batch_size", 12))
+        self.max_target_mb = int(self.settings.value("max_target_mb", 1))
+        self.exclusion_text = str(
+            self.settings.value("scan_exclusions", ", ".join(DEFAULT_EXCLUDES))
+        )
+        self.dependency_scan = (
+            str(self.settings.value("dependency_scan", "true")).lower() == "true"
+        )
+        self.secret_scan = (
+            str(self.settings.value("secret_scan", "true")).lower() == "true"
+        )
         self.apply_fixes = str(self.settings.value("apply_fixes", "false")).lower() == "true"
         self.create_pr = False
         self.outcome: ScanOutcome | None = None
@@ -1960,6 +2065,50 @@ class AegisScanWindow(QMainWindow):
         if hasattr(self, "app_settings") and self.app_settings.batch.value() != value:
             self.app_settings.batch.setValue(value)
 
+    def set_max_target_mb(self, value: int) -> None:
+        self.max_target_mb = value
+        self.settings.setValue("max_target_mb", value)
+        if hasattr(self, "new_scan") and self.new_scan.max_target_mb.value() != value:
+            self.new_scan.max_target_mb.setValue(value)
+        if (
+            hasattr(self, "app_settings")
+            and self.app_settings.max_target_mb.value() != value
+        ):
+            self.app_settings.max_target_mb.setValue(value)
+
+    def set_exclusion_text(self, value: str) -> None:
+        self.exclusion_text = value
+        self.settings.setValue("scan_exclusions", value)
+        if hasattr(self, "new_scan") and self.new_scan.exclusions.text() != value:
+            self.new_scan.exclusions.setText(value)
+        if hasattr(self, "app_settings") and self.app_settings.exclusions.text() != value:
+            self.app_settings.exclusions.setText(value)
+
+    def set_dependency_scan(self, checked: bool) -> None:
+        self.dependency_scan = checked
+        self.settings.setValue("dependency_scan", checked)
+        if (
+            hasattr(self, "new_scan")
+            and self.new_scan.dependency_scan.isChecked() != checked
+        ):
+            self.new_scan.dependency_scan.setChecked(checked)
+        if (
+            hasattr(self, "app_settings")
+            and self.app_settings.dependency_scan.isChecked() != checked
+        ):
+            self.app_settings.dependency_scan.setChecked(checked)
+
+    def set_secret_scan(self, checked: bool) -> None:
+        self.secret_scan = checked
+        self.settings.setValue("secret_scan", checked)
+        if hasattr(self, "new_scan") and self.new_scan.secret_scan.isChecked() != checked:
+            self.new_scan.secret_scan.setChecked(checked)
+        if (
+            hasattr(self, "app_settings")
+            and self.app_settings.secret_scan.isChecked() != checked
+        ):
+            self.app_settings.secret_scan.setChecked(checked)
+
     def set_apply_fixes(self, checked: bool) -> None:
         self.apply_fixes = checked
         self.settings.setValue("apply_fixes", checked)
@@ -2029,6 +2178,14 @@ class AegisScanWindow(QMainWindow):
             "create_pull_request": self.create_pr,
             "github_token": self.github_token.strip(),
             "repository": self.github_repository.strip(),
+            "dependency_scan": self.dependency_scan,
+            "secret_scan": self.secret_scan,
+            "exclude_patterns": [
+                pattern.strip()
+                for pattern in self.exclusion_text.split(",")
+                if pattern.strip()
+            ],
+            "max_target_bytes": self.max_target_mb * 1_000_000,
         }
         self.navigate("new_scan")
         self.new_scan.set_running(True)
@@ -2062,14 +2219,17 @@ class AegisScanWindow(QMainWindow):
             f"[SESSION] Results synchronized · {len(outcome.report.issues)} confirmed · "
             f"{outcome.disposition_count('NEEDS_REVIEW')} needs review · "
             f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · "
-            f"{outcome.batch_count} batches"
+            f"{outcome.total_finding_count} detector findings · {outcome.batch_count} AI batches"
         )
-        if outcome.ai_triage_degraded:
+        if outcome.audit_degraded:
             self.new_scan.append_progress(
-                "[WARNING] Gemini triage was incomplete. Untriaged runtime candidates "
-                "are preserved in Needs review; no clean result was inferred."
+                "[WARNING] Audit coverage was incomplete. Detector failures and untriaged "
+                "runtime candidates are retained in the report; no clean result was inferred."
             )
-            self.global_status.set_status("AI triage incomplete", "error")
+            for detector, errors in outcome.detector_errors.items():
+                for error in errors:
+                    self.new_scan.append_progress(f"[WARNING] {detector}: {error}")
+            self.global_status.set_status("Audit incomplete", "error")
             history_status = "Needs review"
         else:
             self.global_status.set_status("Audit complete", "good")
@@ -2077,7 +2237,7 @@ class AegisScanWindow(QMainWindow):
         self.history.append(
             {
                 "repository": self.repo_path,
-                "findings": outcome.raw_finding_count,
+                "findings": outcome.total_finding_count,
                 "batches": outcome.batch_count,
                 "issues": len(outcome.report.issues),
                 "status": history_status,
@@ -2089,7 +2249,7 @@ class AegisScanWindow(QMainWindow):
         self.review_queue.refresh()
         self.non_runtime.refresh()
         self.reports.refresh()
-        self.navigate("review_queue" if outcome.ai_triage_degraded else "findings")
+        self.navigate("review_queue" if outcome.audit_degraded else "findings")
 
     @Slot(str)
     def _scan_failed(self, message: str) -> None:
@@ -2124,12 +2284,19 @@ class AegisScanWindow(QMainWindow):
         payload = {
             "summary": {
                 "raw_semgrep_findings": self.outcome.raw_finding_count,
+                "dependency_findings": self.outcome.dependency_finding_count,
+                "secret_findings": self.outcome.secret_finding_count,
+                "total_detector_findings": self.outcome.total_finding_count,
                 "batches": self.outcome.batch_count,
                 "failed_batches": self.outcome.failed_batches,
                 "failed_batch_reasons": self.outcome.failed_batch_reasons,
                 "ai_attempted_batches": self.outcome.ai_attempted_batches,
                 "ai_successful_batches": self.outcome.ai_successful_batches,
                 "ai_triage_degraded": self.outcome.ai_triage_degraded,
+                "audit_degraded": self.outcome.audit_degraded,
+                "detector_errors": self.outcome.detector_errors,
+                "dependency_scan_enabled": self.outcome.dependency_scan_enabled,
+                "secret_scan_enabled": self.outcome.secret_scan_enabled,
                 "fixed_files": self.outcome.fixed_files,
                 "pull_request_url": self.outcome.pull_request_url,
             },
@@ -2145,7 +2312,7 @@ class AegisScanWindow(QMainWindow):
             "<h2>AegisScan</h2>"
             f"<p>Version {__version__} (beta)</p>"
             "<p>Local-first controls with bounded Gemini triage of repository findings.</p>"
-            "<p>Semgrep · Gemini · Pydantic · Deterministic patch safety</p>",
+            "<p>Semgrep · OSV-Scanner · Gitleaks · Gemini · Deterministic patch safety</p>",
         )
 
     def _error(self, message: str) -> None:

@@ -1,5 +1,6 @@
 """Semgrep runner with explicit failure handling and optional diff filtering."""
 
+from collections.abc import Iterable
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ from .scope import classify_code_role, is_runtime_role, load_ignore_patterns
 logger = logging.getLogger(__name__)
 
 SEMGREP_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_SEMGREP_TIMEOUT", "300"))
+DEFAULT_MAX_TARGET_BYTES = 1_000_000
+DEFAULT_EXCLUDES = (".git", ".venv", "node_modules")
 
 
 def _error_detail(error: object) -> str:
@@ -124,6 +127,9 @@ def _aegisscan_rules_path() -> Path:
 def run_semgrep_scan(
     repo_path: str,
     changed_files_lines: Optional[dict[str, set[int]]] = None,
+    *,
+    exclude_patterns: Iterable[str] | None = None,
+    max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES,
 ) -> str:
     """
     Run Semgrep on the repository and return formatted findings for LLM triage.
@@ -140,19 +146,27 @@ def run_semgrep_scan(
     """
     logger.info("Running Semgrep scan for sequential triage...")
     try:
+        target_limit = max(1, int(max_target_bytes))
+        excludes = tuple(
+            pattern.strip()
+            for pattern in (
+                DEFAULT_EXCLUDES if exclude_patterns is None else exclude_patterns
+            )
+            if pattern.strip()
+        )
         semgrep_cmd = [
             _semgrep_executable(), "scan",
             "--config", str(_aegisscan_rules_path()),
             "--config", "p/security-audit",
             "--config", "p/python",
-            "--exclude", ".github",
-            "--exclude", ".git",
-            "--exclude", ".venv",
-            "--exclude", "node_modules",
-            "--max-target-bytes", "1000000",
+        ]
+        for pattern in excludes:
+            semgrep_cmd.extend(("--exclude", pattern))
+        semgrep_cmd.extend([
+            "--max-target-bytes", str(target_limit),
             "--json",
             "--quiet",
-        ]
+        ])
         scan_environment = os.environ.copy()
         system_certificate_store = Path("/etc/ssl/cert.pem")
         if system_certificate_store.is_file():

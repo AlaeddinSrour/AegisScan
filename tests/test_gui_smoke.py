@@ -55,7 +55,7 @@ def test_degraded_scan_opens_manual_review_without_failure_dialog(tmp_path):
 
     window._scan_completed(outcome)
 
-    assert window.global_status.text.text() == "AI triage incomplete"
+    assert window.global_status.text.text() == "Audit incomplete"
     assert window.stack.currentIndex() == window.page_indexes["review_queue"]
     assert window.dashboard.security_ring.caption == "INCOMPLETE"
     assert not window.dashboard.security_ring.has_score

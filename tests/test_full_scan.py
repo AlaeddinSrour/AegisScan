@@ -1,7 +1,22 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.full_scan import batch_findings, run_full_scan, split_semgrep_findings
-from src.models import ReviewIssue, ReviewReport
+from src.models import FindingDisposition, ReviewIssue, ReviewReport
+from src.semgrep_runner import DEFAULT_EXCLUDES, DEFAULT_MAX_TARGET_BYTES
+from src.supplemental_scanners import DetectorResult
+
+
+@pytest.fixture(autouse=True)
+def completed_supplemental_scanners(monkeypatch):
+    monkeypatch.setattr(
+        "src.full_scan.scan_dependencies", lambda _path: DetectorResult(detector="osv")
+    )
+    monkeypatch.setattr(
+        "src.full_scan.scan_secrets",
+        lambda _path, **_kwargs: DetectorResult(detector="gitleaks"),
+    )
 
 
 def _finding(number: int, path: str, line: int = 1) -> str:
@@ -57,7 +72,12 @@ def test_run_full_scan_disables_diff_filter_and_merges_report(tmp_path):
                 progress=progress_events.append,
             )
 
-    scan.assert_called_once_with(str(tmp_path.resolve()), changed_files_lines=None)
+    scan.assert_called_once_with(
+        str(tmp_path.resolve()),
+        changed_files_lines=None,
+        exclude_patterns=DEFAULT_EXCLUDES,
+        max_target_bytes=DEFAULT_MAX_TARGET_BYTES,
+    )
     assert outcome.raw_finding_count == 1
     assert outcome.batch_count == 1
     assert len(outcome.report.issues) == 1
@@ -78,6 +98,72 @@ def test_run_full_scan_disables_diff_filter_and_merges_report(tmp_path):
         "[COMPLETE]",
     ):
         assert any(event.startswith(phase) for event in progress_events)
+
+
+def test_clean_semgrep_still_runs_supplemental_detectors(tmp_path, monkeypatch):
+    dependency_issue = ReviewIssue(
+        file="requirements.txt",
+        line=1,
+        severity="HIGH",
+        issue_name="Vulnerable dependency",
+        description="A resolved package version has a known advisory.",
+        original_code="library==1.0.0",
+        suggested_fix="Upgrade after compatibility testing.",
+        finding_id="OSV-test",
+        rule_id="osv.GHSA-test",
+        confidence="MEDIUM",
+        code_role="RUNTIME",
+        source_evidence="Resolved from requirements.txt.",
+        sink_evidence="The version is affected.",
+        sink_file="requirements.txt",
+        sink_line=1,
+        reachability_evidence="Runtime reachability was not established.",
+        remediation_type="MANUAL_REQUIRED",
+    )
+    disposition = {
+        "finding_id": "OSV-test",
+        "status": "CONFIRMED",
+        "reason": "Known advisory match.",
+        "file": "requirements.txt",
+        "line": 1,
+        "rule_id": "osv.GHSA-test",
+        "code_role": "RUNTIME",
+        "confidence": "MEDIUM",
+    }
+    (tmp_path / "requirements.txt").write_text("library==1.0.0\n")
+    monkeypatch.setattr(
+        "src.full_scan.scan_dependencies",
+        lambda _path: DetectorResult(
+            detector="osv",
+            finding_count=1,
+            issues=[dependency_issue],
+            dispositions=[FindingDisposition(**disposition)],
+        ),
+    )
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=""):
+        with patch("src.full_scan.call_gemini_with_failover") as ai_call:
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    ai_call.assert_not_called()
+    assert outcome.raw_finding_count == 0
+    assert outcome.dependency_finding_count == 1
+    assert outcome.total_finding_count == 1
+    assert outcome.report.issues == [dependency_issue]
+    assert not outcome.audit_degraded
+
+
+def test_detector_failure_marks_audit_degraded(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.full_scan.scan_dependencies",
+        lambda _path: DetectorResult(detector="osv", errors=["tool unavailable"]),
+    )
+    with patch("src.full_scan.run_semgrep_scan", return_value=""):
+        outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    assert outcome.audit_degraded
+    assert not outcome.ai_triage_degraded
+    assert outcome.detector_errors == {"osv": ["tool unavailable"]}
 
 
 def test_run_full_scan_rejects_issue_path_outside_repository(tmp_path):

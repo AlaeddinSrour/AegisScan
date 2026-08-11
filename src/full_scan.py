@@ -27,7 +27,8 @@ from .github_ops import (
 from .models import FindingDisposition, ReviewIssue, ReviewReport
 from .prompt import build_full_scan_prompt
 from .scope import classify_code_role, is_runtime_role, load_ignore_patterns
-from .semgrep_runner import run_semgrep_scan
+from .semgrep_runner import DEFAULT_EXCLUDES, DEFAULT_MAX_TARGET_BYTES, run_semgrep_scan
+from .supplemental_scanners import DetectorResult, scan_dependencies, scan_secrets
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -80,6 +81,11 @@ class ScanOutcome:
     failed_batch_reasons: dict[int, str] = field(default_factory=dict)
     ai_attempted_batches: int = 0
     ai_successful_batches: int = 0
+    dependency_finding_count: int = 0
+    secret_finding_count: int = 0
+    detector_errors: dict[str, list[str]] = field(default_factory=dict)
+    dependency_scan_enabled: bool = True
+    secret_scan_enabled: bool = True
     fixed_files: list[str] = field(default_factory=list)
     audit_branch: str = ""
     pull_request_url: str = ""
@@ -96,6 +102,19 @@ class ScanOutcome:
     def all_ai_batches_failed(self) -> bool:
         """Whether AI triage was attempted but produced no successful batch."""
         return self.ai_attempted_batches > 0 and self.ai_successful_batches == 0
+
+    @property
+    def audit_degraded(self) -> bool:
+        """Whether any enabled detector or AI triage stage was incomplete."""
+        return self.ai_triage_degraded or any(self.detector_errors.values())
+
+    @property
+    def total_finding_count(self) -> int:
+        return (
+            self.raw_finding_count
+            + self.dependency_finding_count
+            + self.secret_finding_count
+        )
 
 
 def _pretriage_disposition(candidate: SemgrepCandidate) -> FindingDisposition | None:
@@ -646,6 +665,10 @@ def run_full_scan(
     github_token: str = "",
     repository: str = "",
     base_branch: str = "",
+    dependency_scan: bool = True,
+    secret_scan: bool = True,
+    exclude_patterns: Iterable[str] | None = None,
+    max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES,
     progress: Callable[[str], None] | None = None,
     client: genai.Client | None = None,
 ) -> ScanOutcome:
@@ -670,29 +693,79 @@ def run_full_scan(
     notify(f"[SETUP] Repository boundary validated: {root}")
     notify(
         f"[SETUP] Full-repository mode · batch limit {max(1, min(int(batch_size), MAX_BATCH_SIZE))} · "
+        f"target limit {max(1, int(max_target_bytes)):,} bytes · "
         f"safe fixes {'enabled' if apply_fixes else 'disabled'} · "
         f"PR publishing {'enabled' if create_pull_request else 'disabled'}"
+    )
+    configured_excludes = tuple(
+        pattern.strip()
+        for pattern in (
+            DEFAULT_EXCLUDES if exclude_patterns is None else exclude_patterns
+        )
+        if pattern.strip()
+    )
+    notify(
+        "[SETUP] Semgrep exclusions: "
+        + (", ".join(configured_excludes) if configured_excludes else "none")
     )
     notify("[DISCOVER] Starting Semgrep with bundled, security-audit, and Python rulesets")
     notify("[DISCOVER] Scope is the complete repository; pull-request diff filtering is disabled")
     semgrep_started = monotonic()
-    formatted = run_semgrep_scan(str(root), changed_files_lines=None)
+    formatted = run_semgrep_scan(
+        str(root),
+        changed_files_lines=None,
+        exclude_patterns=configured_excludes,
+        max_target_bytes=max_target_bytes,
+    )
     findings = split_semgrep_findings(formatted)
     finding_files = {path for item in findings if (path := finding_file(item))}
     notify(
         f"[DISCOVER] Semgrep completed in {monotonic() - semgrep_started:.1f}s · "
         f"{len(findings)} raw findings across {len(finding_files)} files"
     )
-    if not findings:
-        notify("[COMPLETE] No findings require AI triage; repository audit is clean at the SAST layer")
-        return ScanOutcome(
-            report=ReviewReport(
-                analysis_scratchpad="Semgrep returned no full-repository findings.",
-                issues=[],
-            ),
-            raw_finding_count=0,
-            batch_count=0,
+
+    supplemental_results: list[DetectorResult] = []
+    if dependency_scan:
+        notify("[DEPENDENCIES] Starting OSV dependency vulnerability scan")
+        dependency_started = monotonic()
+        try:
+            dependency_result = scan_dependencies(str(root))
+        except Exception as exc:  # Keep an auditable degraded result on tool failure.
+            dependency_result = DetectorResult(
+                detector="osv",
+                errors=[f"OSV-Scanner failed unexpectedly: {' '.join(str(exc).split())[:500]}"],
+            )
+        supplemental_results.append(dependency_result)
+        notify(
+            f"[DEPENDENCIES] Completed in {monotonic() - dependency_started:.1f}s · "
+            f"{dependency_result.finding_count} vulnerable package findings"
         )
+        for error in dependency_result.errors:
+            notify(f"[WARNING] {error}")
+    else:
+        notify("[DEPENDENCIES] Dependency scanning disabled for this audit")
+
+    if secret_scan:
+        notify("[SECRETS] Starting redacted current-tree and Git-history scan")
+        secret_started = monotonic()
+        try:
+            secret_result = scan_secrets(
+                str(root), max_target_bytes=max_target_bytes
+            )
+        except Exception as exc:  # Keep an auditable degraded result on tool failure.
+            secret_result = DetectorResult(
+                detector="gitleaks",
+                errors=[f"Gitleaks failed unexpectedly: {' '.join(str(exc).split())[:500]}"],
+            )
+        supplemental_results.append(secret_result)
+        notify(
+            f"[SECRETS] Completed in {monotonic() - secret_started:.1f}s · "
+            f"{secret_result.finding_count} redacted secret findings"
+        )
+        for error in secret_result.errors:
+            notify(f"[WARNING] {error}")
+    else:
+        notify("[SECRETS] Secret scanning disabled for this audit")
 
     ignore_patterns = load_ignore_patterns(root)
     if ignore_patterns:
@@ -709,7 +782,8 @@ def run_full_scan(
     role_summary = ", ".join(
         f"{count} {role.lower()}" for role, count in sorted(role_counts.items())
     )
-    notify(f"[SCOPE] Deterministic path classification: {role_summary}")
+    if role_summary:
+        notify(f"[SCOPE] Deterministic path classification: {role_summary}")
     notify(
         f"[PLAN] Packed {len(findings)} findings into {len(batches)} context-bounded batches "
         f"(maximum {max(1, min(int(batch_size), MAX_BATCH_SIZE))} findings each)"
@@ -849,8 +923,25 @@ def run_full_scan(
 
     merged = _merge_reports(reports, root)
     merged.dispositions.extend(failed_dispositions)
+    supplemental_summaries: list[str] = []
+    detector_errors: dict[str, list[str]] = {}
+    for detector_result in supplemental_results:
+        merged.issues.extend(detector_result.issues)
+        merged.dispositions.extend(detector_result.dispositions)
+        supplemental_summaries.append(
+            f"{detector_result.detector}: {detector_result.finding_count} finding(s), "
+            f"{len(detector_result.errors)} error(s)."
+        )
+        if detector_result.errors:
+            detector_errors[detector_result.detector] = detector_result.errors
+    base_scratchpad = merged.analysis_scratchpad.strip()
+    scratchpad_parts = [part for part in (base_scratchpad, *supplemental_summaries) if part]
+    if not scratchpad_parts:
+        scratchpad_parts.append("All enabled detectors completed without findings.")
+    merged.analysis_scratchpad = "\n\n".join(scratchpad_parts)
     accepted_before_merge = sum(len(report.issues) for _, report in reports)
-    duplicate_count = accepted_before_merge - len(merged.issues)
+    supplemental_issue_count = sum(len(result.issues) for result in supplemental_results)
+    duplicate_count = accepted_before_merge - (len(merged.issues) - supplemental_issue_count)
     notify(
         f"[MERGE] Combined {len(reports)} successful batches · {len(merged.issues)} confirmed issues · "
         f"{sum(item.status == 'NEEDS_REVIEW' for item in merged.dispositions)} needs review · "
@@ -865,6 +956,25 @@ def run_full_scan(
         failed_batch_reasons=failed_batch_reasons,
         ai_attempted_batches=attempted_ai_batches,
         ai_successful_batches=successful_ai_batches,
+        dependency_finding_count=next(
+            (
+                result.finding_count
+                for result in supplemental_results
+                if result.detector == "osv"
+            ),
+            0,
+        ),
+        secret_finding_count=next(
+            (
+                result.finding_count
+                for result in supplemental_results
+                if result.detector == "gitleaks"
+            ),
+            0,
+        ),
+        detector_errors=detector_errors,
+        dependency_scan_enabled=dependency_scan,
+        secret_scan_enabled=secret_scan,
     )
     if apply_fixes and merged.issues:
         remediation_started = monotonic()
@@ -910,8 +1020,9 @@ def run_full_scan(
 
     notify(
         f"[COMPLETE] Audit finished"
-        f"{' with incomplete AI triage' if outcome.ai_triage_degraded else ''} "
+        f"{' in degraded mode' if outcome.audit_degraded else ''} "
         f"in {monotonic() - audit_started:.1f}s · "
+        f"{outcome.total_finding_count} detector findings · "
         f"{len(merged.issues)} confirmed · {outcome.disposition_count('NEEDS_REVIEW')} needs review · "
         f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · {len(outcome.fixed_files)} changed files"
     )
@@ -923,12 +1034,19 @@ def _write_report(outcome: ScanOutcome, output_path: str) -> None:
     payload = {
         "summary": {
             "raw_semgrep_findings": outcome.raw_finding_count,
+            "dependency_findings": outcome.dependency_finding_count,
+            "secret_findings": outcome.secret_finding_count,
+            "total_detector_findings": outcome.total_finding_count,
             "llm_batches": outcome.batch_count,
             "failed_batches": outcome.failed_batches,
             "failed_batch_reasons": outcome.failed_batch_reasons,
             "ai_attempted_batches": outcome.ai_attempted_batches,
             "ai_successful_batches": outcome.ai_successful_batches,
             "ai_triage_degraded": outcome.ai_triage_degraded,
+            "audit_degraded": outcome.audit_degraded,
+            "detector_errors": outcome.detector_errors,
+            "dependency_scan_enabled": outcome.dependency_scan_enabled,
+            "secret_scan_enabled": outcome.secret_scan_enabled,
             "confirmed_issues": len(outcome.report.issues),
             "needs_review": outcome.disposition_count("NEEDS_REVIEW"),
             "non_runtime": outcome.disposition_count("NON_RUNTIME"),
@@ -949,6 +1067,17 @@ def main() -> None:
     parser.add_argument("--repo", default=os.getcwd(), help="Repository directory")
     parser.add_argument("--api-key", default=os.getenv("GEMINI_API_KEY", ""))
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument(
+        "--max-target-bytes", type=int, default=DEFAULT_MAX_TARGET_BYTES
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        dest="exclude_patterns",
+        help="Semgrep exclusion pattern; repeat for multiple patterns",
+    )
+    parser.add_argument("--no-dependency-scan", action="store_true")
+    parser.add_argument("--no-secret-scan", action="store_true")
     parser.add_argument("--apply-fixes", action="store_true")
     parser.add_argument("--create-pull-request", action="store_true")
     parser.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN", ""))
@@ -962,6 +1091,10 @@ def main() -> None:
             args.repo,
             args.api_key,
             batch_size=args.batch_size,
+            dependency_scan=not args.no_dependency_scan,
+            secret_scan=not args.no_secret_scan,
+            exclude_patterns=args.exclude_patterns,
+            max_target_bytes=args.max_target_bytes,
             apply_fixes=args.apply_fixes,
             create_pull_request=args.create_pull_request,
             github_token=args.github_token,
@@ -970,10 +1103,10 @@ def main() -> None:
         )
         _write_report(outcome, args.report)
         logger.info("Wrote audit report to %s", args.report)
-        if outcome.ai_triage_degraded:
+        if outcome.audit_degraded:
             logger.error(
-                "Audit completed with incomplete AI triage; inspect Needs review and "
-                "failed_batch_reasons in %s",
+                "Audit completed in degraded mode; inspect detector_errors, Needs review, "
+                "and failed_batch_reasons in %s",
                 args.report,
             )
             sys.exit(2)
