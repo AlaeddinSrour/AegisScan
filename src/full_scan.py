@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BATCH_SIZE = 12
 MAX_BATCH_SIZE = 15
 DEFAULT_MAX_BATCH_CHARS = 100_000
+SECRET_DETECTORS = {"betterleaks", "gitleaks"}
 FINDING_START = re.compile(r"(?m)^Finding #\d+:\s*\nRule ID:")
 FINDING_FILE = re.compile(r"(?m)^File:\s+(.+?):(\d+)\s*$")
 FINDING_RULE = re.compile(r"(?m)^Rule ID:\s*(.+?)\s*$")
@@ -86,6 +87,7 @@ class ScanOutcome:
     detector_errors: dict[str, list[str]] = field(default_factory=dict)
     dependency_scan_enabled: bool = True
     secret_scan_enabled: bool = True
+    secret_scanner: str = ""
     fixed_files: list[str] = field(default_factory=list)
     audit_branch: str = ""
     pull_request_url: str = ""
@@ -162,6 +164,19 @@ def split_semgrep_findings(formatted_findings: str) -> list[str]:
         if block:
             findings.append(block)
     return findings
+
+
+def _deduplicate_semgrep_findings(findings: Iterable[str]) -> list[str]:
+    """Remove exact duplicate Semgrep records while preserving scan order."""
+    unique: list[str] = []
+    seen: set[str] = set()
+    for finding in findings:
+        finding_id = _candidate_from_text(finding).finding_id
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        unique.append(finding)
+    return unique
 
 
 def finding_file(finding: str) -> str:
@@ -577,8 +592,13 @@ def _merge_reports(
     by_sink: dict[tuple[str, str, int], ReviewIssue] = {}
     suppressed: dict[str, ReviewIssue] = {}
 
-    def issue_rank(issue: ReviewIssue) -> tuple[int, int]:
+    def issue_rank(issue: ReviewIssue) -> tuple[int, int, int]:
         confidence = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}[issue.confidence]
+        # Semgrep findings that establish how a secret is used carry more
+        # context than a pattern-only secret-scanner match at the same sink.
+        contextual = int(
+            not issue.rule_id.startswith(("betterleaks.", "gitleaks."))
+        )
         evidence = sum(
             len(value.strip())
             for value in (
@@ -587,7 +607,7 @@ def _merge_reports(
                 issue.reachability_evidence,
             )
         )
-        return confidence, evidence
+        return confidence, contextual, evidence
 
     for issue in candidates:
         key = (
@@ -717,12 +737,18 @@ def run_full_scan(
         exclude_patterns=configured_excludes,
         max_target_bytes=max_target_bytes,
     )
-    findings = split_semgrep_findings(formatted)
+    raw_findings = split_semgrep_findings(formatted)
+    findings = _deduplicate_semgrep_findings(raw_findings)
     finding_files = {path for item in findings if (path := finding_file(item))}
     notify(
         f"[DISCOVER] Semgrep completed in {monotonic() - semgrep_started:.1f}s · "
         f"{len(findings)} raw findings across {len(finding_files)} files"
     )
+    if len(raw_findings) != len(findings):
+        notify(
+            f"[DISCOVER] Removed {len(raw_findings) - len(findings)} exact duplicate "
+            "Semgrep finding(s)"
+        )
 
     supplemental_results: list[DetectorResult] = []
     if dependency_scan:
@@ -746,7 +772,10 @@ def run_full_scan(
         notify("[DEPENDENCIES] Dependency scanning disabled for this audit")
 
     if secret_scan:
-        notify("[SECRETS] Starting redacted current-tree and Git-history scan")
+        notify(
+            "[SECRETS] Starting redacted current-tree and Git-history scan "
+            "(Betterleaks preferred; Gitleaks fallback)"
+        )
         secret_started = monotonic()
         try:
             secret_result = scan_secrets(
@@ -754,8 +783,11 @@ def run_full_scan(
             )
         except Exception as exc:  # Keep an auditable degraded result on tool failure.
             secret_result = DetectorResult(
-                detector="gitleaks",
-                errors=[f"Gitleaks failed unexpectedly: {' '.join(str(exc).split())[:500]}"],
+                detector="betterleaks",
+                errors=[
+                    "Secret scanner failed unexpectedly: "
+                    f"{' '.join(str(exc).split())[:500]}"
+                ],
             )
         supplemental_results.append(secret_result)
         notify(
@@ -923,25 +955,40 @@ def run_full_scan(
 
     merged = _merge_reports(reports, root)
     merged.dispositions.extend(failed_dispositions)
+    base_scratchpad = merged.analysis_scratchpad.strip()
     supplemental_summaries: list[str] = []
     detector_errors: dict[str, list[str]] = {}
     for detector_result in supplemental_results:
-        merged.issues.extend(detector_result.issues)
-        merged.dispositions.extend(detector_result.dispositions)
         supplemental_summaries.append(
             f"{detector_result.detector}: {detector_result.finding_count} finding(s), "
             f"{len(detector_result.errors)} error(s)."
         )
         if detector_result.errors:
             detector_errors[detector_result.detector] = detector_result.errors
-    base_scratchpad = merged.analysis_scratchpad.strip()
+
+    accepted_before_merge = len(merged.issues) + sum(
+        len(result.issues) for result in supplemental_results
+    )
+    if supplemental_results:
+        combined_reports: list[tuple[int, ReviewReport]] = [(0, merged)]
+        combined_reports.extend(
+            (
+                index,
+                ReviewReport(
+                    analysis_scratchpad="",
+                    issues=result.issues,
+                    dispositions=result.dispositions,
+                ),
+            )
+            for index, result in enumerate(supplemental_results, start=1)
+        )
+        merged = _merge_reports(combined_reports, root)
+
     scratchpad_parts = [part for part in (base_scratchpad, *supplemental_summaries) if part]
     if not scratchpad_parts:
         scratchpad_parts.append("All enabled detectors completed without findings.")
     merged.analysis_scratchpad = "\n\n".join(scratchpad_parts)
-    accepted_before_merge = sum(len(report.issues) for _, report in reports)
-    supplemental_issue_count = sum(len(result.issues) for result in supplemental_results)
-    duplicate_count = accepted_before_merge - (len(merged.issues) - supplemental_issue_count)
+    duplicate_count = accepted_before_merge - len(merged.issues)
     notify(
         f"[MERGE] Combined {len(reports)} successful batches · {len(merged.issues)} confirmed issues · "
         f"{sum(item.status == 'NEEDS_REVIEW' for item in merged.dispositions)} needs review · "
@@ -968,13 +1015,21 @@ def run_full_scan(
             (
                 result.finding_count
                 for result in supplemental_results
-                if result.detector == "gitleaks"
+                if result.detector in SECRET_DETECTORS
             ),
             0,
         ),
         detector_errors=detector_errors,
         dependency_scan_enabled=dependency_scan,
         secret_scan_enabled=secret_scan,
+        secret_scanner=next(
+            (
+                result.detector
+                for result in supplemental_results
+                if result.detector in SECRET_DETECTORS
+            ),
+            "",
+        ),
     )
     if apply_fixes and merged.issues:
         remediation_started = monotonic()
@@ -1047,6 +1102,7 @@ def _write_report(outcome: ScanOutcome, output_path: str) -> None:
             "detector_errors": outcome.detector_errors,
             "dependency_scan_enabled": outcome.dependency_scan_enabled,
             "secret_scan_enabled": outcome.secret_scan_enabled,
+            "secret_scanner": outcome.secret_scanner,
             "confirmed_issues": len(outcome.report.issues),
             "needs_review": outcome.disposition_count("NEEDS_REVIEW"),
             "non_runtime": outcome.disposition_count("NON_RUNTIME"),

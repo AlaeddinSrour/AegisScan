@@ -43,6 +43,23 @@ def test_batch_findings_clamps_to_fifteen_and_tracks_files():
     assert "src/file_1.py" in batches[0].files
 
 
+def test_full_scan_removes_exact_duplicate_semgrep_findings(tmp_path):
+    (tmp_path / "app.py").write_text("dangerous()\n", encoding="utf-8")
+    duplicated = _finding(1, "app.py") + _finding(2, "app.py")
+    progress: list[str] = []
+    report = ReviewReport(analysis_scratchpad="reviewed", issues=[])
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=duplicated):
+        with patch("src.full_scan.call_gemini_with_failover", return_value=report):
+            outcome = run_full_scan(
+                str(tmp_path), "", client=MagicMock(), progress=progress.append
+            )
+
+    assert outcome.raw_finding_count == 1
+    assert len(outcome.report.dispositions) == 1
+    assert any("Removed 1 exact duplicate" in event for event in progress)
+
+
 def test_run_full_scan_disables_diff_filter_and_merges_report(tmp_path):
     source = tmp_path / "app.py"
     source.write_text("dangerous()\n", encoding="utf-8")
@@ -404,5 +421,74 @@ def test_helper_candidate_is_consolidated_into_canonical_sink(tmp_path):
     assert [(issue.file, issue.line) for issue in outcome.report.issues] == [
         ("routes/videoHandler.ts", 71)
     ]
+    assert outcome.disposition_count("CONFIRMED") == 1
+    assert outcome.disposition_count("FALSE_POSITIVE") == 1
+
+
+def test_semgrep_and_secret_scanner_findings_share_one_canonical_issue(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "security.ts").write_text(
+        "const privateKey = loadEmbeddedKey()\n", encoding="utf-8"
+    )
+    semgrep_issue = ReviewIssue(
+        file="security.ts",
+        line=1,
+        sink_file="security.ts",
+        sink_line=1,
+        severity="HIGH",
+        issue_name="Hardcoded private key",
+        description="An embedded private key is used for authentication.",
+        original_code="const privateKey = loadEmbeddedKey()",
+        suggested_fix="const privateKey = loadKeyFromSecretStore()",
+        confidence="HIGH",
+        source_evidence="The repository embeds the signing credential.",
+        sink_evidence="The runtime authentication path consumes the key.",
+        reachability_evidence="The application loads this value during startup.",
+        remediation_type="MANUAL_REQUIRED",
+    )
+    secret_issue = semgrep_issue.model_copy(
+        update={
+            "finding_id": "SECRET-one",
+            "rule_id": "betterleaks.private-key",
+            "issue_name": "Potential hardcoded secret: Private key",
+            "source_evidence": "Betterleaks matched a redacted private key.",
+            "sink_evidence": "A credential-shaped value is stored in source.",
+            "reachability_evidence": "The value is present in runtime source.",
+        }
+    )
+    secret_disposition = FindingDisposition(
+        finding_id="SECRET-one",
+        status="CONFIRMED",
+        reason="A specific credential format was detected.",
+        file="security.ts",
+        line=1,
+        rule_id="betterleaks.private-key",
+        message="Private key",
+        code_role="RUNTIME",
+        confidence="HIGH",
+    )
+    monkeypatch.setattr(
+        "src.full_scan.scan_secrets",
+        lambda _path, **_kwargs: DetectorResult(
+            detector="betterleaks",
+            finding_count=1,
+            issues=[secret_issue],
+            dispositions=[secret_disposition],
+        ),
+    )
+    report = ReviewReport(analysis_scratchpad="runtime key use", issues=[semgrep_issue])
+
+    with patch(
+        "src.full_scan.run_semgrep_scan",
+        return_value=_finding(1, "security.ts"),
+    ):
+        with patch("src.full_scan.call_gemini_with_failover", return_value=report):
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    assert len(outcome.report.issues) == 1
+    assert outcome.report.issues[0].rule_id == "test.rule"
+    assert outcome.secret_finding_count == 1
+    assert outcome.secret_scanner == "betterleaks"
     assert outcome.disposition_count("CONFIRMED") == 1
     assert outcome.disposition_count("FALSE_POSITIVE") == 1

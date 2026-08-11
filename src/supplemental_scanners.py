@@ -17,7 +17,12 @@ from .scope import classify_code_role, load_ignore_patterns
 
 
 OSV_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_OSV_TIMEOUT", "300"))
-GITLEAKS_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_GITLEAKS_TIMEOUT", "300"))
+SECRET_SCANNER_TIMEOUT_SECONDS = int(
+    os.environ.get(
+        "AEGISSCAN_BETTERLEAKS_TIMEOUT",
+        os.environ.get("AEGISSCAN_GITLEAKS_TIMEOUT", "300"),
+    )
+)
 
 
 @dataclass
@@ -267,7 +272,19 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
     return result
 
 
-def _run_gitleaks_mode(
+def _secret_scanner() -> tuple[str, str] | None:
+    """Prefer Betterleaks while retaining Gitleaks as a transition fallback."""
+    betterleaks = _executable("betterleaks", "BETTERLEAKS_COMMAND")
+    if betterleaks:
+        return "betterleaks", betterleaks
+    gitleaks = _executable("gitleaks", "GITLEAKS_COMMAND")
+    if gitleaks:
+        return "gitleaks", gitleaks
+    return None
+
+
+def _run_secret_scanner_mode(
+    scanner: str,
     executable: str,
     root: Path,
     mode: str,
@@ -292,14 +309,17 @@ def _run_gitleaks_mode(
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=GITLEAKS_TIMEOUT_SECONDS,
+            timeout=SECRET_SCANNER_TIMEOUT_SECONDS,
             shell=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], f"Gitleaks {mode} scan could not complete: {_compact_error(str(exc))}"
+        return [], (
+            f"{scanner.title()} {mode} scan could not complete: "
+            f"{_compact_error(str(exc))}"
+        )
     if completed.returncode not in {0, 1}:
         return [], (
-            f"Gitleaks {mode} scan exited with status {completed.returncode}: "
+            f"{scanner.title()} {mode} scan exited with status {completed.returncode}: "
             f"{_compact_error(completed.stderr or 'no diagnostic output')}"
         )
     if not report_path.is_file():
@@ -307,7 +327,7 @@ def _run_gitleaks_mode(
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return [], f"Gitleaks {mode} scan returned invalid JSON: {exc}"
+        return [], f"{scanner.title()} {mode} scan returned invalid JSON: {exc}"
     findings = (
         [item for item in payload if isinstance(item, dict)]
         if isinstance(payload, list)
@@ -316,28 +336,65 @@ def _run_gitleaks_mode(
     return findings, None
 
 
+def _finding_value(finding: dict[str, object], *names: str) -> object:
+    """Read current and compatibility Betterleaks/Gitleaks report fields."""
+    for name in names:
+        value = finding.get(name)
+        if value not in (None, ""):
+            return value
+    attributes = finding.get("Attributes") or finding.get("attributes")
+    if isinstance(attributes, dict):
+        for name in names:
+            value = attributes.get(name)
+            if value not in (None, ""):
+                return value
+    return ""
+
+
+def _strong_secret_rule(rule_id: str) -> bool:
+    """Return whether a rule identifies a specific credential format."""
+    normalized = rule_id.casefold().replace("_", "-")
+    uncertain = (
+        "generic-api-key",
+        "generic-secret",
+        "generic-password",
+        "password",
+        "jwt",
+    )
+    return not any(
+        normalized == value or normalized.startswith(f"{value}.")
+        for value in uncertain
+    )
+
+
 def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorResult:
     """Scan current files and Git history without retaining matched secret values."""
-    result = DetectorResult(detector="gitleaks")
-    executable = _executable("gitleaks", "GITLEAKS_COMMAND")
-    if executable is None:
+    selected = _secret_scanner()
+    if selected is None:
+        result = DetectorResult(detector="betterleaks")
         result.errors.append(
-            "Gitleaks is unavailable. Install it with `brew install gitleaks`."
+            "No supported secret scanner is available. Install Betterleaks with "
+            "`brew install betterleaks` (preferred), or Gitleaks as a fallback."
         )
         return result
+    scanner, executable = selected
+    display_name = "Betterleaks" if scanner == "betterleaks" else "Gitleaks"
+    result = DetectorResult(detector=scanner)
 
     root = Path(repo_path).resolve()
     ignore_patterns = load_ignore_patterns(root)
-    with tempfile.TemporaryDirectory(prefix="aegisscan-gitleaks-") as temporary:
+    with tempfile.TemporaryDirectory(prefix=f"aegisscan-{scanner}-") as temporary:
         temporary_root = Path(temporary)
-        current, current_error = _run_gitleaks_mode(
+        current, current_error = _run_secret_scanner_mode(
+            display_name,
             executable,
             root,
             "dir",
             temporary_root / "current.json",
             max_target_bytes,
         )
-        history, history_error = _run_gitleaks_mode(
+        history, history_error = _run_secret_scanner_mode(
+            display_name,
             executable,
             root,
             "git",
@@ -346,30 +403,79 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
         )
     result.errors.extend(error for error in (current_error, history_error) if error)
 
-    seen: set[tuple[str, str, int]] = set()
+    seen: set[tuple[str, str, int, int]] = set()
     for mode, findings in (("current", current), ("history", history)):
         for finding in findings:
-            rule_id = str(finding.get("RuleID") or "generic-secret")
-            description = _compact_error(
-                str(finding.get("Description") or "Potential hardcoded credential")
+            rule_id = str(
+                _finding_value(finding, "RuleID", "rule_id") or "generic-secret"
             )
-            relative_file, current_file = _relative_file(root, finding.get("File"))
+            description = _compact_error(
+                str(
+                    _finding_value(finding, "Description", "description")
+                    or "Potential hardcoded credential"
+                )
+            )
+            relative_file, current_file = _relative_file(
+                root, _finding_value(finding, "File", "path")
+            )
             try:
-                line = max(1, int(finding.get("StartLine") or 1))
+                line = max(
+                    1,
+                    int(_finding_value(finding, "StartLine", "start_line") or 1),
+                )
             except (TypeError, ValueError):
                 line = 1
-            key = (rule_id, relative_file, line)
+            try:
+                column = max(
+                    0,
+                    int(
+                        _finding_value(finding, "StartColumn", "start_column")
+                        or 0
+                    ),
+                )
+            except (TypeError, ValueError):
+                column = 0
+            key = (rule_id, relative_file, line, column)
             if key in seen:
                 continue
             seen.add(key)
             role = classify_code_role(relative_file, ignore_patterns)
             finding_id = _finding_id("SECRET", *key)
-            commit = str(finding.get("Commit") or "")[:12]
+            commit = str(
+                _finding_value(finding, "Commit", "git.sha", "commit") or ""
+            )[:12]
+            validation_status = str(
+                _finding_value(
+                    finding,
+                    "ValidationStatus",
+                    "validationStatus",
+                    "validation_status",
+                )
+                or ""
+            ).casefold()
             is_current_runtime = mode == "current" and current_file is not None and role in {
                 "RUNTIME",
                 "UNKNOWN",
             }
-            if is_current_runtime:
+            is_confirmed = is_current_runtime and (
+                validation_status in {"valid", "revoked"}
+                or (not validation_status and _strong_secret_rule(rule_id))
+            )
+            rule_name = f"{scanner}.{rule_id}"
+            if validation_status == "invalid":
+                status = "FALSE_POSITIVE"
+                reason = (
+                    f"{display_name} validation classified the redacted candidate as invalid."
+                )
+                confidence = "HIGH"
+            elif not is_current_runtime and role not in {"RUNTIME", "UNKNOWN"}:
+                status = "NON_RUNTIME"
+                reason = (
+                    "Deterministic scope classification marked this redacted secret "
+                    f"finding as {role.lower()}."
+                )
+                confidence = "HIGH"
+            elif is_confirmed:
                 result.issues.append(
                     ReviewIssue(
                         file=relative_file,
@@ -377,7 +483,8 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                         severity="HIGH",
                         issue_name=f"Potential hardcoded secret: {description}",
                         description=(
-                            "Gitleaks matched a credential pattern in current runtime source. "
+                            f"{display_name} matched a specific credential pattern in current "
+                            "runtime source. "
                             "The value is redacted and must be validated, rotated, and removed from history."
                         ),
                         original_code="[REDACTED SECRET]",
@@ -386,11 +493,11 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                             "and purge exposed history where required."
                         ),
                         finding_id=finding_id,
-                        rule_id=f"gitleaks.{rule_id}",
+                        rule_id=rule_name,
                         confidence="HIGH",
                         code_role=role,
                         source_evidence=(
-                            f"Gitleaks rule {rule_id} matched a redacted value at "
+                            f"{display_name} rule {rule_id} matched a redacted value at "
                             f"{relative_file}:{line}."
                         ),
                         sink_evidence="A credential-shaped value is stored in repository source.",
@@ -411,9 +518,15 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                 confidence = "HIGH"
             else:
                 status = "NEEDS_REVIEW"
-                location = f"commit {commit}" if commit else f"{role.lower()} source"
+                location = (
+                    f"commit {commit}"
+                    if commit
+                    else "current runtime source"
+                    if is_current_runtime
+                    else f"{role.lower()} source"
+                )
                 reason = (
-                    f"Gitleaks matched a redacted credential pattern in {location}; "
+                    f"{display_name} matched a redacted credential pattern in {location}; "
                     "manual validation and rotation review are required."
                 )
                 confidence = "MEDIUM"
@@ -424,7 +537,7 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                     reason=reason,
                     file=relative_file,
                     line=line,
-                    rule_id=f"gitleaks.{rule_id}",
+                    rule_id=rule_name,
                     message=description,
                     code_role=role,
                     confidence=confidence,

@@ -43,12 +43,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -942,6 +944,16 @@ class DashboardPage(QWidget):
         outcome = self.app.outcome
         if not outcome:
             return
+        secret_detector_failed = bool(
+            {"betterleaks", "gitleaks"}.intersection(outcome.detector_errors)
+        )
+        secret_scanner_name = (
+            "Betterleaks"
+            if outcome.secret_scanner == "betterleaks"
+            else "Gitleaks fallback"
+            if outcome.secret_scanner == "gitleaks"
+            else "Secret scanner"
+        )
         critical = sum(
             issue.severity in {"CRITICAL", "HIGH"} for issue in outcome.report.issues
         )
@@ -1001,15 +1013,15 @@ class DashboardPage(QWidget):
         self.secret_status.setText(
             (
                 "!  Secret scan incomplete"
-                if "gitleaks" in outcome.detector_errors
-                else "✓  Redacted current/history secret scan completed"
+                if secret_detector_failed
+                else f"✓  {secret_scanner_name} current/history scan completed"
                 if outcome.secret_scan_enabled
                 else "–  Secret scan disabled"
             )
         )
         for status, failed in (
             (self.dependency_status, "osv" in outcome.detector_errors),
-            (self.secret_status, "gitleaks" in outcome.detector_errors),
+            (self.secret_status, secret_detector_failed),
         ):
             status.setStyleSheet(
                 "color: #c64545; font-weight: 500;" if failed else ""
@@ -1020,9 +1032,22 @@ class NewScanPage(QWidget):
     def __init__(self, app: "AegisScanWindow") -> None:
         super().__init__()
         self.app = app
-        outer = QVBoxLayout(self)
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("Canvas")
+        page_layout.addWidget(self.scroll_area)
+
+        outer = QVBoxLayout(self.scroll_content)
         outer.setContentsMargins(28, 24, 28, 28)
         outer.setSpacing(16)
+        outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.addWidget(label("SCANS / NEW AUDIT", "Eyebrow"))
         outer.addWidget(label("Configure a full-repository audit", "PageTitle"))
         outer.addWidget(
@@ -1044,7 +1069,10 @@ class NewScanPage(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(16)
+        body.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         config = card()
+        self.config_card = config
+        config.setMinimumHeight(620)
         config_layout = QVBoxLayout(config)
         config_layout.setContentsMargins(22, 20, 22, 20)
         config_layout.setSpacing(12)
@@ -1067,56 +1095,84 @@ class NewScanPage(QWidget):
         self.api_key_input.textChanged.connect(app.set_api_key)
         config_layout.addWidget(self.api_key_input)
 
-        options_row = QHBoxLayout()
+        self.options_panel = QWidget()
+        self.options_panel.setMinimumHeight(76)
+        options_row = QHBoxLayout(self.options_panel)
+        options_row.setContentsMargins(0, 0, 0, 0)
+        options_row.setSpacing(12)
         option_left = QVBoxLayout()
-        option_left.addWidget(label("Findings per AI batch", "Muted"))
+        option_left.setSpacing(6)
+        self.batch_size_label = label("Findings per AI batch", "Muted")
+        option_left.addWidget(self.batch_size_label)
         self.batch_size = QSpinBox()
+        self.batch_size.setMinimumHeight(40)
         self.batch_size.setRange(1, 15)
         self.batch_size.setValue(app.batch_size)
         self.batch_size.valueChanged.connect(app.set_batch_size)
         option_left.addWidget(self.batch_size)
         options_row.addLayout(option_left)
         option_right = QVBoxLayout()
-        option_right.addWidget(label("Audit mode", "Muted"))
-        mode = QComboBox()
-        mode.addItems(["Full repository · SAST + dependencies + secrets", "Custom detector set"])
-        mode.model().item(1).setEnabled(False)
-        option_right.addWidget(mode)
+        option_right.setSpacing(6)
+        self.audit_mode_label = label("Audit mode", "Muted")
+        option_right.addWidget(self.audit_mode_label)
+        self.audit_mode = QComboBox()
+        self.audit_mode.setMinimumHeight(40)
+        self.audit_mode.addItems(
+            ["Full repository · SAST + dependencies + secrets", "Custom detector set"]
+        )
+        self.audit_mode.model().item(1).setEnabled(False)
+        option_right.addWidget(self.audit_mode)
         options_row.addLayout(option_right, 1)
-        config_layout.addLayout(options_row)
+        config_layout.addWidget(self.options_panel)
 
-        limits_row = QHBoxLayout()
+        self.limits_panel = QWidget()
+        self.limits_panel.setMinimumHeight(76)
+        limits_row = QHBoxLayout(self.limits_panel)
+        limits_row.setContentsMargins(0, 0, 0, 0)
+        limits_row.setSpacing(12)
         limit_column = QVBoxLayout()
-        limit_column.addWidget(label("Maximum Semgrep file size (MB)", "Muted"))
+        limit_column.setSpacing(6)
+        self.max_target_label = label("Maximum Semgrep file size (MB)", "Muted")
+        limit_column.addWidget(self.max_target_label)
         self.max_target_mb = QSpinBox()
+        self.max_target_mb.setMinimumHeight(40)
         self.max_target_mb.setRange(1, 100)
         self.max_target_mb.setValue(app.max_target_mb)
         self.max_target_mb.valueChanged.connect(app.set_max_target_mb)
         limit_column.addWidget(self.max_target_mb)
         limits_row.addLayout(limit_column)
         exclusion_column = QVBoxLayout()
-        exclusion_column.addWidget(label("Semgrep exclusions (comma-separated)", "Muted"))
+        exclusion_column.setSpacing(6)
+        self.exclusions_label = label("Semgrep exclusions (comma-separated)", "Muted")
+        exclusion_column.addWidget(self.exclusions_label)
         self.exclusions = QLineEdit(app.exclusion_text)
+        self.exclusions.setMinimumHeight(40)
         self.exclusions.setPlaceholderText(".git, .venv, node_modules")
         self.exclusions.textChanged.connect(app.set_exclusion_text)
         exclusion_column.addWidget(self.exclusions)
         limits_row.addLayout(exclusion_column, 1)
-        config_layout.addLayout(limits_row)
+        config_layout.addWidget(self.limits_panel)
 
         self.dependency_scan = QCheckBox("Scan dependency manifests and lockfiles with OSV-Scanner")
+        self.dependency_scan.setMinimumHeight(24)
         self.dependency_scan.setChecked(app.dependency_scan)
         self.dependency_scan.toggled.connect(app.set_dependency_scan)
         config_layout.addWidget(self.dependency_scan)
-        self.secret_scan = QCheckBox("Scan current files and Git history with redacted Gitleaks output")
+        self.secret_scan = QCheckBox(
+            "Scan current files and Git history with redacted Betterleaks output"
+        )
+        self.secret_scan.setMinimumHeight(24)
         self.secret_scan.setChecked(app.secret_scan)
         self.secret_scan.toggled.connect(app.set_secret_scan)
         config_layout.addWidget(self.secret_scan)
 
         self.apply_fixes = QCheckBox("Apply fixes that pass deterministic safety checks")
+        self.apply_fixes.setMinimumHeight(24)
         self.apply_fixes.setChecked(app.apply_fixes)
         self.apply_fixes.toggled.connect(app.set_apply_fixes)
         config_layout.addWidget(self.apply_fixes)
         self.publish_pr = QCheckBox("Publish changed files as a new GitHub pull request")
+        self.publish_pr.setMinimumHeight(24)
         self.publish_pr.setChecked(app.create_pr)
         self.publish_pr.toggled.connect(self._publish_toggled)
         config_layout.addWidget(self.publish_pr)
@@ -1127,6 +1183,8 @@ class NewScanPage(QWidget):
         body.addWidget(config, 5)
 
         live = card()
+        self.live_card = live
+        live.setMinimumHeight(620)
         live_layout = QVBoxLayout(live)
         live_layout.setContentsMargins(22, 20, 22, 20)
         live_layout.addWidget(label("Live audit", "SectionTitle"))
@@ -1169,6 +1227,9 @@ class NewScanPage(QWidget):
         live_layout.addWidget(self.console, 1)
         body.addWidget(live, 4)
         outer.addLayout(body, 1)
+        # Qt requires the child layout to exist before it is assigned to a
+        # scroll area; assigning it earlier can render a blank page.
+        self.scroll_area.setWidget(self.scroll_content)
 
     def _publish_toggled(self, checked: bool) -> None:
         if checked:
@@ -2297,6 +2358,7 @@ class AegisScanWindow(QMainWindow):
                 "detector_errors": self.outcome.detector_errors,
                 "dependency_scan_enabled": self.outcome.dependency_scan_enabled,
                 "secret_scan_enabled": self.outcome.secret_scan_enabled,
+                "secret_scanner": self.outcome.secret_scanner,
                 "fixed_files": self.outcome.fixed_files,
                 "pull_request_url": self.outcome.pull_request_url,
             },
@@ -2312,7 +2374,7 @@ class AegisScanWindow(QMainWindow):
             "<h2>AegisScan</h2>"
             f"<p>Version {__version__} (beta)</p>"
             "<p>Local-first controls with bounded Gemini triage of repository findings.</p>"
-            "<p>Semgrep · OSV-Scanner · Gitleaks · Gemini · Deterministic patch safety</p>",
+            "<p>Semgrep · OSV-Scanner · Betterleaks · Gemini · Deterministic patch safety</p>",
         )
 
     def _error(self, message: str) -> None:

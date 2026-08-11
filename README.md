@@ -6,7 +6,7 @@ Local-first macOS security auditing with repository-wide Semgrep discovery,
 OSV dependency checks, redacted current/history secret detection, bounded Gemini
 triage, an explicit evidence ledger, and guarded remediation.
 
-> **Project status:** Version 0.2.0 beta. AegisScan is suitable for evaluation and
+> **Project status:** Version 0.2.1 beta. AegisScan is suitable for evaluation and
 > development workflows, but findings and generated fixes still require human
 > review before production use.
 
@@ -20,8 +20,9 @@ and preserves the complete decision trail:
   audit to changed lines.
 - Matches resolved packages from supported manifests and lockfiles against the
   OSV vulnerability database.
-- Scans both current files and Git history with Gitleaks while discarding matched
-  secret values before results enter the report.
+- Scans both current files and Git history with Betterleaks while discarding
+  matched secret values before results enter the report. Gitleaks remains a
+  compatibility fallback during the transition.
 - Assigns every candidate a stable ID and a final disposition: confirmed,
   needs review, false positive, or non-runtime.
 - Separates runtime code from tests, fixtures, generated files, dependencies,
@@ -37,9 +38,11 @@ and preserves the complete decision trail:
 
 ## Privacy and trust boundary
 
-Semgrep and Gitleaks scanning, scope classification, patch validation, and file
-modification happen locally. OSV-Scanner may query vulnerability/package metadata
-services using dependency names and versions. For AI triage, AegisScan sends
+Semgrep and secret scanning, scope classification, patch validation, and file
+modification happen locally. Betterleaks network validation is deliberately not
+enabled, so candidate credentials are not sent to provider APIs. OSV-Scanner may
+query vulnerability/package metadata services using dependency names and
+versions. For AI triage, AegisScan sends
 Gemini the Semgrep finding, a bounded source excerpt around it, and locally
 generated structural context. Dependency and secret findings bypass Gemini. Do
 not scan a repository whose source is not permitted to be sent to the configured
@@ -58,7 +61,8 @@ the model cannot write files directly.
 | Python | 3.11 or newer when running from source |
 | Semgrep | 1.172 or newer; must be available on `PATH` or via `SEMGREP_COMMAND` |
 | OSV-Scanner | Version 2; must be available on `PATH` or via `OSV_SCANNER_COMMAND` |
-| Gitleaks | Current release; must be available on `PATH` or via `GITLEAKS_COMMAND` |
+| Betterleaks | Current release; must be available on `PATH` or via `BETTERLEAKS_COMMAND` |
+| Gitleaks | Optional compatibility fallback when Betterleaks is unavailable |
 | Gemini | API key with access to a configured model |
 
 The prebuilt app is architecture-specific. Build on Apple Silicon for an arm64
@@ -80,7 +84,7 @@ Installing `requirements.txt` provides Semgrep for source-based runs. Install th
 supplemental command-line scanners separately:
 
 ```bash
-brew install osv-scanner gitleaks
+brew install osv-scanner betterleaks
 ```
 
 The desktop app checks `PATH`, `/opt/homebrew/bin`, and `/usr/local/bin` for all
@@ -101,19 +105,24 @@ In the app:
 
 1. Semgrep runs the bundled coverage-floor rules plus the `security-audit` and
    Python registries against the configured repository scope.
-2. OSV-Scanner checks supported dependency manifests and lockfiles. Gitleaks
-   scans both current files and Git history with 100% match redaction.
+2. OSV-Scanner checks supported dependency manifests and lockfiles. Betterleaks
+   scans current files and Git history with 100% match redaction; Gitleaks is
+   used only when Betterleaks is unavailable.
 3. Every raw result receives a stable detector-specific identifier and a
    deterministic code role.
-4. Semgrep findings are grouped by directory and packed into batches of at most 15.
+4. Exact duplicate Semgrep records are removed. Secret matches in tests,
+   fixtures, generated files, documentation, dependencies, and ignored paths
+   are retained as Non-runtime instead of inflating the review queue.
+5. Semgrep findings are grouped by directory and packed into batches of at most 15.
    Python files receive local import, definition, and call-edge context.
-5. Deterministic and non-runtime findings bypass Gemini. Runtime Semgrep findings are sent
+6. Deterministic and non-runtime findings bypass Gemini. Runtime Semgrep findings are sent
    through the stable `gemini-3.6-flash` → `gemini-3.5-flash` failover chain.
-6. The returned JSON is validated as a strict `ReviewReport`. Missing or invalid
+7. The returned JSON is validated as a strict `ReviewReport`. Missing or invalid
    candidate decisions become Needs review instead of disappearing.
-7. Confirmed findings are reconciled against real repository paths, lines, code
-   roles, and canonical sensitive sinks.
-8. Optional fixes pass secret, control-flow, ambiguity, and syntax checks before
+8. Confirmed findings are reconciled against real repository paths, lines, code
+   roles, and canonical sensitive sinks. Overlapping Semgrep and secret-scanner
+   findings at the same sink are consolidated into one issue.
+9. Optional fixes pass secret, control-flow, ambiguity, and syntax checks before
    an atomic write.
 
 Semgrep parser errors in known non-runtime files remain visible as non-runtime
@@ -159,7 +168,7 @@ generated/**
 
 This scope file controls how findings are classified in the evidence ledger. To
 skip files during Semgrep discovery, edit the comma-separated exclusions in **New
-Audit** or **Settings**. The maximum Semgrep/Gitleaks target size is configurable
+Audit** or **Settings**. The maximum Semgrep/secret-scanner target size is configurable
 from 1–100 MB; increasing it can materially increase scan time and memory use.
 
 ## Configuration
@@ -176,8 +185,10 @@ from 1–100 MB; increasing it can materially increase scan time and memory use.
 | `SEMGREP_COMMAND` | Explicit Semgrep executable path | auto-detected |
 | `AEGISSCAN_OSV_TIMEOUT` | OSV-Scanner process timeout, in seconds | `300` |
 | `OSV_SCANNER_COMMAND` | Explicit OSV-Scanner executable path | auto-detected |
-| `AEGISSCAN_GITLEAKS_TIMEOUT` | Gitleaks process timeout per mode, in seconds | `300` |
-| `GITLEAKS_COMMAND` | Explicit Gitleaks executable path | auto-detected |
+| `AEGISSCAN_BETTERLEAKS_TIMEOUT` | Secret-scanner timeout per mode, in seconds | `300` |
+| `BETTERLEAKS_COMMAND` | Explicit Betterleaks executable path | auto-detected |
+| `AEGISSCAN_GITLEAKS_TIMEOUT` | Legacy fallback timeout when the Betterleaks value is unset | `300` |
+| `GITLEAKS_COMMAND` | Explicit Gitleaks fallback executable path | auto-detected |
 | `GITHUB_TOKEN` | Optional credential for publishing fixes | none |
 | `GITHUB_REPOSITORY` | Optional `owner/repository` publishing target | none |
 
@@ -220,7 +231,7 @@ tokens in environment variables instead of shell-history arguments.
 ## Build the macOS app
 
 ```bash
-PYTHON_BIN=python3.13 ./scripts/build_macos_app.sh
+PYTHON_BOOTSTRAP=python3.13 ./scripts/build_macos_app.sh
 dist/AegisScan.app/Contents/MacOS/AegisScan --self-test
 codesign --verify --deep --strict dist/AegisScan.app
 open dist/AegisScan.app
@@ -233,7 +244,7 @@ and notarization workflow.
 
 ### GitHub prereleases
 
-Pushing a semantic version tag such as `v0.2.0` runs
+Pushing a semantic version tag such as `v0.2.1` runs
 `.github/workflows/release.yml`. GitHub builds separate native bundles on
 `macos-15-intel` and `macos-15`, verifies their actual `x86_64` and `arm64`
 architectures, and publishes both ZIP files plus SHA-256 checksums as a GitHub
@@ -263,7 +274,12 @@ reporting guidance.
 - Dependency matches are version-based; they do not prove that vulnerable code is
   reachable at runtime.
 - Secret matches identify credential-shaped values but do not test whether a
-  credential is valid. Detected credentials should be reviewed and rotated.
+  credential is valid. Generic patterns remain Needs review, while specific
+  credential formats in current runtime source may be confirmed. Detected
+  credentials should still be reviewed and rotated.
+- Betterleaks live validation is intentionally disabled because it can make
+  outbound requests containing candidate credentials. AegisScan does not enable
+  it implicitly.
 - Historical secret remediation is manual; AegisScan does not rewrite Git history.
 - Large files or unusual languages can exceed Semgrep resource or parser limits;
   those gaps must not be interpreted as clean results.
