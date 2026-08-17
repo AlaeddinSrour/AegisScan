@@ -1,9 +1,9 @@
 PyGithub>=2.9.1,<3.0
-google-genai>=2.17.0,<3.0
+google-genai>=2.18.1,<3.0
 # Pin the official universal macOS wheel. Source builds can link against the
 # runner's older OpenSSL and then fail after PyInstaller bundles the app.
-cryptography==48.0.0
+cryptography==48.0.1
 requests>=2.34.2,<3.0
 pydantic>=2.13.4,<3.0
-semgrep>=1.172.0,<2.0
+semgrep>=1.173.0,<2.0
 PySide6>=6.11.1,<7.0
