@@ -46,3 +46,404 @@ rules:
     metadata:
       confidence: HIGH
       category: secrets
+
+  - id: aegisscan.python.user-input-to-network-request
+    message: User-controlled URL data reaches an outbound network request and may permit SSRF.
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.args.get(...)
+          - pattern: $REQ.args[$KEY]
+          - pattern: $REQ.form.get(...)
+          - pattern: $REQ.form[$KEY]
+          - pattern: $REQ.GET.get(...)
+          - pattern: $REQ.GET[$KEY]
+          - pattern: $REQ.POST.get(...)
+          - pattern: $REQ.POST[$KEY]
+          - pattern: $REQ.get_json(...)
+          - pattern: $REQ.json
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.get($URL, ...)
+              - pattern: requests.post($URL, ...)
+              - pattern: requests.put($URL, ...)
+              - pattern: requests.patch($URL, ...)
+              - pattern: requests.delete($URL, ...)
+              - pattern: requests.request($METHOD, $URL, ...)
+              - pattern: httpx.get($URL, ...)
+              - pattern: httpx.post($URL, ...)
+              - pattern: httpx.put($URL, ...)
+              - pattern: httpx.patch($URL, ...)
+              - pattern: httpx.delete($URL, ...)
+              - pattern: httpx.request($METHOD, $URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: aiohttp.request($METHOD, $URL, ...)
+              - pattern: aiohttp.ClientSession().get($URL, ...)
+              - pattern: aiohttp.ClientSession().post($URL, ...)
+              - pattern: aiohttp.ClientSession().request($METHOD, $URL, ...)
+          - focus-metavariable: $URL
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-918
+      technology: [flask, django, requests, httpx, urllib, aiohttp]
+
+  - id: aegisscan.javascript.user-input-to-network-request
+    message: User-controlled URL data reaches an outbound network request and may permit SSRF.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.body.$FIELD
+          - pattern: $REQ.body[$FIELD]
+          - pattern: $REQ.query.$FIELD
+          - pattern: $REQ.query[$FIELD]
+          - pattern: $REQ.params.$FIELD
+          - pattern: $REQ.params[$FIELD]
+          - pattern: $REQ.headers.$FIELD
+          - pattern: $REQ.headers[$FIELD]
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: axios.get($URL, ...)
+              - pattern: axios.post($URL, ...)
+              - pattern: axios.put($URL, ...)
+              - pattern: axios.patch($URL, ...)
+              - pattern: axios.delete($URL, ...)
+              - pattern: http.get($URL, ...)
+              - pattern: http.request($URL, ...)
+              - pattern: https.get($URL, ...)
+              - pattern: https.request($URL, ...)
+              - pattern: got($URL, ...)
+          - focus-metavariable: $URL
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-918
+      technology: [express, fetch, axios, node]
+
+  - id: aegisscan.python.filesystem-check-then-use
+    message: A filesystem check is followed by a path operation that may be vulnerable to a TOCTOU race.
+    languages: [python]
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-inside: |
+                  if os.path.exists($PATH):
+                    ...
+              - pattern-either: &python_path_operations
+                  - pattern: open($PATH, ...)
+                  - pattern: os.open($PATH, ...)
+                  - pattern: os.remove($PATH)
+                  - pattern: os.unlink($PATH)
+                  - pattern: os.rename($PATH, ...)
+                  - pattern: os.replace($PATH, ...)
+                  - pattern: os.chmod($PATH, ...)
+                  - pattern: os.chown($PATH, ...)
+          - patterns:
+              - pattern-inside: |
+                  if os.path.lexists($PATH):
+                    ...
+              - pattern-either: *python_path_operations
+          - patterns:
+              - pattern-inside: |
+                  if os.path.isfile($PATH):
+                    ...
+              - pattern-either: *python_path_operations
+          - patterns:
+              - pattern-inside: |
+                  if os.path.islink($PATH):
+                    ...
+              - pattern-either: *python_path_operations
+          - patterns:
+              - pattern-inside: |
+                  if os.access($PATH, ...):
+                    ...
+              - pattern-either: *python_path_operations
+          - patterns:
+              - pattern-inside: |
+                  if $PATH.exists():
+                    ...
+              - pattern-either:
+                  - pattern: $PATH.open(...)
+                  - pattern: $PATH.read_text(...)
+                  - pattern: $PATH.read_bytes(...)
+                  - pattern: $PATH.unlink(...)
+                  - pattern: $PATH.rename(...)
+                  - pattern: $PATH.replace(...)
+                  - pattern: $PATH.chmod(...)
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-367
+      technology: [python, filesystem]
+
+  - id: aegisscan.javascript.filesystem-check-then-use
+    message: A synchronous filesystem existence check is followed by a path operation that may be vulnerable to a TOCTOU race.
+    languages: [javascript, typescript]
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - pattern: |
+              if ($FS.existsSync($PATH)) {
+                ...
+                $FS.readFileSync($PATH, ...);
+                ...
+              }
+          - pattern: |
+              if ($FS.existsSync($PATH)) {
+                ...
+                $FS.openSync($PATH, ...);
+                ...
+              }
+          - pattern: |
+              if ($FS.existsSync($PATH)) {
+                ...
+                $FS.unlinkSync($PATH, ...);
+                ...
+              }
+          - pattern: |
+              if ($FS.existsSync($PATH)) {
+                ...
+                $FS.renameSync($PATH, ...);
+                ...
+              }
+          - pattern: |
+              if ($FS.existsSync($PATH)) {
+                ...
+                $FS.chmodSync($PATH, ...);
+                ...
+              }
+          - pattern: |
+              await $FS.promises.access($PATH, ...);
+              ...
+              await $FS.promises.readFile($PATH, ...)
+          - pattern: |
+              await $FS.promises.access($PATH, ...);
+              ...
+              await $FS.promises.open($PATH, ...)
+          - pattern: |
+              await $FS.promises.access($PATH, ...);
+              ...
+              await $FS.promises.unlink($PATH, ...)
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-367
+      technology: [node, filesystem]
+
+  - id: aegisscan.go.user-input-to-network-request
+    message: User-controlled URL data reaches an outbound network request and may permit SSRF.
+    languages: [go]
+    severity: ERROR
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.URL.Query().Get(...)
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.Header.Get(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: http.Get($URL)
+              - pattern: http.Post($URL, ...)
+              - pattern: http.PostForm($URL, ...)
+              - pattern: http.Head($URL)
+              - pattern: $CLIENT.Do($URL)
+          - focus-metavariable: $URL
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-918
+      technology: [go, net-http]
+
+  - id: aegisscan.go.filesystem-check-then-use
+    message: A filesystem metadata check is followed by a path operation that may be vulnerable to a TOCTOU race.
+    languages: [go]
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-inside: |
+                  if _, $ERR := os.Stat($PATH); $ERR == nil {
+                    ...
+                  }
+              - pattern-either: &go_path_operations
+                  - pattern: os.Open($PATH)
+                  - pattern: os.OpenFile($PATH, ...)
+                  - pattern: os.ReadFile($PATH)
+                  - pattern: os.Remove($PATH)
+                  - pattern: os.RemoveAll($PATH)
+                  - pattern: os.Rename($PATH, ...)
+                  - pattern: os.Chmod($PATH, ...)
+                  - pattern: os.Chown($PATH, ...)
+          - patterns:
+              - pattern-inside: |
+                  if _, $ERR := os.Lstat($PATH); $ERR == nil {
+                    ...
+                  }
+              - pattern-either: *go_path_operations
+          - pattern: |
+              if _, $ERR := os.Stat($PATH); $ERR != nil {
+                ...
+              }
+              ...
+              os.ReadFile($PATH)
+          - pattern: |
+              if _, $ERR := os.Stat($PATH); $ERR != nil {
+                ...
+              }
+              ...
+              os.Open($PATH)
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-367
+      technology: [go, filesystem]
+
+  - id: aegisscan.java.user-input-to-network-request
+    message: User-controlled URL data reaches an outbound network request and may permit SSRF.
+    languages: [java]
+    severity: ERROR
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.getParameter(...)
+          - pattern: $REQ.getHeader(...)
+          - pattern: $REQ.getQueryString()
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: new URL($URL).openConnection(...)
+              - pattern: URI.create($URL).toURL().openConnection(...)
+              - pattern: HttpRequest.newBuilder(URI.create($URL))
+              - pattern: $REST.getForObject($URL, ...)
+              - pattern: $REST.getForEntity($URL, ...)
+              - pattern: $REST.postForObject($URL, ...)
+              - pattern: $REST.exchange($URL, ...)
+          - focus-metavariable: $URL
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-918
+      technology: [java, servlet, spring]
+
+  - id: aegisscan.java.filesystem-check-then-use
+    message: A filesystem existence check is followed by a path operation that may be vulnerable to a TOCTOU race.
+    languages: [java]
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-inside: |
+                  if (Files.exists($PATH)) {
+                    ...
+                  }
+              - pattern-either: &java_path_operations
+                  - pattern: Files.newInputStream($PATH, ...)
+                  - pattern: Files.newOutputStream($PATH, ...)
+                  - pattern: Files.readAllBytes($PATH)
+                  - pattern: Files.readString($PATH, ...)
+                  - pattern: Files.delete($PATH)
+                  - pattern: Files.deleteIfExists($PATH)
+                  - pattern: Files.move($PATH, ...)
+                  - pattern: Files.setPosixFilePermissions($PATH, ...)
+          - patterns:
+              - pattern-inside: |
+                  if (Files.notExists($PATH)) {
+                    ...
+                  }
+              - pattern-either: *java_path_operations
+          - patterns:
+              - pattern-inside: |
+                  if ($FILE.exists()) {
+                    ...
+                  }
+              - pattern-either:
+                  - pattern: new FileInputStream($FILE)
+                  - pattern: new FileOutputStream($FILE)
+                  - pattern: $FILE.delete()
+                  - pattern: $FILE.renameTo(...)
+                  - pattern: $FILE.setReadable(...)
+                  - pattern: $FILE.setWritable(...)
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-367
+      technology: [java, nio, filesystem]
+
+  - id: aegisscan.csharp.user-input-to-network-request
+    message: User-controlled URL data reaches an outbound network request and may permit SSRF.
+    languages: [csharp]
+    severity: ERROR
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.Query[$KEY]
+          - pattern: $REQ.QueryString[$KEY]
+          - pattern: $REQ.Form[$KEY]
+          - pattern: $REQ.Headers[$KEY]
+          - pattern: $REQ.RouteValues[$KEY]
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CLIENT.GetAsync($URL, ...)
+              - pattern: $CLIENT.PostAsync($URL, ...)
+              - pattern: $CLIENT.PutAsync($URL, ...)
+              - pattern: $CLIENT.DeleteAsync($URL, ...)
+              - pattern: $CLIENT.GetStringAsync($URL, ...)
+              - pattern: WebRequest.Create($URL)
+              - pattern: WebRequest.CreateHttp($URL)
+              - pattern: $CLIENT.DownloadString($URL)
+          - focus-metavariable: $URL
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-918
+      technology: [csharp, aspnet, dotnet]
+
+  - id: aegisscan.csharp.filesystem-check-then-use
+    message: A filesystem existence check is followed by a path operation that may be vulnerable to a TOCTOU race.
+    languages: [csharp]
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-inside: |
+                  if (File.Exists($PATH)) {
+                    ...
+                  }
+              - pattern-either: &csharp_path_operations
+                  - pattern: File.Open($PATH, ...)
+                  - pattern: File.OpenRead($PATH)
+                  - pattern: File.OpenWrite($PATH)
+                  - pattern: File.ReadAllText($PATH, ...)
+                  - pattern: File.ReadAllTextAsync($PATH, ...)
+                  - pattern: File.ReadAllBytes($PATH)
+                  - pattern: File.ReadAllBytesAsync($PATH, ...)
+                  - pattern: File.Delete($PATH)
+                  - pattern: File.Move($PATH, ...)
+                  - pattern: File.SetAttributes($PATH, ...)
+          - patterns:
+              - pattern-inside: |
+                  if (Directory.Exists($PATH)) {
+                    ...
+                  }
+              - pattern-either:
+                  - pattern: Directory.Delete($PATH, ...)
+                  - pattern: Directory.Move($PATH, ...)
+                  - pattern: Directory.GetFiles($PATH, ...)
+                  - pattern: Directory.GetDirectories($PATH, ...)
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-367
+      technology: [csharp, dotnet, filesystem]

@@ -2,7 +2,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.full_scan import batch_findings, run_full_scan, split_semgrep_findings
+from src.full_scan import (
+    _requires_manual_remediation,
+    batch_findings,
+    run_full_scan,
+    split_semgrep_findings,
+)
 from src.models import FindingDisposition, ReviewIssue, ReviewReport
 from src.semgrep_runner import DEFAULT_EXCLUDES, DEFAULT_MAX_TARGET_BYTES
 from src.supplemental_scanners import DetectorResult
@@ -94,6 +99,7 @@ def test_run_full_scan_disables_diff_filter_and_merges_report(tmp_path):
         changed_files_lines=None,
         exclude_patterns=DEFAULT_EXCLUDES,
         max_target_bytes=DEFAULT_MAX_TARGET_BYTES,
+        rule_mode="bundled",
     )
     assert outcome.raw_finding_count == 1
     assert outcome.batch_count == 1
@@ -168,6 +174,35 @@ def test_clean_semgrep_still_runs_supplemental_detectors(tmp_path, monkeypatch):
     assert outcome.total_finding_count == 1
     assert outcome.report.issues == [dependency_issue]
     assert not outcome.audit_degraded
+
+
+def test_detector_only_scan_needs_no_api_key_and_retains_runtime_candidates(tmp_path):
+    (tmp_path / "app.py").write_text("dangerous()\n", encoding="utf-8")
+    progress_events: list[str] = []
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=_finding(1, "app.py")):
+        with patch("src.full_scan.call_gemini_with_failover") as ai_call:
+            outcome = run_full_scan(
+                str(tmp_path),
+                "",
+                ai_triage=False,
+                progress=progress_events.append,
+            )
+
+    ai_call.assert_not_called()
+    assert outcome.ai_triage_enabled is False
+    assert outcome.ai_attempted_batches == 0
+    assert outcome.ai_successful_batches == 0
+    assert outcome.report.issues == []
+    assert outcome.disposition_count("NEEDS_REVIEW") == 1
+    assert outcome.report.dispositions[0].confidence == "LOW"
+    assert not outcome.audit_degraded
+    assert any("intentionally disabled" in event for event in progress_events)
+
+
+def test_ai_triage_still_requires_an_api_key_or_client(tmp_path):
+    with pytest.raises(ValueError, match="Gemini API key"):
+        run_full_scan(str(tmp_path), "")
 
 
 def test_detector_failure_marks_audit_degraded(tmp_path, monkeypatch):
@@ -320,6 +355,27 @@ def test_hardcoded_private_key_requires_manual_remediation(tmp_path):
 
     assert len(outcome.report.issues) == 1
     assert outcome.report.issues[0].remediation_type == "MANUAL_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    ("issue_name", "rule_id"),
+    [
+        ("Server-Side Request Forgery", "aegisscan.python.user-input-to-network-request"),
+        ("Filesystem Race", "aegisscan.python.filesystem-check-then-use"),
+    ],
+)
+def test_ssrf_and_toctou_require_manual_remediation(issue_name, rule_id):
+    issue = ReviewIssue(
+        file="app.py",
+        line=1,
+        severity="HIGH",
+        issue_name=issue_name,
+        description="Attacker input reaches a sensitive operation.",
+        original_code="unsafe(value)",
+        suggested_fix="safer(value)",
+    )
+
+    assert _requires_manual_remediation(issue, rule_id)
 
 
 def test_partial_batch_failure_preserves_candidates_for_review(tmp_path):

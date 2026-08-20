@@ -121,12 +121,18 @@ jobs:
       RELEASE_NOTES: |
         Native Intel and Apple Silicon beta builds of AegisScan.
 
+        Highlights:
+        - Reproducible SSRF and TOCTOU rules for Python, JavaScript/TypeScript, Go, Java, and C#
+        - Bundled ruleset SHA-256 identity in JSON and SARIF reports
+        - Detector-only CLI audits without a Gemini credential
+        - GitHub Code Scanning-compatible SARIF 2.1.0 export
+
         Requirements:
         - macOS 12 or newer
         - Semgrep available on the system
         - OSV-Scanner available on the system
         - Betterleaks available on the system (Gitleaks is supported as a fallback)
-        - A Gemini API key
+        - A Gemini API key for contextual AI triage (not required for detector-only mode)
 
         These beta bundles are ad-hoc signed and are not Apple-notarized. Findings and generated fixes require human review.
     steps:

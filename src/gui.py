@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from datetime import datetime
@@ -66,7 +65,8 @@ from . import __version__
 from .full_scan import ScanOutcome, run_full_scan
 from .github_ops import apply_auto_fixes_with_paths, auto_fix_eligibility
 from .models import FindingDisposition, ReviewIssue
-from .semgrep_runner import DEFAULT_EXCLUDES
+from .reporting import write_json_report, write_sarif_report
+from .semgrep_runner import DEFAULT_EXCLUDES, SEMGREP_RULE_MODES
 
 
 APP_STYLE = """
@@ -668,6 +668,7 @@ class ScanWorker(QObject):
                 secret_scan=bool(self.options["secret_scan"]),
                 exclude_patterns=list(self.options["exclude_patterns"]),
                 max_target_bytes=int(self.options["max_target_bytes"]),
+                semgrep_rule_mode=str(self.options["semgrep_rule_mode"]),
                 progress=self.progress.emit,
             )
             self.completed.emit(outcome)
@@ -1117,10 +1118,19 @@ class NewScanPage(QWidget):
         option_right.addWidget(self.audit_mode_label)
         self.audit_mode = QComboBox()
         self.audit_mode.setMinimumHeight(40)
-        self.audit_mode.addItems(
-            ["Full repository · SAST + dependencies + secrets", "Custom detector set"]
+        self.audit_mode.addItem(
+            "Reproducible · bundled rules only", "bundled"
         )
-        self.audit_mode.model().item(1).setEnabled(False)
+        self.audit_mode.addItem(
+            "Extended · bundled + live Semgrep Registry", "extended"
+        )
+        selected_mode = self.audit_mode.findData(app.semgrep_rule_mode)
+        self.audit_mode.setCurrentIndex(max(0, selected_mode))
+        self.audit_mode.currentIndexChanged.connect(
+            lambda _index: app.set_semgrep_rule_mode(
+                str(self.audit_mode.currentData())
+            )
+        )
         option_right.addWidget(self.audit_mode)
         options_row.addLayout(option_right, 1)
         config_layout.addWidget(self.options_panel)
@@ -1661,7 +1671,10 @@ class ReportsPage(QWidget):
         layout.addWidget(label("WORKSPACE / REPORTS", "Eyebrow"))
         layout.addWidget(label("Audit reports", "PageTitle"))
         layout.addWidget(
-            label("Export the current structured ReviewReport for archival or downstream review.", "PageSubtitle")
+            label(
+                "Export structured JSON for archival or SARIF 2.1.0 for code-scanning tools.",
+                "PageSubtitle",
+            )
         )
         summary = card()
         summary_layout = QHBoxLayout(summary)
@@ -1671,7 +1684,7 @@ class ReportsPage(QWidget):
         self.summary = label("No audit has been completed in this session.", "Muted")
         summary_text.addWidget(self.summary)
         summary_layout.addLayout(summary_text, 1)
-        self.export_button = primary_button("Export JSON…", app.export_report)
+        self.export_button = primary_button("Export report…", app.export_report)
         self.export_button.setEnabled(False)
         summary_layout.addWidget(self.export_button)
         layout.addWidget(summary)
@@ -1818,6 +1831,16 @@ class SettingsPage(QWidget):
         self.exclusions = QLineEdit(app.exclusion_text)
         self.exclusions.textChanged.connect(app.set_exclusion_text)
         audit_layout.addWidget(self.exclusions)
+        audit_layout.addWidget(label("Semgrep rule mode", "Muted"))
+        self.rule_mode = QComboBox()
+        self.rule_mode.addItem("Reproducible · bundled rules only", "bundled")
+        self.rule_mode.addItem("Extended · live registry augmentation", "extended")
+        selected_mode = self.rule_mode.findData(app.semgrep_rule_mode)
+        self.rule_mode.setCurrentIndex(max(0, selected_mode))
+        self.rule_mode.currentIndexChanged.connect(
+            lambda _index: app.set_semgrep_rule_mode(str(self.rule_mode.currentData()))
+        )
+        audit_layout.addWidget(self.rule_mode)
         self.dependency_scan = QCheckBox("Enable OSV dependency scanning")
         self.dependency_scan.setChecked(app.dependency_scan)
         self.dependency_scan.toggled.connect(app.set_dependency_scan)
@@ -1874,6 +1897,14 @@ class AegisScanWindow(QMainWindow):
         )
         self.secret_scan = (
             str(self.settings.value("secret_scan", "true")).lower() == "true"
+        )
+        configured_rule_mode = str(
+            self.settings.value("semgrep_rule_mode", "bundled")
+        )
+        self.semgrep_rule_mode = (
+            configured_rule_mode
+            if configured_rule_mode in SEMGREP_RULE_MODES
+            else "bundled"
         )
         self.apply_fixes = str(self.settings.value("apply_fixes", "false")).lower() == "true"
         self.create_pr = False
@@ -2145,6 +2176,21 @@ class AegisScanWindow(QMainWindow):
         if hasattr(self, "app_settings") and self.app_settings.exclusions.text() != value:
             self.app_settings.exclusions.setText(value)
 
+    def set_semgrep_rule_mode(self, value: str) -> None:
+        if value not in SEMGREP_RULE_MODES:
+            return
+        self.semgrep_rule_mode = value
+        self.settings.setValue("semgrep_rule_mode", value)
+        for widget in (
+            getattr(getattr(self, "new_scan", None), "audit_mode", None),
+            getattr(getattr(self, "app_settings", None), "rule_mode", None),
+        ):
+            if widget is None:
+                continue
+            index = widget.findData(value)
+            if index >= 0 and widget.currentIndex() != index:
+                widget.setCurrentIndex(index)
+
     def set_dependency_scan(self, checked: bool) -> None:
         self.dependency_scan = checked
         self.settings.setValue("dependency_scan", checked)
@@ -2247,6 +2293,7 @@ class AegisScanWindow(QMainWindow):
                 if pattern.strip()
             ],
             "max_target_bytes": self.max_target_mb * 1_000_000,
+            "semgrep_rule_mode": self.semgrep_rule_mode,
         }
         self.navigate("new_scan")
         self.new_scan.set_running(True)
@@ -2332,40 +2379,25 @@ class AegisScanWindow(QMainWindow):
         if not self.outcome:
             self._error("Run an audit before exporting a report.")
             return
-        destination, _ = QFileDialog.getSaveFileName(
+        destination, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export AegisScan report",
             str(Path.home() / "aegisscan-report.json"),
-            "JSON report (*.json)",
+            "JSON report (*.json);;SARIF report (*.sarif)",
         )
         if not destination:
             return
-        if not destination.endswith(".json"):
-            destination += ".json"
-        payload = {
-            "summary": {
-                "raw_semgrep_findings": self.outcome.raw_finding_count,
-                "dependency_findings": self.outcome.dependency_finding_count,
-                "secret_findings": self.outcome.secret_finding_count,
-                "total_detector_findings": self.outcome.total_finding_count,
-                "batches": self.outcome.batch_count,
-                "failed_batches": self.outcome.failed_batches,
-                "failed_batch_reasons": self.outcome.failed_batch_reasons,
-                "ai_attempted_batches": self.outcome.ai_attempted_batches,
-                "ai_successful_batches": self.outcome.ai_successful_batches,
-                "ai_triage_degraded": self.outcome.ai_triage_degraded,
-                "audit_degraded": self.outcome.audit_degraded,
-                "detector_errors": self.outcome.detector_errors,
-                "dependency_scan_enabled": self.outcome.dependency_scan_enabled,
-                "secret_scan_enabled": self.outcome.secret_scan_enabled,
-                "secret_scanner": self.outcome.secret_scanner,
-                "fixed_files": self.outcome.fixed_files,
-                "pull_request_url": self.outcome.pull_request_url,
-            },
-            "report": self.outcome.report.model_dump(),
-        }
-        Path(destination).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self.global_status.set_status("Report exported", "good")
+        export_sarif = "SARIF" in selected_filter or destination.endswith(".sarif")
+        if export_sarif:
+            if not destination.endswith(".sarif"):
+                destination += ".sarif"
+            write_sarif_report(self.outcome, destination)
+            self.global_status.set_status("SARIF exported", "good")
+        else:
+            if not destination.endswith(".json"):
+                destination += ".json"
+            write_json_report(self.outcome, destination)
+            self.global_status.set_status("JSON report exported", "good")
 
     def show_about(self) -> None:
         QMessageBox.about(

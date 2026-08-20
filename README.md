@@ -1,14 +1,20 @@
 # AegisScan
 
 [![CI](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/ci.yml/badge.svg)](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/ci.yml)
+[![AegisScan](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/aegisscan.yml/badge.svg)](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/aegisscan.yml)
 
 Local-first macOS security auditing with repository-wide Semgrep discovery,
 OSV dependency checks, redacted current/history secret detection, bounded Gemini
 triage, an explicit evidence ledger, and guarded remediation.
 
-> **Project status:** Version 0.2.1 beta. AegisScan is suitable for evaluation and
+> **Project status:** Version 0.3.0 beta. AegisScan is suitable for evaluation and
 > development workflows, but findings and generated fixes still require human
 > review before production use.
+
+Version 0.3.0 adds reproducible bundled SSRF and TOCTOU detection across Python,
+JavaScript/TypeScript, Go, Java, and C#; ruleset fingerprinting; JSON and SARIF
+2.1.0 export; a no-credential detector-only CLI mode; and automatic GitHub Code
+Scanning uploads.
 
 ## Why AegisScan
 
@@ -31,6 +37,9 @@ and preserves the complete decision trail:
   schema-validated responses.
 - Requires source, sink, reachability, and confidence evidence before promoting
   an issue to Confirmed.
+- Includes bundled Python, JavaScript/TypeScript, Go, Java, and C# discovery for
+  user-controlled URLs reaching common HTTP clients (SSRF) and filesystem
+  check-then-use sequences (TOCTOU).
 - Applies only deterministic safety-approved patches and validates modified
   syntax before committing an atomic file update.
 - Can optionally publish AegisScan-created fixes on a dedicated GitHub branch
@@ -42,7 +51,9 @@ Semgrep and secret scanning, scope classification, patch validation, and file
 modification happen locally. Betterleaks network validation is deliberately not
 enabled, so candidate credentials are not sent to provider APIs. OSV-Scanner may
 query vulnerability/package metadata services using dependency names and
-versions. For AI triage, AegisScan sends
+versions. The default bundled Semgrep mode is offline and content-fingerprinted;
+the optional extended mode downloads mutable community registry packs from
+Semgrep. For AI triage, AegisScan sends
 Gemini the Semgrep finding, a bounded source excerpt around it, and locally
 generated structural context. Dependency and secret findings bypass Gemini. Do
 not scan a repository whose source is not permitted to be sent to the configured
@@ -63,7 +74,7 @@ the model cannot write files directly.
 | OSV-Scanner | Version 2; must be available on `PATH` or via `OSV_SCANNER_COMMAND` |
 | Betterleaks | Current release; must be available on `PATH` or via `BETTERLEAKS_COMMAND` |
 | Gitleaks | Optional compatibility fallback when Betterleaks is unavailable |
-| Gemini | API key with access to a configured model |
+| Gemini | API key with access to a configured model; optional in detector-only CLI mode |
 
 The prebuilt app is architecture-specific. Build on Apple Silicon for an arm64
 bundle or on an Intel Mac for an x86_64 bundle.
@@ -97,14 +108,19 @@ In the app:
 1. Choose a repository.
 2. Enter a Gemini API key under **New Audit** or **Settings**.
 3. Keep automatic fixes disabled for the first review.
-4. Run the audit and inspect **Confirmed**, **Needs review**, and
+4. Choose **Reproducible** bundled rules, or explicitly select **Extended** if
+   live Semgrep Registry augmentation is desired.
+5. Run the audit and inspect **Confirmed**, **Needs review**, and
    **Non-runtime** separately.
-5. Export the JSON report if an auditable artifact is required.
+6. Export JSON for archival or SARIF for GitHub/CI integration.
 
 ## How an audit works
 
-1. Semgrep runs the bundled coverage-floor rules plus the `security-audit` and
-   Python registries against the configured repository scope.
+1. Semgrep runs the versioned bundled coverage-floor rules against the configured
+   repository scope and records their SHA-256 fingerprint. Extended mode also
+   downloads the mutable `security-audit` and Python registry packs. The bundled
+   floor includes SSRF taint flows and common TOCTOU sequences for Python,
+   JavaScript/TypeScript, Go, Java, and C#.
 2. OSV-Scanner checks supported dependency manifests and lockfiles. Betterleaks
    scans current files and Git history with 100% match redaction; Gitleaks is
    used only when Betterleaks is unavailable.
@@ -143,7 +159,7 @@ status `2`, preventing automation from treating incomplete triage as success.
 - **Critical & high** — focused priority queue.
 - **Needs review** — incomplete evidence, omitted candidates, and failed batches.
 - **Non-runtime** — scoped-out evidence retained for auditability.
-- **Reports** — JSON export and the retained analysis summary.
+- **Reports** — JSON and SARIF 2.1.0 export plus the retained analysis summary.
 - **Integrations** — optional GitHub pull-request publishing.
 - **Settings** — AI and audit defaults.
 
@@ -195,6 +211,15 @@ from 1–100 MB; increasing it can materially increase scan time and memory use.
 The default model identifiers are explicit rather than moving `-latest` aliases,
 so audit behavior does not silently change between releases.
 
+The Semgrep rule mode is selected in **New audit** or **Settings**, or with
+`--semgrep-rule-mode` in the CLI:
+
+- `bundled` (default) uses only version-controlled AegisScan rules, works offline,
+  and records the exact rules file SHA-256 in JSON and SARIF reports.
+- `extended` adds the live `p/security-audit` and `p/python` registry packs. It
+  provides broader community coverage, but requires network access and is not
+  reproducible because registry contents can change independently of AegisScan.
+
 ## CLI
 
 The CLI writes a report but does not modify or publish anything unless requested:
@@ -205,9 +230,34 @@ python -m src.full_scan \
   --api-key "$GEMINI_API_KEY" \
   --batch-size 12 \
   --max-target-bytes 1000000 \
+  --semgrep-rule-mode bundled \
   --exclude .git --exclude .venv --exclude node_modules \
-  --report aegisscan-report.json
+  --report aegisscan-report.json \
+  --sarif aegisscan-results.sarif
 ```
+
+The SARIF output contains Confirmed and Needs review results, while excluding
+deterministically Non-runtime and False positive evidence. It can be uploaded to
+GitHub Code Scanning or consumed by SARIF-compatible CI and editor tooling.
+
+For a local or CI audit that does not send code context to Gemini and needs no
+API key, use detector-only mode. Runtime candidates remain visible as Needs
+review instead of being promoted to Confirmed:
+
+```bash
+python -m src.full_scan \
+  --repo /path/to/repository \
+  --detector-only \
+  --semgrep-rule-mode bundled \
+  --report aegisscan-report.json \
+  --sarif aegisscan-results.sarif
+```
+
+The included `aegisscan.yml` workflow runs this reproducible mode on pushes and
+pull requests, retains both reports as artifacts, and uploads SARIF to GitHub
+Code Scanning. Dependency and secret scanning are disabled in that workflow
+because those external binaries are not installed on its runner; full local
+audits keep both detectors enabled by default.
 
 Dependency and secret scanning are enabled by default. Use
 `--no-dependency-scan` or `--no-secret-scan` only when intentionally running a
@@ -244,7 +294,7 @@ and notarization workflow.
 
 ### GitHub prereleases
 
-Pushing a semantic version tag such as `v0.2.1` runs
+Pushing a semantic version tag such as `v0.3.0` runs
 `.github/workflows/release.yml`. GitHub builds separate native bundles on
 `macos-15-intel` and `macos-15`, verifies their actual `x86_64` and `arm64`
 architectures, and publishes both ZIP files plus SHA-256 checksums as a GitHub
@@ -271,6 +321,17 @@ reporting guidance.
 - AegisScan is not a replacement for manual review, dynamic testing, penetration
   testing, or production monitoring.
 - The bundled rules are a coverage floor, not a complete vulnerability taxonomy.
+- SSRF coverage follows recognized web-request sources into common Python,
+  JavaScript/TypeScript, Go, Java, and C# HTTP clients. Custom frameworks,
+  wrapper clients, dynamically constructed call paths, DNS rebinding, and
+  redirect behavior can still require manual review or dynamic testing.
+- TOCTOU coverage finds common filesystem existence/access checks followed by
+  path operations, including Python `pathlib`, Node promise APIs, Go early
+  guards, Java `File`/`Files`, and C# synchronous or asynchronous reads. It does
+  not prove exploitability, model operating-system permissions, or detect every
+  cross-function and asynchronous race.
+- Confirmed SSRF and TOCTOU findings always require manual remediation because
+  safe destination policies and atomic filesystem semantics are application-specific.
 - Dependency matches are version-based; they do not prove that vulnerable code is
   reachable at runtime.
 - Secret matches identify credential-shaped values but do not test whether a

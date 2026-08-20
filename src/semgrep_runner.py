@@ -1,6 +1,7 @@
 """Semgrep runner with explicit failure handling and optional diff filtering."""
 
 from collections.abc import Iterable
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 SEMGREP_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_SEMGREP_TIMEOUT", "300"))
 DEFAULT_MAX_TARGET_BYTES = 1_000_000
 DEFAULT_EXCLUDES = (".git", ".venv", "node_modules")
+SEMGREP_RULE_MODES = ("bundled", "extended")
 
 
 def _error_detail(error: object) -> str:
@@ -124,12 +126,28 @@ def _aegisscan_rules_path() -> Path:
     return Path(__file__).resolve().with_name("aegisscan_rules.yml")
 
 
+def bundled_rules_sha256() -> str:
+    """Return the immutable content fingerprint recorded with each audit."""
+    return hashlib.sha256(_aegisscan_rules_path().read_bytes()).hexdigest()
+
+
+def _semgrep_configs(rule_mode: str) -> list[str]:
+    if rule_mode not in SEMGREP_RULE_MODES:
+        choices = ", ".join(SEMGREP_RULE_MODES)
+        raise ValueError(f"Unknown Semgrep rule mode {rule_mode!r}; choose {choices}.")
+    configs = [str(_aegisscan_rules_path())]
+    if rule_mode == "extended":
+        configs.extend(("p/security-audit", "p/python"))
+    return configs
+
+
 def run_semgrep_scan(
     repo_path: str,
     changed_files_lines: Optional[dict[str, set[int]]] = None,
     *,
     exclude_patterns: Iterable[str] | None = None,
     max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES,
+    rule_mode: str = "bundled",
 ) -> str:
     """
     Run Semgrep on the repository and return formatted findings for LLM triage.
@@ -156,10 +174,11 @@ def run_semgrep_scan(
         )
         semgrep_cmd = [
             _semgrep_executable(), "scan",
-            "--config", str(_aegisscan_rules_path()),
-            "--config", "p/security-audit",
-            "--config", "p/python",
+            "--disable-version-check",
+            "--metrics", "off",
         ]
+        for config in _semgrep_configs(rule_mode):
+            semgrep_cmd.extend(("--config", config))
         for pattern in excludes:
             semgrep_cmd.extend(("--exclude", pattern))
         semgrep_cmd.extend([
@@ -351,7 +370,7 @@ def run_semgrep_scan(
             f"Semgrep scan timed out after {SEMGREP_TIMEOUT_SECONDS}s; "
             "the repository cannot be reported as clean."
         )
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         raise
     except Exception as e:
         logger.error(f"Semgrep scan failed: {e}")

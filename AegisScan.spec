@@ -41,8 +41,8 @@ app = BUNDLE(
     bundle_identifier="com.aegisscan.desktop",
     info_plist={
         "CFBundleDisplayName": "AegisScan",
-        "CFBundleShortVersionString": "0.2.1",
-        "CFBundleVersion": "4",
+        "CFBundleShortVersionString": "0.3.0",
+        "CFBundleVersion": "5",
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,
     },

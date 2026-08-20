@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import logging
 import os
 import re
@@ -26,8 +25,15 @@ from .github_ops import (
 )
 from .models import FindingDisposition, ReviewIssue, ReviewReport
 from .prompt import build_full_scan_prompt
+from .reporting import write_json_report, write_sarif_report
 from .scope import classify_code_role, is_runtime_role, load_ignore_patterns
-from .semgrep_runner import DEFAULT_EXCLUDES, DEFAULT_MAX_TARGET_BYTES, run_semgrep_scan
+from .semgrep_runner import (
+    DEFAULT_EXCLUDES,
+    DEFAULT_MAX_TARGET_BYTES,
+    SEMGREP_RULE_MODES,
+    bundled_rules_sha256,
+    run_semgrep_scan,
+)
 from .supplemental_scanners import DetectorResult, scan_dependencies, scan_secrets
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -88,6 +94,9 @@ class ScanOutcome:
     dependency_scan_enabled: bool = True
     secret_scan_enabled: bool = True
     secret_scanner: str = ""
+    ai_triage_enabled: bool = True
+    semgrep_rule_mode: str = "bundled"
+    semgrep_rules_sha256: str = ""
     fixed_files: list[str] = field(default_factory=list)
     audit_branch: str = ""
     pull_request_url: str = ""
@@ -289,11 +298,20 @@ def _validated_issues(report: ReviewReport, repo_path: Path) -> list[ReviewIssue
     return valid
 
 
-def _requires_manual_remediation(issue: ReviewIssue) -> bool:
+def _requires_manual_remediation(
+    issue: ReviewIssue, detector_rule_id: str = ""
+) -> bool:
     evidence = " ".join(
-        (issue.issue_name, issue.description, issue.original_code, issue.suggested_fix)
+        (
+            issue.issue_name,
+            issue.description,
+            issue.original_code,
+            issue.suggested_fix,
+            issue.rule_id,
+            detector_rule_id,
+        )
     ).casefold()
-    secret_terms = (
+    manual_terms = (
         "private key",
         "hardcoded secret",
         "hard-coded secret",
@@ -302,8 +320,16 @@ def _requires_manual_remediation(issue: ReviewIssue) -> bool:
         "hmac secret",
         "credential",
         "password hash",
+        "ssrf",
+        "server-side request forgery",
+        "server side request forgery",
+        "toctou",
+        "time-of-check",
+        "time of check",
+        "filesystem-check-then-use",
+        "user-input-to-network-request",
     )
-    return any(term in evidence for term in secret_terms)
+    return any(term in evidence for term in manual_terms)
 
 
 def _issue_family(issue: ReviewIssue) -> str:
@@ -318,6 +344,7 @@ def _issue_family(issue: ReviewIssue) -> str:
         ("COMMAND_INJECTION", ("command injection", "shell injection")),
         ("PATH_TRAVERSAL", ("path traversal", "zip slip")),
         ("SSRF", ("ssrf", "server-side request forgery")),
+        ("TOCTOU", ("toctou", "time-of-check", "time of check", "check-then-use")),
         ("SECRET", ("private key", "hardcoded secret", "hard-coded secret", "hmac key", "jwt secret", "credential")),
     )
     for family, terms in families:
@@ -436,7 +463,7 @@ def _reconcile_batch_report(
 
         remediation_type = (
             "MANUAL_REQUIRED"
-            if _requires_manual_remediation(issue)
+            if _requires_manual_remediation(issue, candidate.rule_id)
             else issue.remediation_type
         )
         sink_file = issue.sink_file or issue.file
@@ -689,6 +716,8 @@ def run_full_scan(
     secret_scan: bool = True,
     exclude_patterns: Iterable[str] | None = None,
     max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES,
+    semgrep_rule_mode: str = "bundled",
+    ai_triage: bool = True,
     progress: Callable[[str], None] | None = None,
     client: genai.Client | None = None,
 ) -> ScanOutcome:
@@ -698,12 +727,15 @@ def run_full_scan(
     root = Path(repo_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Repository directory does not exist: {root}")
-    if not gemini_api_key and client is None:
+    if ai_triage and not gemini_api_key and client is None:
         raise ValueError("A Gemini API key is required.")
     if create_pull_request and not apply_fixes:
         raise ValueError("Pull-request creation requires auto-fix application.")
     if create_pull_request and (not github_token or not repository):
         raise ValueError("GitHub token and owner/repository are required to create a PR.")
+    if semgrep_rule_mode not in SEMGREP_RULE_MODES:
+        choices = ", ".join(SEMGREP_RULE_MODES)
+        raise ValueError(f"Unknown Semgrep rule mode {semgrep_rule_mode!r}; choose {choices}.")
     if create_pull_request:
         starting_branch = validate_publishable_worktree(str(root))
         notify(
@@ -714,6 +746,7 @@ def run_full_scan(
     notify(
         f"[SETUP] Full-repository mode · batch limit {max(1, min(int(batch_size), MAX_BATCH_SIZE))} · "
         f"target limit {max(1, int(max_target_bytes)):,} bytes · "
+        f"AI triage {'enabled' if ai_triage else 'disabled'} · "
         f"safe fixes {'enabled' if apply_fixes else 'disabled'} · "
         f"PR publishing {'enabled' if create_pull_request else 'disabled'}"
     )
@@ -728,7 +761,16 @@ def run_full_scan(
         "[SETUP] Semgrep exclusions: "
         + (", ".join(configured_excludes) if configured_excludes else "none")
     )
-    notify("[DISCOVER] Starting Semgrep with bundled, security-audit, and Python rulesets")
+    rules_fingerprint = bundled_rules_sha256()
+    rule_description = (
+        "versioned bundled rules only"
+        if semgrep_rule_mode == "bundled"
+        else "versioned bundled rules plus mutable live registry augmentation"
+    )
+    notify(
+        f"[DISCOVER] Starting Semgrep with {rule_description} · "
+        f"bundled SHA-256 {rules_fingerprint[:12]}"
+    )
     notify("[DISCOVER] Scope is the complete repository; pull-request diff filtering is disabled")
     semgrep_started = monotonic()
     formatted = run_semgrep_scan(
@@ -736,6 +778,7 @@ def run_full_scan(
         changed_files_lines=None,
         exclude_patterns=configured_excludes,
         max_target_bytes=max_target_bytes,
+        rule_mode=semgrep_rule_mode,
     )
     raw_findings = split_semgrep_findings(formatted)
     findings = _deduplicate_semgrep_findings(raw_findings)
@@ -820,7 +863,7 @@ def run_full_scan(
         f"[PLAN] Packed {len(findings)} findings into {len(batches)} context-bounded batches "
         f"(maximum {max(1, min(int(batch_size), MAX_BATCH_SIZE))} findings each)"
     )
-    gemini_client = client or genai.Client(api_key=gemini_api_key)
+    gemini_client = (client or genai.Client(api_key=gemini_api_key)) if ai_triage else None
     reports: list[tuple[int, ReviewReport]] = []
     failed_batches: list[int] = []
     failed_batch_reasons: dict[int, str] = {}
@@ -861,6 +904,54 @@ def run_full_scan(
             notify(
                 f"[SCOPE] Batch {index}/{len(batches)} contains only deterministic "
                 "non-runtime or incomplete-scan evidence; AI triage was skipped"
+            )
+            notify(
+                f"[BATCH {index}/{len(batches)}] Complete in "
+                f"{monotonic() - batch_started:.1f}s"
+            )
+            continue
+        if not ai_triage:
+            detector_only_dispositions = [
+                FindingDisposition(
+                    finding_id=candidate.finding_id,
+                    status=(
+                        "NEEDS_REVIEW"
+                        if is_runtime_role(candidate.code_role)
+                        else "NON_RUNTIME"
+                    ),
+                    reason=(
+                        "Detector-only mode intentionally skipped AI contextual triage; "
+                        "manual review is required."
+                        if is_runtime_role(candidate.code_role)
+                        else "Deterministic scope classification marked this path as "
+                        f"{candidate.code_role.lower()}."
+                    ),
+                    file=candidate.file,
+                    line=candidate.line,
+                    rule_id=candidate.rule_id,
+                    message=candidate.message,
+                    code_role=candidate.code_role,
+                    confidence="LOW",
+                )
+                for candidate in triage_findings
+            ]
+            detector_only_dispositions.extend(deterministic_dispositions)
+            reports.append(
+                (
+                    index,
+                    ReviewReport(
+                        analysis_scratchpad=(
+                            "Detector-only mode retained runtime candidates as Needs "
+                            "review without sending source context to an AI provider."
+                        ),
+                        issues=[],
+                        dispositions=detector_only_dispositions,
+                    ),
+                )
+            )
+            notify(
+                f"[AI] Batch {index}/{len(batches)} contextual triage intentionally "
+                "disabled; runtime candidates remain in Needs review"
             )
             notify(
                 f"[BATCH {index}/{len(batches)}] Complete in "
@@ -1030,6 +1121,9 @@ def run_full_scan(
             ),
             "",
         ),
+        ai_triage_enabled=ai_triage,
+        semgrep_rule_mode=semgrep_rule_mode,
+        semgrep_rules_sha256=rules_fingerprint,
     )
     if apply_fixes and merged.issues:
         remediation_started = monotonic()
@@ -1086,34 +1180,7 @@ def run_full_scan(
 
 
 def _write_report(outcome: ScanOutcome, output_path: str) -> None:
-    payload = {
-        "summary": {
-            "raw_semgrep_findings": outcome.raw_finding_count,
-            "dependency_findings": outcome.dependency_finding_count,
-            "secret_findings": outcome.secret_finding_count,
-            "total_detector_findings": outcome.total_finding_count,
-            "llm_batches": outcome.batch_count,
-            "failed_batches": outcome.failed_batches,
-            "failed_batch_reasons": outcome.failed_batch_reasons,
-            "ai_attempted_batches": outcome.ai_attempted_batches,
-            "ai_successful_batches": outcome.ai_successful_batches,
-            "ai_triage_degraded": outcome.ai_triage_degraded,
-            "audit_degraded": outcome.audit_degraded,
-            "detector_errors": outcome.detector_errors,
-            "dependency_scan_enabled": outcome.dependency_scan_enabled,
-            "secret_scan_enabled": outcome.secret_scan_enabled,
-            "secret_scanner": outcome.secret_scanner,
-            "confirmed_issues": len(outcome.report.issues),
-            "needs_review": outcome.disposition_count("NEEDS_REVIEW"),
-            "non_runtime": outcome.disposition_count("NON_RUNTIME"),
-            "false_positives": outcome.disposition_count("FALSE_POSITIVE"),
-            "fixed_files": outcome.fixed_files,
-            "audit_branch": outcome.audit_branch,
-            "pull_request_url": outcome.pull_request_url,
-        },
-        "report": outcome.report.model_dump(),
-    }
-    Path(output_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_json_report(outcome, output_path)
 
 
 def main() -> None:
@@ -1134,12 +1201,34 @@ def main() -> None:
     )
     parser.add_argument("--no-dependency-scan", action="store_true")
     parser.add_argument("--no-secret-scan", action="store_true")
+    parser.add_argument(
+        "--detector-only",
+        action="store_true",
+        help=(
+            "Run deterministic detectors without Gemini; runtime candidates are "
+            "reported as Needs review"
+        ),
+    )
+    parser.add_argument(
+        "--semgrep-rule-mode",
+        choices=SEMGREP_RULE_MODES,
+        default="bundled",
+        help=(
+            "bundled is offline and reproducible; extended also downloads mutable "
+            "security-audit and Python registry packs"
+        ),
+    )
     parser.add_argument("--apply-fixes", action="store_true")
     parser.add_argument("--create-pull-request", action="store_true")
     parser.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN", ""))
     parser.add_argument("--repository", default=os.getenv("GITHUB_REPOSITORY", ""))
     parser.add_argument("--base-branch", default="")
     parser.add_argument("--report", default="aegisscan-report.json")
+    parser.add_argument(
+        "--sarif",
+        default="",
+        help="Optional SARIF 2.1.0 output path for GitHub Code Scanning and CI tools",
+    )
     args = parser.parse_args()
 
     try:
@@ -1151,6 +1240,8 @@ def main() -> None:
             secret_scan=not args.no_secret_scan,
             exclude_patterns=args.exclude_patterns,
             max_target_bytes=args.max_target_bytes,
+            semgrep_rule_mode=args.semgrep_rule_mode,
+            ai_triage=not args.detector_only,
             apply_fixes=args.apply_fixes,
             create_pull_request=args.create_pull_request,
             github_token=args.github_token,
@@ -1159,6 +1250,9 @@ def main() -> None:
         )
         _write_report(outcome, args.report)
         logger.info("Wrote audit report to %s", args.report)
+        if args.sarif:
+            write_sarif_report(outcome, args.sarif)
+            logger.info("Wrote SARIF report to %s", args.sarif)
         if outcome.audit_degraded:
             logger.error(
                 "Audit completed in degraded mode; inspect detector_errors, Needs review, "

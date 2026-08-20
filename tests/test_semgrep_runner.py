@@ -2,7 +2,11 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock, mock_open
 import subprocess
-from src.semgrep_runner import _aegisscan_rules_path, run_semgrep_scan
+from src.semgrep_runner import (
+    _aegisscan_rules_path,
+    bundled_rules_sha256,
+    run_semgrep_scan,
+)
 
 
 def test_bundled_ruleset_exists():
@@ -11,6 +15,16 @@ def test_bundled_ruleset_exists():
     assert "express-sequelize-taint-sqli" in rules
     assert "hardcoded-private-key" in rules
     assert "hardcoded-hmac-key" in rules
+    assert "python.user-input-to-network-request" in rules
+    assert "javascript.user-input-to-network-request" in rules
+    assert "python.filesystem-check-then-use" in rules
+    assert "javascript.filesystem-check-then-use" in rules
+    assert "go.user-input-to-network-request" in rules
+    assert "go.filesystem-check-then-use" in rules
+    assert "java.user-input-to-network-request" in rules
+    assert "java.filesystem-check-then-use" in rules
+    assert "csharp.user-input-to-network-request" in rules
+    assert "csharp.filesystem-check-then-use" in rules
 
 def test_empty_stdout_fails_scan_completeness():
     with patch('subprocess.run') as mock_run:
@@ -31,7 +45,41 @@ def test_no_results_returns_empty():
         assert result == ""
         command = mock_run.call_args.args[0]
         assert str(_aegisscan_rules_path()) in command
+        assert "--disable-version-check" in command
+        assert command[command.index("--metrics") + 1] == "off"
+        assert "p/security-audit" not in command
+        assert "p/python" not in command
         assert mock_run.call_args.kwargs["env"]["SEMGREP_SEND_METRICS"] == "off"
+
+
+def test_extended_mode_adds_live_registry_rules():
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"results": []}),
+            stderr="",
+        )
+
+        run_semgrep_scan("/repo", rule_mode="extended")
+
+    command = mock_run.call_args.args[0]
+    assert "p/security-audit" in command
+    assert "p/python" in command
+
+
+def test_bundled_rule_fingerprint_is_stable_sha256():
+    fingerprint = bundled_rules_sha256()
+
+    assert len(fingerprint) == 64
+    assert int(fingerprint, 16) >= 0
+
+
+def test_unknown_rule_mode_is_rejected_before_semgrep_runs():
+    with patch("subprocess.run") as mock_run:
+        with pytest.raises(ValueError, match="Unknown Semgrep rule mode"):
+            run_semgrep_scan("/repo", rule_mode="moving-target")
+
+    mock_run.assert_not_called()
 
 
 def test_custom_exclusions_and_target_limit_are_forwarded():

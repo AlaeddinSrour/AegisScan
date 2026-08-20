@@ -1,0 +1,57 @@
+name: AegisScan detector audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: aegisscan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detector-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install AegisScan
+        run: python -m pip install -r requirements.txt
+
+      - name: Run reproducible detector-only audit
+        run: |
+          python -m src.full_scan \
+            --repo . \
+            --detector-only \
+            --no-dependency-scan \
+            --no-secret-scan \
+            --semgrep-rule-mode bundled \
+            --report aegisscan-ci-report.json \
+            --sarif aegisscan-ci.sarif
+
+      - name: Retain audit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: aegisscan-detector-audit
+          path: |
+            aegisscan-ci-report.json
+            aegisscan-ci.sarif
+          if-no-files-found: warn
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: ${{ always() && hashFiles('aegisscan-ci.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: aegisscan-ci.sarif
+          category: aegisscan-bundled-detectors

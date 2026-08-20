@@ -1,4 +1,5 @@
 import os
+import json
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,7 +21,40 @@ def test_main_window_builds_with_isolated_settings(tmp_path):
     assert window.windowTitle() == "AegisScan"
     assert "dashboard" in window.page_indexes
     assert window.new_scan.api_key_input.echoMode().name == "Password"
+    assert window.new_scan.audit_mode.currentData() == "bundled"
+    window.set_semgrep_rule_mode("extended")
+    assert window.new_scan.audit_mode.currentData() == "extended"
+    assert window.app_settings.rule_mode.currentData() == "extended"
 
+    window.close()
+    application.processEvents()
+
+
+def test_desktop_can_export_sarif(tmp_path, monkeypatch):
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path))
+    application = QApplication.instance() or QApplication([])
+    window = AegisScanWindow()
+    window.outcome = ScanOutcome(
+        report=ReviewReport(analysis_scratchpad="clean", issues=[]),
+        raw_finding_count=0,
+        batch_count=0,
+        semgrep_rule_mode="bundled",
+        semgrep_rules_sha256="b" * 64,
+    )
+    destination = tmp_path / "desktop-export.sarif"
+    monkeypatch.setattr(
+        "src.gui.QFileDialog.getSaveFileName",
+        lambda *_args, **_kwargs: (str(destination), "SARIF report (*.sarif)"),
+    )
+
+    window.export_report()
+
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert payload["version"] == "2.1.0"
+    assert payload["runs"][0]["invocations"][0]["properties"][
+        "semgrepRuleMode"
+    ] == "bundled"
     window.close()
     application.processEvents()
 

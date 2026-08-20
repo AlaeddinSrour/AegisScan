@@ -19,6 +19,7 @@ SECURITY_REVIEW_GUIDANCE = r"""
 5. SSRF fixes must validate scheme and destination against an allowlist and reject private, loopback, link-local, and metadata endpoints where relevant.
 6. Database queries must use parameter binding, never interpolated query strings.
 7. Replace unsafe parsers/deserializers with safe loaders or hardened libraries.
+8. SSRF and TOCTOU remediation is application-specific and must use `MANUAL_REQUIRED`; never emit an automatic patch for either family.
 
 ### Semgrep Triage
 - Every supplied finding has a stable `Candidate ID` and deterministic `code role`.

@@ -36,6 +36,7 @@ htmlcov/
 .env.*
 !.env.example
 *aegisscan-report*.json
+*aegisscan*.sarif
 
 # Local application state and logs
 *.log
