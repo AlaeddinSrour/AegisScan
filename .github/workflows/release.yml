@@ -24,8 +24,8 @@ jobs:
     env:
       TARGET_ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
@@ -136,7 +136,7 @@ jobs:
 
         These beta bundles are ad-hoc signed and are not Apple-notarized. Findings and generated fixes require human review.
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
