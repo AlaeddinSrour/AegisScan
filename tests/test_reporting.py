@@ -68,6 +68,15 @@ def _outcome() -> ScanOutcome:
         batch_count=1,
         semgrep_rule_mode="bundled",
         semgrep_rules_sha256="a" * 64,
+        scan_started_at="2026-08-20T10:00:00+00:00",
+        scan_completed_at="2026-08-20T10:01:00+00:00",
+        repository_name="juice-shop",
+        repository_commit="b" * 40,
+        repository_branch="main",
+        repository_dirty=False,
+        ai_models=["gemini-test"],
+        scan_exclusions=[".git"],
+        max_target_bytes=2_000_000,
     )
 
 
@@ -79,6 +88,49 @@ def test_json_report_records_reproducible_rule_identity():
     assert payload["summary"]["ai_triage_enabled"] is True
     assert payload["summary"]["confirmed_issues"] == 1
     assert payload["summary"]["needs_review"] == 1
+    assert payload["summary"]["provenance"] == {
+        "aegisscan_version": "0.3.0",
+        "scan_started_at": "2026-08-20T10:00:00+00:00",
+        "scan_completed_at": "2026-08-20T10:01:00+00:00",
+        "repository_name": "juice-shop",
+        "repository_commit": "b" * 40,
+        "repository_branch": "main",
+        "repository_dirty": False,
+        "ai_models": ["gemini-test"],
+    }
+    assert payload["summary"]["configuration"]["max_target_bytes"] == 2_000_000
+
+
+def test_json_report_separates_scanner_diagnostics_and_detector_telemetry():
+    outcome = _outcome()
+    outcome.detector_telemetry = {
+        "osv": {
+            "status": "completed",
+            "manifests_discovered": 2,
+            "manifests_scanned": 2,
+            "packages_queried": 42,
+        }
+    }
+    outcome.scanner_diagnostics = {
+        "semgrep": [
+            {
+                "kind": "Syntax error",
+                "file": "tests/broken.ts",
+                "line": 9,
+                "code_role": "TEST",
+                "message": "Non-runtime parsing was incomplete.",
+            }
+        ]
+    }
+
+    payload = build_report_payload(outcome)
+
+    assert payload["summary"]["total_detector_findings"] == 3
+    assert payload["summary"]["scanner_diagnostic_count"] == 1
+    assert payload["summary"]["scanner_diagnostics"]["semgrep"][0]["file"] == (
+        "tests/broken.ts"
+    )
+    assert payload["summary"]["detector_telemetry"]["osv"]["packages_queried"] == 42
 
 
 def test_sarif_contains_confirmed_and_needs_review_but_not_non_runtime():
@@ -100,6 +152,7 @@ def test_sarif_contains_confirmed_and_needs_review_but_not_non_runtime():
     assert "CWE-918" in confirmed_rule["properties"]["tags"]
     assert run["invocations"][0]["properties"]["semgrepRulesSha256"] == "a" * 64
     assert run["invocations"][0]["properties"]["aiTriageEnabled"] is True
+    assert run["invocations"][0]["properties"]["repositoryCommit"] == "b" * 40
 
 
 def test_write_sarif_report_outputs_valid_json(tmp_path):
@@ -109,3 +162,24 @@ def test_write_sarif_report_outputs_valid_json(tmp_path):
 
     payload = json.loads(destination.read_text(encoding="utf-8"))
     assert payload["$schema"].endswith("sarif-2.1.0.json")
+
+
+def test_json_and_sarif_exports_redact_secret_material():
+    outcome = _outcome()
+    private_key = (
+        "-----BEGIN RSA PRIVATE KEY-----secret-material"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    outcome.report.issues[0] = outcome.report.issues[0].model_copy(
+        update={
+            "original_code": f"const privateKey = '{private_key}'",
+            "source_evidence": private_key,
+        }
+    )
+
+    json_payload = json.dumps(build_report_payload(outcome))
+    sarif_payload = json.dumps(build_sarif_payload(outcome))
+
+    assert private_key not in json_payload
+    assert private_key not in sarif_payload
+    assert "[REDACTED SECRET]" in json_payload

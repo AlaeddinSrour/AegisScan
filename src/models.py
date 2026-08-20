@@ -16,12 +16,19 @@ CodeRole = Literal[
 ]
 FindingStatus = Literal[
     "CONFIRMED",
+    "DUPLICATE",
     "FALSE_POSITIVE",
     "NON_RUNTIME",
     "NEEDS_REVIEW",
 ]
 FindingConfidence = Literal["HIGH", "MEDIUM", "LOW"]
 RemediationType = Literal["AUTOMATIC", "MANUAL_REQUIRED"]
+EvidenceScope = Literal[
+    "CURRENT",
+    "GIT_HISTORY",
+    "CURRENT_AND_HISTORY",
+    "UNKNOWN",
+]
 
 
 class ReviewIssue(BaseModel):
@@ -58,9 +65,16 @@ class ReviewIssue(BaseModel):
     )
     suggested_fix: str = Field(
         description=(
-            "Strictly the 1-2 corrected lines to replace original_code. "
-            "Do not include entire functions."
+            "For AUTOMATIC remediation, strictly the 1-2 corrected lines to replace "
+            "original_code. Leave empty for MANUAL_REQUIRED remediation."
         )
+    )
+    remediation_guidance: str = Field(
+        default="",
+        description=(
+            "Concrete review and implementation guidance for MANUAL_REQUIRED findings; "
+            "empty for deterministic automatic replacements."
+        ),
     )
     finding_id: str = Field(
         default="",
@@ -105,6 +119,13 @@ class ReviewIssue(BaseModel):
         default="AUTOMATIC",
         description="Whether a deterministic local patch is appropriate.",
     )
+    related_weaknesses: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional weakness families represented by consolidated detector "
+            "candidates at the same canonical sink."
+        ),
+    )
 
 
 class FindingDisposition(BaseModel):
@@ -123,6 +144,11 @@ class FindingDisposition(BaseModel):
     message: str = ""
     code_role: CodeRole = "UNKNOWN"
     confidence: FindingConfidence = "LOW"
+    evidence_scope: EvidenceScope = "UNKNOWN"
+    commit: str = ""
+    commits: List[str] = Field(default_factory=list)
+    occurrence_count: int = Field(default=1, ge=1)
+    canonical_finding_id: str = ""
 
 
 class ReviewReport(BaseModel):

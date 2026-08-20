@@ -16,6 +16,14 @@ JavaScript/TypeScript, Go, Java, and C#; ruleset fingerprinting; JSON and SARIF
 2.1.0 export; a no-credential detector-only CLI mode; and automatic GitHub Code
 Scanning uploads.
 
+The desktop workspace also supports credential-free detector-only audits,
+scanner readiness diagnostics, and persistent local audit comparisons that show
+new, resolved, and unchanged actionable findings.
+
+The current bundled JavaScript/TypeScript coverage floor also discovers Express
+flows for command injection, path traversal, dynamic code evaluation, unsafe
+deserialization, object-level authorization review, and reflected/DOM XSS.
+
 ## Why AegisScan
 
 Static analyzers are good at finding suspicious syntax, but a raw alert is not
@@ -29,12 +37,16 @@ and preserves the complete decision trail:
 - Scans both current files and Git history with Betterleaks while discarding
   matched secret values before results enter the report. Gitleaks remains a
   compatibility fallback during the transition.
+- Applies centralized credential redaction to repository context before AI
+  requests and again before JSON, SARIF, or UI retention.
 - Assigns every candidate a stable ID and a final disposition: confirmed,
-  needs review, false positive, or non-runtime.
+  needs review, duplicate, false positive, or non-runtime. Consolidated evidence
+  points to its canonical finding instead of being mislabeled as a false alarm.
 - Separates runtime code from tests, fixtures, generated files, dependencies,
   documentation, and project-defined ignored paths.
-- Sends findings to Gemini in bounded batches and requires structured,
-  schema-validated responses.
+- Optionally sends findings to Gemini in bounded batches and requires structured,
+  schema-validated responses; detector-only audits keep runtime candidates in
+  Needs review without contacting an AI provider.
 - Requires source, sink, reachability, and confidence evidence before promoting
   an issue to Confirmed.
 - Includes bundled Python, JavaScript/TypeScript, Go, Java, and C# discovery for
@@ -47,22 +59,29 @@ and preserves the complete decision trail:
 
 ## Privacy and trust boundary
 
-Semgrep and secret scanning, scope classification, patch validation, and file
-modification happen locally. Betterleaks network validation is deliberately not
-enabled, so candidate credentials are not sent to provider APIs. OSV-Scanner may
-query vulnerability/package metadata services using dependency names and
-versions. The default bundled Semgrep mode is offline and content-fingerprinted;
-the optional extended mode downloads mutable community registry packs from
-Semgrep. For AI triage, AegisScan sends
-Gemini the Semgrep finding, a bounded source excerpt around it, and locally
-generated structural context. Dependency and secret findings bypass Gemini. Do
-not scan a repository whose source is not permitted to be sent to the configured
+Semgrep and secret scanning, scope classification, patch validation, finding
+comparison, and file modification happen locally. Betterleaks network validation
+is deliberately not enabled, so candidate credentials are not sent to provider
+APIs. OSV-Scanner may query vulnerability/package metadata services using
+dependency names and versions. The default bundled Semgrep mode is offline and
+content-fingerprinted; the optional extended mode downloads mutable community
+registry packs from Semgrep. When AI triage is enabled, AegisScan sends Gemini
+the Semgrep finding, a bounded source excerpt around it, and locally generated
+structural context, including bounded definitions of imported JavaScript and
+TypeScript helpers used by a finding.
+Dependency and secret findings bypass Gemini. Detector-only mode sends no
+repository source or finding context to an AI provider. Do not enable AI triage
+for a repository whose source is not permitted to be sent to the configured
 Gemini service.
 
 Gemini and GitHub credentials are held in memory by the desktop app and are not
 saved in application preferences. Exported reports and local environment files
 are ignored by Git. Repository text is treated as untrusted prompt input, and
-the model cannot write files directly.
+the model cannot write files directly. Secret-shaped values found through any
+detector are replaced with `[REDACTED SECRET]` before AI triage and report
+serialization. Audit history stores at most 100 local
+summary records and opaque finding fingerprints—not source excerpts or raw
+finding IDs—and can be cleared from the Activity page.
 
 ## Requirements
 
@@ -74,7 +93,7 @@ the model cannot write files directly.
 | OSV-Scanner | Version 2; must be available on `PATH` or via `OSV_SCANNER_COMMAND` |
 | Betterleaks | Current release; must be available on `PATH` or via `BETTERLEAKS_COMMAND` |
 | Gitleaks | Optional compatibility fallback when Betterleaks is unavailable |
-| Gemini | API key with access to a configured model; optional in detector-only CLI mode |
+| Gemini | API key with model access; optional in detector-only desktop and CLI modes |
 
 The prebuilt app is architecture-specific. Build on Apple Silicon for an arm64
 bundle or on an Intel Mac for an x86_64 bundle.
@@ -106,13 +125,16 @@ the repository as clean.
 In the app:
 
 1. Choose a repository.
-2. Enter a Gemini API key under **New Audit** or **Settings**.
-3. Keep automatic fixes disabled for the first review.
-4. Choose **Reproducible** bundled rules, or explicitly select **Extended** if
+2. Open **Scanner Readiness** to verify the enabled local tools.
+3. Enable Gemini triage and enter an API key under **New Audit** or
+   **Settings**, or disable it for a local detector-only audit.
+4. Keep automatic fixes disabled for the first review.
+5. Choose **Reproducible** bundled rules, or explicitly select **Extended** if
    live Semgrep Registry augmentation is desired.
-5. Run the audit and inspect **Confirmed**, **Needs review**, and
+6. Run the audit and inspect **Confirmed**, **Needs review**, and
    **Non-runtime** separately.
-6. Export JSON for archival or SARIF for GitHub/CI integration.
+7. Review the **Activity** comparison, then export JSON for archival or SARIF
+   for GitHub/CI integration.
 
 ## How an audit works
 
@@ -121,29 +143,41 @@ In the app:
    downloads the mutable `security-audit` and Python registry packs. The bundled
    floor includes SSRF taint flows and common TOCTOU sequences for Python,
    JavaScript/TypeScript, Go, Java, and C#.
-2. OSV-Scanner checks supported dependency manifests and lockfiles. Betterleaks
-   scans current files and Git history with 100% match redaction; Gitleaks is
-   used only when Betterleaks is unavailable.
+2. OSV-Scanner checks supported dependency manifests and lockfiles and records
+   discovered/scanned manifest and package inventory telemetry. Betterleaks
+   scans current files and Git history with 100% match redaction; repeated
+   secret evidence is consolidated while preserving current/history scope,
+   occurrence count, and redacted commit provenance. Gitleaks is used only when
+   Betterleaks is unavailable.
 3. Every raw result receives a stable detector-specific identifier and a
    deterministic code role.
 4. Exact duplicate Semgrep records are removed. Secret matches in tests,
    fixtures, generated files, documentation, dependencies, and ignored paths
    are retained as Non-runtime instead of inflating the review queue.
 5. Semgrep findings are grouped by directory and packed into batches of at most 15.
-   Python files receive local import, definition, and call-edge context.
-6. Deterministic and non-runtime findings bypass Gemini. Runtime Semgrep findings are sent
-   through the stable `gemini-3.6-flash` → `gemini-3.5-flash` failover chain.
+   Python files receive local import, definition, and call-edge context;
+   JavaScript and TypeScript findings receive bounded imported-helper context.
+6. Deterministic and non-runtime findings bypass Gemini. With AI triage enabled,
+   runtime Semgrep findings are sent through the stable `gemini-3.6-flash` →
+   `gemini-3.5-flash` failover chain. With it disabled, those candidates remain
+   explicitly visible under Needs review.
 7. The returned JSON is validated as a strict `ReviewReport`. Missing or invalid
    candidate decisions become Needs review instead of disappearing.
 8. Confirmed findings are reconciled against real repository paths, lines, code
    roles, and canonical sensitive sinks. Overlapping Semgrep and secret-scanner
    findings at the same sink are consolidated into one issue.
-9. Optional fixes pass secret, control-flow, ambiguity, and syntax checks before
+9. Bundled rule IDs are normalized independently of local installation paths,
+   and report provenance records the AegisScan version, timestamps, target Git
+   commit/branch/dirty state, AI model chain, ruleset hash, and scan settings.
+10. Optional fixes pass secret, control-flow, ambiguity, and syntax checks before
    an atomic write.
 
-Semgrep parser errors in known non-runtime files remain visible as non-runtime
-evidence. Runtime resource-limit failures become Needs review. Global or runtime
-parser failures stop the audit because completeness is unknown.
+Semgrep parser errors in known non-runtime files remain visible as scanner
+diagnostics, separate from vulnerability totals. Runtime resource-limit failures
+become Needs review and mark the audit
+degraded. Global or runtime parser failures stop the audit because completeness
+is unknown. Known vendored browser assets and generated bundles are scoped out
+deterministically unless a repository override forces them into runtime scope.
 
 If some or all Gemini batches fail, the desktop app finishes in visibly degraded
 mode, suppresses the posture score, and preserves every untriaged runtime
@@ -153,14 +187,18 @@ status `2`, preventing automation from treating incomplete triage as success.
 ## Desktop workspace
 
 - **Dashboard** — posture, confirmed-risk metrics, review backlog, and scan state.
-- **New audit** — repository, credential, batch, remediation, and publishing controls.
-- **Activity** — audits completed during the current app session.
+- **New audit** — repository, optional AI triage, scanner, remediation, and
+  publishing controls.
+- **Activity** — persistent local summaries with new/resolved/unchanged
+  comparisons.
 - **Confirmed** — runtime findings that passed the evidence gate.
 - **Critical & high** — focused priority queue.
 - **Needs review** — incomplete evidence, omitted candidates, and failed batches.
 - **Non-runtime** — scoped-out evidence retained for auditability.
 - **Reports** — JSON and SARIF 2.1.0 export plus the retained analysis summary.
 - **Integrations** — optional GitHub pull-request publishing.
+- **Scanner Readiness** — tool availability, versions, executable paths, and
+  setup guidance.
 - **Settings** — AI and audit defaults.
 
 ## Scope overrides
@@ -236,8 +274,10 @@ python -m src.full_scan \
   --sarif aegisscan-results.sarif
 ```
 
-The SARIF output contains Confirmed and Needs review results, while excluding
-deterministically Non-runtime and False positive evidence. It can be uploaded to
+The JSON report includes detector telemetry, scanner diagnostics, duplicate
+links, and secret current/history provenance. SARIF contains Confirmed and Needs
+review results, while excluding deterministically Non-runtime, Duplicate, and
+False positive evidence. It can be uploaded to
 GitHub Code Scanning or consumed by SARIF-compatible CI and editor tooling.
 
 For a local or CI audit that does not send code context to Gemini and needs no
@@ -321,6 +361,11 @@ reporting guidance.
 - AegisScan is not a replacement for manual review, dynamic testing, penetration
   testing, or production monitoring.
 - The bundled rules are a coverage floor, not a complete vulnerability taxonomy.
+- The JavaScript/TypeScript regression floor covers representative SQL injection,
+  SSRF, TOCTOU, command injection, path traversal, dynamic code evaluation,
+  unsafe deserialization, object-level authorization candidates, hardcoded
+  cryptographic material, and response/DOM XSS patterns. Business-logic findings
+  still require contextual or dynamic testing.
 - SSRF coverage follows recognized web-request sources into common Python,
   JavaScript/TypeScript, Go, Java, and C# HTTP clients. Custom frameworks,
   wrapper clients, dynamically constructed call paths, DNS rebinding, and

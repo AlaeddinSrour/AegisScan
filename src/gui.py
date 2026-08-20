@@ -62,10 +62,19 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .audit_history import (
+    MAX_HISTORY_ENTRIES,
+    build_failure_entry,
+    build_history_entry,
+    dump_history,
+    latest_completed_entry,
+    load_history,
+)
 from .full_scan import ScanOutcome, run_full_scan
 from .github_ops import apply_auto_fixes_with_paths, auto_fix_eligibility
 from .models import FindingDisposition, ReviewIssue
 from .reporting import write_json_report, write_sarif_report
+from .readiness import ScannerStatus, inspect_scanner_readiness, missing_required_scanners
 from .semgrep_runner import DEFAULT_EXCLUDES, SEMGREP_RULE_MODES
 
 
@@ -669,6 +678,7 @@ class ScanWorker(QObject):
                 exclude_patterns=list(self.options["exclude_patterns"]),
                 max_target_bytes=int(self.options["max_target_bytes"]),
                 semgrep_rule_mode=str(self.options["semgrep_rule_mode"]),
+                ai_triage=bool(self.options["ai_triage"]),
                 progress=self.progress.emit,
             )
             self.completed.emit(outcome)
@@ -688,6 +698,7 @@ class NavButton(QPushButton):
             "non_runtime": "⊘",
             "reports": "▤",
             "integrations": "⌘",
+            "readiness": "✓",
             "settings": "⚙",
         }
         visible_text = text.replace("&&", "&").replace("&", "&&")
@@ -914,7 +925,7 @@ class DashboardPage(QWidget):
         posture_header = QHBoxLayout()
         posture_header.addWidget(label("Protection stack", "SectionTitle"))
         posture_header.addStretch()
-        self.stack_count = label("7 / 7", "Good")
+        self.stack_count = label("8 / 8", "Good")
         posture_header.addWidget(self.stack_count)
         posture_layout.addLayout(posture_header)
         self.stack_description = label("All deterministic controls operational.", "Muted")
@@ -926,6 +937,8 @@ class DashboardPage(QWidget):
         posture_layout.addWidget(self.dependency_status)
         self.secret_status = label("✓  Redacted current/history secret scan completed", "Good")
         posture_layout.addWidget(self.secret_status)
+        self.ai_status = label("✓  Gemini contextual triage enabled", "Good")
+        posture_layout.addWidget(self.ai_status)
         posture_layout.addWidget(label("✓  Every candidate receives a disposition", "Good"))
         posture_layout.addWidget(label("✓  Runtime scope classification active", "Good"))
         posture_layout.addWidget(label("✓  Evidence-backed confirmation gate", "Good"))
@@ -964,8 +977,20 @@ class DashboardPage(QWidget):
         self.non_runtime_metric.set_number(
             outcome.disposition_count("NON_RUNTIME")
             + outcome.disposition_count("FALSE_POSITIVE")
+            + outcome.disposition_count("DUPLICATE")
         )
         self.distribution.set_counts(outcome.report.issues)
+        disabled_controls = sum(
+            (
+                not outcome.dependency_scan_enabled,
+                not outcome.secret_scan_enabled,
+                not outcome.ai_triage_enabled,
+            )
+        )
+        detector_only_review = (
+            not outcome.ai_triage_enabled
+            and outcome.disposition_count("NEEDS_REVIEW") > 0
+        )
         score = 100
         for issue in outcome.report.issues:
             score -= {"CRITICAL": 24, "HIGH": 12, "WARNING": 4, "INFO": 1}[issue.severity]
@@ -973,10 +998,10 @@ class DashboardPage(QWidget):
             self.security_ring.set_unknown("INCOMPLETE")
             self.engine_status.setText("!  Audit coverage incomplete; review detector warnings")
             self.engine_status.setStyleSheet("color: #c64545; font-weight: 500;")
-            completed_controls = 7 - len(outcome.detector_errors)
+            completed_controls = 8 - disabled_controls - len(outcome.detector_errors)
             if outcome.ai_triage_degraded:
                 completed_controls -= 1
-            self.stack_count.setText(f"{max(0, completed_controls)} / 7")
+            self.stack_count.setText(f"{max(0, completed_controls)} / 8")
             self.stack_count.setStyleSheet("color: #c64545; font-weight: 500;")
             self.stack_description.setText(
                 "At least one enabled detector or AI triage stage did not complete."
@@ -984,17 +1009,21 @@ class DashboardPage(QWidget):
             completed = outcome.ai_successful_batches
             attempted = outcome.ai_attempted_batches
             self.coverage.setValue(round(100 * completed / attempted) if attempted else 100)
+        elif detector_only_review:
+            self.security_ring.set_unknown("REVIEW QUEUE")
+            self.engine_status.setText("✓  All enabled deterministic detectors completed")
+            self.engine_status.setStyleSheet("")
+            self.stack_count.setText(f"{8 - disabled_controls} / 8")
+            self.stack_count.setStyleSheet("color: #d4a017; font-weight: 500;")
+            self.stack_description.setText(
+                "Detector-only candidates require manual contextual review."
+            )
+            self.coverage.setValue(100)
         else:
             self.security_ring.set_score(max(0, score), "POSTURE")
             self.engine_status.setText("✓  All enabled audit detectors completed")
             self.engine_status.setStyleSheet("")
-            disabled_controls = sum(
-                (
-                    not outcome.dependency_scan_enabled,
-                    not outcome.secret_scan_enabled,
-                )
-            )
-            self.stack_count.setText(f"{7 - disabled_controls} / 7")
+            self.stack_count.setText(f"{8 - disabled_controls} / 8")
             self.stack_count.setStyleSheet("")
             self.stack_description.setText(
                 "All enabled controls operational."
@@ -1002,11 +1031,18 @@ class DashboardPage(QWidget):
                 else "All deterministic controls operational."
             )
             self.coverage.setValue(100)
+        osv_telemetry = outcome.detector_telemetry.get("osv", {})
+        dependency_detail = (
+            f" · {osv_telemetry.get('manifests_discovered', 0)} manifests · "
+            f"{osv_telemetry.get('packages_in_local_inventory', 0)} packages inventoried"
+            if osv_telemetry
+            else ""
+        )
         self.dependency_status.setText(
             (
                 "!  OSV dependency scan incomplete"
                 if "osv" in outcome.detector_errors
-                else "✓  OSV dependency scan completed"
+                else f"✓  OSV dependency scan completed{dependency_detail}"
                 if outcome.dependency_scan_enabled
                 else "–  OSV dependency scan disabled"
             )
@@ -1020,9 +1056,17 @@ class DashboardPage(QWidget):
                 else "–  Secret scan disabled"
             )
         )
+        self.ai_status.setText(
+            "!  Gemini contextual triage incomplete"
+            if outcome.ai_triage_degraded
+            else "✓  Gemini contextual triage completed"
+            if outcome.ai_triage_enabled
+            else "–  Gemini triage disabled; detector-only audit"
+        )
         for status, failed in (
             (self.dependency_status, "osv" in outcome.detector_errors),
             (self.secret_status, secret_detector_failed),
+            (self.ai_status, outcome.ai_triage_degraded),
         ):
             status.setStyleSheet(
                 "color: #c64545; font-weight: 500;" if failed else ""
@@ -1051,12 +1095,11 @@ class NewScanPage(QWidget):
         outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.addWidget(label("SCANS / NEW AUDIT", "Eyebrow"))
         outer.addWidget(label("Configure a full-repository audit", "PageTitle"))
-        outer.addWidget(
-            label(
-                "Scanning runs locally; bounded finding context and source excerpts are sent to Gemini for triage.",
-                "PageSubtitle",
-            )
+        self.page_subtitle = label(
+            "Scanning runs locally; bounded finding context and source excerpts are sent to Gemini for triage.",
+            "PageSubtitle",
         )
+        outer.addWidget(self.page_subtitle)
 
         stages = QHBoxLayout()
         stages.setSpacing(10)
@@ -1073,7 +1116,7 @@ class NewScanPage(QWidget):
         body.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         config = card()
         self.config_card = config
-        config.setMinimumHeight(620)
+        config.setMinimumHeight(680)
         config_layout = QVBoxLayout(config)
         config_layout.setContentsMargins(22, 20, 22, 20)
         config_layout.setSpacing(12)
@@ -1089,12 +1132,22 @@ class NewScanPage(QWidget):
         repo_row.addWidget(browse)
         config_layout.addLayout(repo_row)
 
-        config_layout.addWidget(label("Gemini API key", "Muted"))
+        self.ai_triage = QCheckBox("Use Gemini for contextual triage")
+        self.ai_triage.setChecked(app.ai_triage)
+        self.ai_triage.toggled.connect(self._ai_triage_toggled)
+        config_layout.addWidget(self.ai_triage)
+        self.api_key_label = label("Gemini API key", "Muted")
+        config_layout.addWidget(self.api_key_label)
         self.api_key_input = QLineEdit(app.api_key)
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_input.setPlaceholderText("Stored only for this app session")
         self.api_key_input.textChanged.connect(app.set_api_key)
         config_layout.addWidget(self.api_key_input)
+        self.ai_privacy_note = label(
+            "Only bounded finding context is sent; credentials remain session-only.",
+            "Muted",
+        )
+        config_layout.addWidget(self.ai_privacy_note)
 
         self.options_panel = QWidget()
         self.options_panel.setMinimumHeight(76)
@@ -1176,6 +1229,10 @@ class NewScanPage(QWidget):
         self.secret_scan.toggled.connect(app.set_secret_scan)
         config_layout.addWidget(self.secret_scan)
 
+        self.readiness_button = QPushButton("Check scanner readiness")
+        self.readiness_button.clicked.connect(lambda: app.navigate("readiness"))
+        config_layout.addWidget(self.readiness_button)
+
         self.apply_fixes = QCheckBox("Apply fixes that pass deterministic safety checks")
         self.apply_fixes.setMinimumHeight(24)
         self.apply_fixes.setChecked(app.apply_fixes)
@@ -1194,7 +1251,7 @@ class NewScanPage(QWidget):
 
         live = card()
         self.live_card = live
-        live.setMinimumHeight(620)
+        live.setMinimumHeight(680)
         live_layout = QVBoxLayout(live)
         live_layout.setContentsMargins(22, 20, 22, 20)
         live_layout.addWidget(label("Live audit", "SectionTitle"))
@@ -1221,12 +1278,14 @@ class NewScanPage(QWidget):
         idle_title = label("Ready for full coverage", "SectionTitle")
         idle_title.setWordWrap(False)
         idle_layout.addWidget(idle_title, alignment=Qt.AlignmentFlag.AlignCenter)
-        idle_description = label(
+        self.idle_description = label(
             "The live console will trace discovery, AI triage, and remediation.", "Muted"
         )
-        idle_description.setMaximumWidth(310)
-        idle_description.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        idle_layout.addWidget(idle_description, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.idle_description.setMaximumWidth(310)
+        self.idle_description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        idle_layout.addWidget(
+            self.idle_description, alignment=Qt.AlignmentFlag.AlignCenter
+        )
         live_layout.addWidget(self.idle_panel)
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
@@ -1240,6 +1299,34 @@ class NewScanPage(QWidget):
         # Qt requires the child layout to exist before it is assigned to a
         # scroll area; assigning it earlier can render a blank page.
         self.scroll_area.setWidget(self.scroll_content)
+        self.set_ai_triage_enabled(app.ai_triage)
+
+    def _ai_triage_toggled(self, checked: bool) -> None:
+        self.app.set_ai_triage(checked)
+
+    def set_ai_triage_enabled(self, enabled: bool) -> None:
+        self.api_key_label.setEnabled(enabled)
+        self.api_key_input.setEnabled(enabled)
+        self.ai_privacy_note.setText(
+            "Only bounded finding context is sent; credentials remain session-only."
+            if enabled
+            else "No repository source or finding context will be sent to an AI provider."
+        )
+        self.batch_size_label.setEnabled(enabled)
+        self.batch_size.setEnabled(enabled)
+        self.launch_button.setText(
+            "Run full audit  →" if enabled else "Run detector-only audit  →"
+        )
+        self.page_subtitle.setText(
+            "Scanning runs locally; bounded finding context and source excerpts are sent to Gemini for triage."
+            if enabled
+            else "Deterministic scanners run locally; runtime candidates remain in Needs review for manual triage."
+        )
+        self.idle_description.setText(
+            "The live console will trace discovery, AI triage, and remediation."
+            if enabled
+            else "The live console will trace local discovery and preserve runtime candidates for review."
+        )
 
     def _publish_toggled(self, checked: bool) -> None:
         if checked:
@@ -1294,6 +1381,12 @@ class NewScanPage(QWidget):
         self.api_key_input.setText(value)
         self.api_key_input.blockSignals(False)
 
+    def sync_ai_triage(self, enabled: bool) -> None:
+        self.ai_triage.blockSignals(True)
+        self.ai_triage.setChecked(enabled)
+        self.ai_triage.blockSignals(False)
+        self.set_ai_triage_enabled(enabled)
+
 
 class ActivityPage(QWidget):
     def __init__(self, app: "AegisScanWindow") -> None:
@@ -1303,14 +1396,52 @@ class ActivityPage(QWidget):
         layout.setContentsMargins(28, 24, 28, 28)
         layout.setSpacing(16)
         layout.addWidget(label("SCANS / ACTIVITY", "Eyebrow"))
-        layout.addWidget(label("Session activity", "PageTitle"))
-        layout.addWidget(label("A local record of audits run during this app session.", "PageSubtitle"))
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["Repository", "Semgrep", "Batches", "Confirmed", "Status"]
+        title_row = QHBoxLayout()
+        title_column = QVBoxLayout()
+        title_column.addWidget(label("Audit history", "PageTitle"))
+        title_column.addWidget(
+            label(
+                "Persistent local summaries compare actionable findings without storing source excerpts.",
+                "PageSubtitle",
+            )
         )
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, 5):
+        title_row.addLayout(title_column, 1)
+        clear_button = QPushButton("Clear history")
+        clear_button.clicked.connect(app.clear_history)
+        title_row.addWidget(clear_button, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(title_row)
+
+        comparison = card(soft=True)
+        comparison_layout = QHBoxLayout(comparison)
+        comparison_layout.setContentsMargins(18, 14, 18, 14)
+        comparison_layout.addWidget(label("LATEST COMPARISON", "Eyebrow"))
+        comparison_layout.addStretch()
+        self.new_count = label("New  —", "Accent")
+        self.resolved_count = label("Resolved  —", "Good")
+        self.unchanged_count = label("Unchanged  —", "Muted")
+        comparison_layout.addWidget(self.new_count)
+        comparison_layout.addWidget(self.resolved_count)
+        comparison_layout.addWidget(self.unchanged_count)
+        layout.addWidget(comparison)
+
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Completed",
+                "Repository",
+                "Mode",
+                "Detector findings",
+                "Confirmed",
+                "New",
+                "Resolved",
+                "Unchanged",
+                "Status",
+            ]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        for column in (0, 2, 3, 4, 5, 6, 7, 8):
             self.table.horizontalHeader().setSectionResizeMode(
                 column, QHeaderView.ResizeMode.ResizeToContents
             )
@@ -1322,10 +1453,38 @@ class ActivityPage(QWidget):
     def refresh(self) -> None:
         self.table.setRowCount(len(self.app.history))
         for row, entry in enumerate(reversed(self.app.history)):
-            for column, key in enumerate(
-                ("repository", "findings", "batches", "issues", "status")
-            ):
-                self.table.setItem(row, column, QTableWidgetItem(str(entry[key])))
+            comparison = entry.get("comparison", {})
+            if not isinstance(comparison, dict):
+                comparison = {}
+            timestamp = str(entry.get("timestamp", "—"))
+            if "T" in timestamp:
+                timestamp = timestamp.replace("T", " ").replace("+00:00", " UTC")
+            values = (
+                timestamp,
+                entry.get("repository", "—"),
+                entry.get("audit_mode", "—"),
+                entry.get("findings", "—"),
+                entry.get("issues", "—"),
+                comparison.get("new", "—"),
+                comparison.get("resolved", "—"),
+                comparison.get("unchanged", "—"),
+                entry.get("status", "—"),
+            )
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(str(value)))
+
+        completed = next(
+            (entry for entry in reversed(self.app.history) if entry.get("status") != "Failed"),
+            None,
+        )
+        comparison = completed.get("comparison", {}) if completed else {}
+        if not isinstance(comparison, dict):
+            comparison = {}
+        self.new_count.setText(f"New  {comparison.get('new', '—')}")
+        self.resolved_count.setText(f"Resolved  {comparison.get('resolved', '—')}")
+        self.unchanged_count.setText(
+            f"Unchanged  {comparison.get('unchanged', '—')}"
+        )
 
 
 class FindingsPage(QWidget):
@@ -1471,6 +1630,11 @@ class FindingsPage(QWidget):
             f"{issue.severity}  ·  {issue.confidence} confidence  ·  "
             f"{issue.file}:{issue.line}  ·  {issue.rule_id or 'unknown rule'}"
         )
+        remediation = (
+            f"MANUAL GUIDANCE\n{issue.remediation_guidance}"
+            if issue.remediation_type == "MANUAL_REQUIRED"
+            else f"SUGGESTED FIX\n{issue.suggested_fix}"
+        )
         self.detail_body.setPlainText(
             f"WHY IT MATTERS\n{issue.description}\n\n"
             f"UNTRUSTED SOURCE\n{issue.source_evidence}\n\n"
@@ -1478,7 +1642,7 @@ class FindingsPage(QWidget):
             f"REACHABILITY\n{issue.reachability_evidence}\n\n"
             f"REMEDIATION MODE\n{issue.remediation_type}\n\n"
             f"ORIGINAL CODE\n{issue.original_code}\n\n"
-            f"SUGGESTED FIX\n{issue.suggested_fix}"
+            f"{remediation}"
         )
         patch_key = self.app.issue_patch_key(issue)
         if patch_key in self.app.applied_issue_patches:
@@ -1715,6 +1879,8 @@ class ReportsPage(QWidget):
             f"{outcome.disposition_count('NEEDS_REVIEW')} needs review · "
             f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · "
             f"{outcome.disposition_count('FALSE_POSITIVE')} false positives · "
+            f"{outcome.disposition_count('DUPLICATE')} duplicates · "
+            f"{outcome.scanner_diagnostic_count} diagnostics · "
             f"{len(outcome.fixed_files)} changed files"
         )
         self.scratchpad.setPlainText(outcome.report.analysis_scratchpad)
@@ -1777,6 +1943,107 @@ class IntegrationsPage(QWidget):
         self.connection_state.setObjectName("Good" if checked else "Muted")
 
 
+class ReadinessPage(QWidget):
+    def __init__(self, app: "AegisScanWindow") -> None:
+        super().__init__()
+        self.app = app
+        self.statuses: list[ScannerStatus] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setSpacing(16)
+        layout.addWidget(label("WORKSPACE / READINESS", "Eyebrow"))
+
+        header = QHBoxLayout()
+        header_text = QVBoxLayout()
+        header_text.addWidget(label("Scanner readiness", "PageTitle"))
+        header_text.addWidget(
+            label(
+                "Verify local executables, versions, search paths, and setup commands before an audit.",
+                "PageSubtitle",
+            )
+        )
+        header.addLayout(header_text, 1)
+        refresh_button = primary_button("Refresh checks", self.refresh)
+        header.addWidget(refresh_button, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(header)
+
+        summary = card(soft=True)
+        summary_layout = QHBoxLayout(summary)
+        summary_layout.setContentsMargins(18, 14, 18, 14)
+        self.summary = label("Readiness has not been checked yet.", "Muted")
+        summary_layout.addWidget(self.summary)
+        summary_layout.addStretch()
+        self.ai_status = label("", "Muted")
+        summary_layout.addWidget(self.ai_status)
+        layout.addWidget(summary)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Scanner", "Requirement", "Status", "Version", "Executable", "Setup"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch
+        )
+        for column in (0, 1, 2, 3, 5):
+            self.table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(
+            label(
+                "A missing optional scanner does not block an audit when its detector is disabled. "
+                "An enabled missing scanner is reported as incomplete coverage.",
+                "Muted",
+            )
+        )
+
+    def refresh(self) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.statuses = inspect_scanner_readiness(
+                dependency_enabled=self.app.dependency_scan,
+                secret_enabled=self.app.secret_scan,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.table.setRowCount(len(self.statuses))
+        for row, status in enumerate(self.statuses):
+            values = (
+                status.name,
+                "Required" if status.required else "Optional",
+                "Ready" if status.available else "Missing",
+                status.version or "—",
+                status.executable or status.detail,
+                status.install_command,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 2:
+                    item.setForeground(
+                        QColor("#5db872" if status.available else "#c64545")
+                    )
+                self.table.setItem(row, column, item)
+        missing = missing_required_scanners(self.statuses)
+        if missing:
+            self.summary.setText(
+                "Missing required scanners: " + ", ".join(item.name for item in missing)
+            )
+            self.summary.setStyleSheet("color: #c64545; font-weight: 500;")
+        else:
+            self.summary.setText("All enabled scanner requirements are ready.")
+            self.summary.setStyleSheet("color: #5db872; font-weight: 500;")
+        self.ai_status.setText(
+            "Gemini triage ready"
+            if self.app.ai_triage and self.app.api_key.strip()
+            else "Gemini key required"
+            if self.app.ai_triage
+            else "Detector-only mode"
+        )
+
+
 class SettingsPage(QWidget):
     def __init__(self, app: "AegisScanWindow") -> None:
         super().__init__()
@@ -1788,7 +2055,7 @@ class SettingsPage(QWidget):
         layout.addWidget(label("Application settings", "PageTitle"))
         layout.addWidget(
             label(
-                "Credentials stay in memory. Finding context and source excerpts are sent to Gemini during audits.",
+                "Credentials stay in memory. AI triage is optional and detector-only audits keep source local.",
                 "PageSubtitle",
             )
         )
@@ -1799,6 +2066,10 @@ class SettingsPage(QWidget):
         ai_layout = QVBoxLayout(ai)
         ai_layout.setContentsMargins(22, 20, 22, 20)
         ai_layout.addWidget(label("AI provider", "SectionTitle"))
+        self.ai_triage = QCheckBox("Use Gemini for contextual triage")
+        self.ai_triage.setChecked(app.ai_triage)
+        self.ai_triage.toggled.connect(app.set_ai_triage)
+        ai_layout.addWidget(self.ai_triage)
         ai_layout.addWidget(label("Gemini API key", "Muted"))
         self.api_key = QLineEdit(app.api_key)
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1809,6 +2080,7 @@ class SettingsPage(QWidget):
             label("Structured JSON output is enforced through ReviewReport.", "Good")
         )
         ai_layout.addStretch()
+        self.set_ai_triage_enabled(app.ai_triage)
         grid.addWidget(ai, 0, 0)
 
         audit = card()
@@ -1819,6 +2091,7 @@ class SettingsPage(QWidget):
         self.batch = QSpinBox()
         self.batch.setRange(1, 15)
         self.batch.setValue(app.batch_size)
+        self.batch.setEnabled(app.ai_triage)
         self.batch.valueChanged.connect(app.set_batch_size)
         audit_layout.addWidget(self.batch)
         audit_layout.addWidget(label("Maximum Semgrep file size (MB)", "Muted"))
@@ -1876,11 +2149,22 @@ class SettingsPage(QWidget):
         self.api_key.setText(value)
         self.api_key.blockSignals(False)
 
+    def sync_ai_triage(self, enabled: bool) -> None:
+        self.ai_triage.blockSignals(True)
+        self.ai_triage.setChecked(enabled)
+        self.ai_triage.blockSignals(False)
+        self.set_ai_triage_enabled(enabled)
+
+    def set_ai_triage_enabled(self, enabled: bool) -> None:
+        self.api_key.setEnabled(enabled)
+        if hasattr(self, "batch"):
+            self.batch.setEnabled(enabled)
+
 
 class AegisScanWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.settings = QSettings("AegisScan", "AegisScan")
+        self.settings = settings or QSettings("AegisScan", "AegisScan")
         self.repo_path = str(self.settings.value("repository", os.getcwd()))
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.github_token = os.getenv("GITHUB_TOKEN", "")
@@ -1898,6 +2182,9 @@ class AegisScanWindow(QMainWindow):
         self.secret_scan = (
             str(self.settings.value("secret_scan", "true")).lower() == "true"
         )
+        self.ai_triage = (
+            str(self.settings.value("ai_triage", "true")).lower() == "true"
+        )
         configured_rule_mode = str(
             self.settings.value("semgrep_rule_mode", "bundled")
         )
@@ -1909,7 +2196,7 @@ class AegisScanWindow(QMainWindow):
         self.apply_fixes = str(self.settings.value("apply_fixes", "false")).lower() == "true"
         self.create_pr = False
         self.outcome: ScanOutcome | None = None
-        self.history: list[dict[str, object]] = []
+        self.history = load_history(self.settings.value("audit_history", "[]"))
         self.applied_issue_patches: set[str] = set()
         self.thread: QThread | None = None
         self.worker: ScanWorker | None = None
@@ -1952,6 +2239,7 @@ class AegisScanWindow(QMainWindow):
             ("Needs Review", "review_queue"),
             ("Non-runtime Evidence", "non_runtime"),
             ("Reports", "reports"),
+            ("Scanner Readiness", "readiness"),
             ("Settings", "settings"),
         ):
             action = QAction(title, self)
@@ -2011,6 +2299,7 @@ class AegisScanWindow(QMainWindow):
                 [
                     ("Reports", "reports"),
                     ("Integrations", "integrations"),
+                    ("Readiness", "readiness"),
                     ("Settings", "settings"),
                 ],
                 self.navigate,
@@ -2076,14 +2365,15 @@ class AegisScanWindow(QMainWindow):
         )
         self.non_runtime = DispositionPage(
             self,
-            statuses={"NON_RUNTIME", "FALSE_POSITIVE"},
-            title="Non-runtime and rejected evidence",
+            statuses={"NON_RUNTIME", "FALSE_POSITIVE", "DUPLICATE"},
+            title="Scoped out, duplicate, and rejected evidence",
             subtitle=(
-                "Fixtures, tests, generated material, ignored paths, and false positives remain auditable without inflating runtime risk."
+                "Fixtures, tests, generated material, duplicates, ignored paths, and false positives remain auditable without inflating runtime risk."
             ),
         )
         self.reports = ReportsPage(self)
         self.integrations = IntegrationsPage(self)
+        self.readiness = ReadinessPage(self)
         self.app_settings = SettingsPage(self)
         pages = [
             ("dashboard", self.dashboard),
@@ -2095,6 +2385,7 @@ class AegisScanWindow(QMainWindow):
             ("non_runtime", self.non_runtime),
             ("reports", self.reports),
             ("integrations", self.integrations),
+            ("readiness", self.readiness),
             ("settings", self.app_settings),
         ]
         for key, page in pages:
@@ -2119,6 +2410,7 @@ class AegisScanWindow(QMainWindow):
             "non_runtime": "Findings  /  Non-runtime",
             "reports": "Workspace  /  Reports",
             "integrations": "Workspace  /  Integrations",
+            "readiness": "Workspace  /  Scanner readiness",
             "settings": "Workspace  /  Settings",
         }
         self.breadcrumb.setText(names[key])
@@ -2148,6 +2440,17 @@ class AegisScanWindow(QMainWindow):
             self.new_scan.sync_api_key(value)
         if hasattr(self, "app_settings") and self.sender() is not self.app_settings.api_key:
             self.app_settings.sync_api_key(value)
+
+    def set_ai_triage(self, enabled: bool) -> None:
+        self.ai_triage = enabled
+        self.settings.setValue("ai_triage", enabled)
+        if hasattr(self, "new_scan") and self.sender() is not self.new_scan.ai_triage:
+            self.new_scan.sync_ai_triage(enabled)
+        if (
+            hasattr(self, "app_settings")
+            and self.sender() is not self.app_settings.ai_triage
+        ):
+            self.app_settings.sync_ai_triage(enabled)
 
     def set_batch_size(self, value: int) -> None:
         self.batch_size = value
@@ -2238,6 +2541,27 @@ class AegisScanWindow(QMainWindow):
     def set_github_token(self, value: str) -> None:
         self.github_token = value
 
+    def _save_history(self) -> None:
+        self.history = self.history[-MAX_HISTORY_ENTRIES:]
+        self.settings.setValue("audit_history", dump_history(self.history))
+
+    def clear_history(self) -> None:
+        if not self.history:
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "Clear audit history",
+            "Remove all locally stored audit summaries and comparison fingerprints?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        self.history.clear()
+        self._save_history()
+        self.activity.refresh()
+        self.global_status.set_status("History cleared", "good")
+
     @staticmethod
     def issue_patch_key(issue: ReviewIssue) -> str:
         return issue.finding_id or f"{issue.file}:{issue.line}:{issue.issue_name}"
@@ -2264,9 +2588,26 @@ class AegisScanWindow(QMainWindow):
             self._error("Choose an existing repository directory before starting.")
             self.navigate("new_scan")
             return
-        if not self.api_key.strip():
+        if self.ai_triage and not self.api_key.strip():
             self._error("Enter a Gemini API key in New Audit or Settings.")
             self.navigate("new_scan")
+            return
+        readiness = inspect_scanner_readiness(
+            dependency_enabled=self.dependency_scan,
+            secret_enabled=self.secret_scan,
+            include_versions=False,
+        )
+        semgrep_missing = [
+            status
+            for status in missing_required_scanners(readiness)
+            if status.key == "semgrep"
+        ]
+        if semgrep_missing:
+            self._error(
+                "Semgrep is required but was not found. Open Scanner Readiness for "
+                "the detected search paths and installation command."
+            )
+            self.navigate("readiness")
             return
         if self.create_pr and (
             not self.github_token.strip() or not self.github_repository.strip()
@@ -2294,6 +2635,7 @@ class AegisScanWindow(QMainWindow):
             ],
             "max_target_bytes": self.max_target_mb * 1_000_000,
             "semgrep_rule_mode": self.semgrep_rule_mode,
+            "ai_triage": self.ai_triage,
         }
         self.navigate("new_scan")
         self.new_scan.set_running(True)
@@ -2327,7 +2669,8 @@ class AegisScanWindow(QMainWindow):
             f"[SESSION] Results synchronized · {len(outcome.report.issues)} confirmed · "
             f"{outcome.disposition_count('NEEDS_REVIEW')} needs review · "
             f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · "
-            f"{outcome.total_finding_count} detector findings · {outcome.batch_count} AI batches"
+            f"{outcome.total_finding_count} detector findings · "
+            f"{outcome.batch_count} finding batches"
         )
         if outcome.audit_degraded:
             self.new_scan.append_progress(
@@ -2340,39 +2683,43 @@ class AegisScanWindow(QMainWindow):
             self.global_status.set_status("Audit incomplete", "error")
             history_status = "Needs review"
         else:
-            self.global_status.set_status("Audit complete", "good")
+            self.global_status.set_status(
+                "Audit complete" if outcome.ai_triage_enabled else "Detector audit complete",
+                "good",
+            )
             history_status = "Completed"
-        self.history.append(
-            {
-                "repository": self.repo_path,
-                "findings": outcome.total_finding_count,
-                "batches": outcome.batch_count,
-                "issues": len(outcome.report.issues),
-                "status": history_status,
-            }
-        )
+        previous = latest_completed_entry(self.history, self.repo_path)
+        history_entry = build_history_entry(outcome, self.repo_path, previous)
+        history_entry["status"] = history_status
+        self.history.append(history_entry)
+        self._save_history()
+        comparison = history_entry["comparison"]
+        if isinstance(comparison, dict):
+            self.new_scan.append_progress(
+                f"[COMPARE] {comparison['new']} new · {comparison['resolved']} resolved · "
+                f"{comparison['unchanged']} unchanged actionable findings"
+            )
         self.dashboard.refresh()
+        self.activity.refresh()
         self.findings.refresh()
         self.high_risk.refresh()
         self.review_queue.refresh()
         self.non_runtime.refresh()
         self.reports.refresh()
-        self.navigate("review_queue" if outcome.audit_degraded else "findings")
+        open_review_queue = outcome.audit_degraded or (
+            not outcome.ai_triage_enabled
+            and outcome.disposition_count("NEEDS_REVIEW") > 0
+        )
+        self.navigate("review_queue" if open_review_queue else "findings")
 
     @Slot(str)
     def _scan_failed(self, message: str) -> None:
         self.new_scan.set_running(False)
         self.new_scan.append_progress(f"[ERROR] Audit failed: {message}")
         self.global_status.set_status("Audit failed", "error")
-        self.history.append(
-            {
-                "repository": self.repo_path,
-                "findings": "—",
-                "batches": "—",
-                "issues": "—",
-                "status": "Failed",
-            }
-        )
+        self.history.append(build_failure_entry(self.repo_path))
+        self._save_history()
+        self.activity.refresh()
         self._error(message)
 
     def export_report(self) -> None:

@@ -447,3 +447,146 @@ rules:
       category: security
       cwe: CWE-367
       technology: [csharp, dotnet, filesystem]
+
+  - id: aegisscan.javascript.express-command-injection
+    message: Express request data reaches a shell command execution sink.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources: &express_request_sources
+      - pattern-either:
+          - pattern: $REQ.body.$FIELD
+          - pattern: $REQ.body[$FIELD]
+          - pattern: $REQ.query.$FIELD
+          - pattern: $REQ.query[$FIELD]
+          - pattern: $REQ.params.$FIELD
+          - pattern: $REQ.params[$FIELD]
+          - pattern: $REQ.headers.$FIELD
+          - pattern: $REQ.headers[$FIELD]
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CP.exec($COMMAND, ...)
+              - pattern: $CP.execSync($COMMAND, ...)
+              - pattern: exec($COMMAND, ...)
+              - pattern: execSync($COMMAND, ...)
+          - focus-metavariable: $COMMAND
+    metadata:
+      confidence: HIGH
+      category: security
+      cwe: CWE-78
+      technology: [express, node, child-process]
+
+  - id: aegisscan.javascript.express-path-traversal
+    message: Express request data reaches a filesystem path sink without a proven boundary check.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources: *express_request_sources
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $FS.readFile($PATH, ...)
+              - pattern: $FS.readFileSync($PATH, ...)
+              - pattern: $FS.createReadStream($PATH, ...)
+              - pattern: $FS.writeFile($PATH, ...)
+              - pattern: $FS.writeFileSync($PATH, ...)
+              - pattern: $FS.createWriteStream($PATH, ...)
+              - pattern: $FS.unlink($PATH, ...)
+              - pattern: $FS.unlinkSync($PATH, ...)
+              - pattern: $RES.sendFile($PATH, ...)
+              - pattern: $RES.download($PATH, ...)
+          - focus-metavariable: $PATH
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-22
+      technology: [express, node, filesystem]
+
+  - id: aegisscan.javascript.express-code-injection
+    message: Express request data reaches dynamic JavaScript evaluation.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources: *express_request_sources
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: eval($CODE)
+              - pattern: Function($CODE)
+              - pattern: new Function($CODE)
+          - focus-metavariable: $CODE
+    metadata:
+      confidence: HIGH
+      category: security
+      cwe: CWE-95
+      technology: [express, javascript]
+
+  - id: aegisscan.javascript.express-unsafe-deserialization
+    message: Express request data reaches a known unsafe JavaScript deserializer.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources: *express_request_sources
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $SERIALIZER.unserialize($DATA, ...)
+              - pattern: $SERIALIZER.deserialize($DATA, ...)
+          - focus-metavariable: $DATA
+    metadata:
+      confidence: HIGH
+      category: security
+      cwe: CWE-502
+      technology: [express, node, serialization]
+
+  - id: aegisscan.javascript.express-id-to-data-access
+    message: A request-controlled object ID reaches a direct data lookup and requires authorization review.
+    languages: [javascript, typescript]
+    severity: WARNING
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.params.$FIELD
+          - pattern: $REQ.params[$FIELD]
+          - pattern: $REQ.query.id
+          - pattern: $REQ.query["id"]
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $MODEL.findByPk($ID, ...)
+              - pattern: $MODEL.findById($ID, ...)
+              - pattern: '$MODEL.findOne({ ..., where: { ..., id: $ID, ... }, ... })'
+          - focus-metavariable: $ID
+    metadata:
+      confidence: LOW
+      category: security
+      cwe: CWE-639
+      technology: [express, sequelize, authorization]
+
+  - id: aegisscan.javascript.express-response-xss
+    message: Express request data reaches an HTML response or DOM injection sink.
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    pattern-sources: *express_request_sources
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: escapeHtml(...)
+          - pattern: $ESCAPE.escape(...)
+          - pattern: $PURIFY.sanitize(...)
+          - pattern: encodeURIComponent(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $RES.send($HTML)
+              - pattern: $ELEMENT.innerHTML = $HTML
+              - pattern: $ELEMENT.outerHTML = $HTML
+              - pattern: $ELEMENT.insertAdjacentHTML($POSITION, $HTML)
+              - pattern: document.write($HTML)
+          - focus-metavariable: $HTML
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-79
+      technology: [express, javascript, xss]

@@ -6,6 +6,8 @@ def test_runtime_and_fixture_paths_are_distinguished():
     assert classify_code_role("data/static/codefixes/search_1.ts") == "FIXTURE"
     assert classify_code_role("tests/search.spec.ts") == "TEST"
     assert classify_code_role("dist/server.js") == "GENERATED"
+    assert classify_code_role("frontend/src/assets/private/three.js") == "DEPENDENCY"
+    assert classify_code_role("public/app.bundle.js") == "GENERATED"
 
 
 def test_aegisscanignore_patterns_override_runtime_role():
