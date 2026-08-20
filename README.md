@@ -7,14 +7,14 @@ Local-first macOS security auditing with repository-wide Semgrep discovery,
 OSV dependency checks, redacted current/history secret detection, bounded Gemini
 triage, an explicit evidence ledger, and guarded remediation.
 
-> **Project status:** Version 0.3.0 beta. AegisScan is suitable for evaluation and
+> **Project status:** Version 0.3.1 beta. AegisScan is suitable for evaluation and
 > development workflows, but findings and generated fixes still require human
 > review before production use.
 
-Version 0.3.0 adds reproducible bundled SSRF and TOCTOU detection across Python,
-JavaScript/TypeScript, Go, Java, and C#; ruleset fingerprinting; JSON and SARIF
-2.1.0 export; a no-credential detector-only CLI mode; and automatic GitHub Code
-Scanning uploads.
+Version 0.3.1 improves audit accuracy with canonical duplicate findings,
+current/history secret provenance, bounded JavaScript/TypeScript helper context,
+separate scanner diagnostics, and dependency inventory telemetry. It retains the
+reproducible multi-language SSRF and TOCTOU coverage introduced in version 0.3.0.
 
 The desktop workspace also supports credential-free detector-only audits,
 scanner readiness diagnostics, and persistent local audit comparisons that show

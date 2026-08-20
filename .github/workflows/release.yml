@@ -122,10 +122,11 @@ jobs:
         Native Intel and Apple Silicon beta builds of AegisScan.
 
         Highlights:
-        - Reproducible SSRF and TOCTOU rules for Python, JavaScript/TypeScript, Go, Java, and C#
-        - Bundled ruleset SHA-256 identity in JSON and SARIF reports
-        - Detector-only CLI audits without a Gemini credential
-        - GitHub Code Scanning-compatible SARIF 2.1.0 export
+        - Canonical duplicate findings without false-positive inflation
+        - Current and Git-history secret provenance with redacted occurrence metadata
+        - Bounded JavaScript/TypeScript imported-helper context for AI triage
+        - Scanner diagnostics separated from vulnerability totals
+        - OSV manifest and package inventory telemetry
 
         Requirements:
         - macOS 12 or newer
