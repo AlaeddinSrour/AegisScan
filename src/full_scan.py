@@ -7,17 +7,20 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Callable, Iterable
 
 from google import genai
 
+from . import __version__
 from .ast_context import build_ast_context
-from .gemini_client import call_gemini_with_failover
+from .gemini_client import FAILOVER_MODELS, call_gemini_with_failover
 from .github_ops import (
     apply_auto_fixes_with_paths,
     push_audit_fixes,
@@ -25,6 +28,8 @@ from .github_ops import (
 )
 from .models import FindingDisposition, ReviewIssue, ReviewReport
 from .prompt import build_full_scan_prompt
+from .redaction import redact_review_report
+from .related_context import build_related_context
 from .reporting import write_json_report, write_sarif_report
 from .scope import classify_code_role, is_runtime_role, load_ignore_patterns
 from .semgrep_runner import (
@@ -91,12 +96,24 @@ class ScanOutcome:
     dependency_finding_count: int = 0
     secret_finding_count: int = 0
     detector_errors: dict[str, list[str]] = field(default_factory=dict)
+    detector_telemetry: dict[str, dict[str, object]] = field(default_factory=dict)
+    scanner_diagnostics: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     dependency_scan_enabled: bool = True
     secret_scan_enabled: bool = True
     secret_scanner: str = ""
     ai_triage_enabled: bool = True
     semgrep_rule_mode: str = "bundled"
     semgrep_rules_sha256: str = ""
+    app_version: str = __version__
+    scan_started_at: str = ""
+    scan_completed_at: str = ""
+    repository_name: str = ""
+    repository_commit: str = ""
+    repository_branch: str = ""
+    repository_dirty: bool | None = None
+    ai_models: list[str] = field(default_factory=list)
+    scan_exclusions: list[str] = field(default_factory=list)
+    max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES
     fixed_files: list[str] = field(default_factory=list)
     audit_branch: str = ""
     pull_request_url: str = ""
@@ -117,7 +134,20 @@ class ScanOutcome:
     @property
     def audit_degraded(self) -> bool:
         """Whether any enabled detector or AI triage stage was incomplete."""
-        return self.ai_triage_degraded or any(self.detector_errors.values())
+        return (
+            self.ai_triage_degraded
+            or any(self.detector_errors.values())
+            or self.runtime_scan_gap_count > 0
+        )
+
+    @property
+    def runtime_scan_gap_count(self) -> int:
+        """Count runtime files/rules Semgrep could not analyze completely."""
+        return sum(
+            disposition.status == "NEEDS_REVIEW"
+            and disposition.rule_id == "aegisscan.semgrep.runtime-scan-incomplete"
+            for disposition in self.report.dispositions
+        )
 
     @property
     def total_finding_count(self) -> int:
@@ -126,6 +156,36 @@ class ScanOutcome:
             + self.dependency_finding_count
             + self.secret_finding_count
         )
+
+    @property
+    def scanner_diagnostic_count(self) -> int:
+        return sum(len(items) for items in self.scanner_diagnostics.values())
+
+
+def _git_provenance(root: Path) -> tuple[str, str, bool | None]:
+    """Return commit, branch, and dirty state without failing non-Git audits."""
+
+    def git(*args: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip()
+
+    commit = git("rev-parse", "HEAD")
+    if not commit:
+        return "", "", None
+    branch = git("branch", "--show-current") or ""
+    status = git("status", "--porcelain", "--untracked-files=normal")
+    return commit, branch, bool(status) if status is not None else None
 
 
 def _pretriage_disposition(candidate: SemgrepCandidate) -> FindingDisposition | None:
@@ -332,6 +392,74 @@ def _requires_manual_remediation(
     return any(term in evidence for term in manual_terms)
 
 
+def _manual_remediation_guidance(issue: ReviewIssue) -> str:
+    """Return actionable prose where a safe local replacement needs app context."""
+    evidence = " ".join(
+        (issue.issue_name, issue.description, issue.rule_id)
+    ).casefold()
+    if any(term in evidence for term in ("ssrf", "server-side request forgery")):
+        return (
+            "Define the destinations this feature genuinely needs, allow only approved "
+            "schemes and hosts, resolve DNS before connecting, reject loopback/private/"
+            "link-local/metadata addresses, and revalidate every redirect target. Add "
+            "tests for encoded IPs, DNS rebinding, and redirect chains."
+        )
+    if any(
+        term in evidence
+        for term in ("toctou", "time-of-check", "time of check", "check-then-use")
+    ):
+        return (
+            "Replace the complete check-then-use sequence with one direct operation and "
+            "handle its error atomically. For security-sensitive writes, use exclusive "
+            "open/create flags and avoid following attacker-controlled symlinks."
+        )
+    if any(
+        term in evidence
+        for term in ("private key", "hardcoded", "hard-coded", "hmac", "credential")
+    ):
+        return (
+            "Remove the embedded value, load a required credential from an approved secret "
+            "store without an insecure fallback, rotate/revoke the exposed credential, and "
+            "review repository history and build artifacts for copies."
+        )
+    if "vulnerable dependency" in evidence or issue.rule_id.startswith("osv."):
+        return (
+            "Confirm whether the affected component is reachable, upgrade to a fixed "
+            "compatible release, regenerate and review the lockfile, run the application "
+            "test suite, and document any temporary risk acceptance."
+        )
+    if "redirect" in evidence:
+        return (
+            "Accept only repository-owned relative paths or exact allowlisted destinations. "
+            "Parse and canonicalize the URL before comparison, then add bypass tests for "
+            "userinfo, mixed encoding, scheme-relative URLs, and subdomain suffix tricks."
+        )
+    return (
+        "Validate the security boundary and implement the remediation with application "
+        "context, then add a regression test that demonstrates the original attack is blocked."
+    )
+
+
+def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
+    issues: list[ReviewIssue] = []
+    for issue in report.issues:
+        if issue.remediation_type != "MANUAL_REQUIRED":
+            issues.append(issue)
+            continue
+        issues.append(
+            issue.model_copy(
+                update={
+                    "suggested_fix": "",
+                    "remediation_guidance": (
+                        issue.remediation_guidance.strip()
+                        or _manual_remediation_guidance(issue)
+                    ),
+                }
+            )
+        )
+    return report.model_copy(update={"issues": issues})
+
+
 def _issue_family(issue: ReviewIssue) -> str:
     """Normalize names from different rules/models into a semantic family."""
     evidence = " ".join(
@@ -415,6 +543,23 @@ def _is_helper_location(repo_path: Path, issue: ReviewIssue) -> bool:
     )
 
 
+def _related_weakness(rule_id: str, message: str) -> str:
+    """Return a human-readable weakness label for consolidated evidence."""
+    evidence = f"{rule_id} {message}".casefold()
+    mappings = (
+        ("CWE-367: TOCTOU", ("toctou", "check-then-use", "filesystem-check")),
+        ("CWE-918: SSRF", ("ssrf", "server-side request forgery", "network-request")),
+        ("CWE-22: Path Traversal", ("path traversal", "zip slip")),
+        ("CWE-89: SQL Injection", ("sql injection", "sqli")),
+        ("CWE-79: Cross-Site Scripting", ("cross-site scripting", "xss")),
+        ("CWE-798: Hardcoded Credential", ("private key", "hardcoded", "credential")),
+    )
+    for label, terms in mappings:
+        if any(term in evidence for term in terms):
+            return label
+    return ""
+
+
 def _reconcile_batch_report(
     report: ReviewReport,
     batch: FindingBatch,
@@ -433,6 +578,18 @@ def _reconcile_batch_report(
             continue
         status = disposition.status
         reason = disposition.reason
+        canonical_finding_id = disposition.canonical_finding_id
+        if status == "DUPLICATE" and (
+            not canonical_finding_id
+            or canonical_finding_id == candidate.finding_id
+            or canonical_finding_id not in candidates
+        ):
+            status = "NEEDS_REVIEW"
+            reason = (
+                "The duplicate disposition did not identify another supplied candidate "
+                "as its canonical finding."
+            )
+            canonical_finding_id = ""
         if not is_runtime_role(candidate.code_role):
             status = "NON_RUNTIME"
             reason = (
@@ -448,6 +605,8 @@ def _reconcile_batch_report(
                 "rule_id": candidate.rule_id,
                 "message": candidate.message,
                 "code_role": candidate.code_role,
+                "evidence_scope": "CURRENT",
+                "canonical_finding_id": canonical_finding_id,
             }
         )
 
@@ -538,6 +697,7 @@ def _reconcile_batch_report(
             )
             continue
         if model_disposition and model_disposition.status in {
+            "DUPLICATE",
             "FALSE_POSITIVE",
             "NON_RUNTIME",
             "NEEDS_REVIEW",
@@ -582,6 +742,22 @@ def _reconcile_batch_report(
             )
         elif candidate.finding_id in confirmed_ids:
             disposition = dispositions[candidate.finding_id]
+        elif (
+            disposition is not None
+            and disposition.status == "DUPLICATE"
+            and disposition.canonical_finding_id not in confirmed_ids
+        ):
+            disposition = disposition.model_copy(
+                update={
+                    "status": "NEEDS_REVIEW",
+                    "reason": (
+                        "The referenced canonical candidate was not retained as a "
+                        "confirmed issue."
+                    ),
+                    "canonical_finding_id": "",
+                    "confidence": "LOW",
+                }
+            )
         elif disposition is None or disposition.status == "CONFIRMED":
             disposition = FindingDisposition(
                 finding_id=candidate.finding_id,
@@ -683,17 +859,82 @@ def _merge_reports(
             if canonical is not None and disposition.status == "CONFIRMED":
                 disposition = disposition.model_copy(
                     update={
-                        "status": "FALSE_POSITIVE",
+                        "status": "DUPLICATE",
                         "reason": (
                             "Consolidated into the canonical "
                             f"{_issue_family(canonical).lower()} sink at "
                             f"{canonical.sink_file or canonical.file}:"
                             f"{canonical.sink_line or canonical.line}."
                         ),
+                        "canonical_finding_id": canonical.finding_id,
                     }
                 )
             updated_dispositions.append(disposition)
         dispositions = updated_dispositions
+
+    canonical_issues = {issue.finding_id: issue for issue in issues if issue.finding_id}
+    normalized_dispositions: list[FindingDisposition] = []
+    for disposition in dispositions:
+        if disposition.status != "FALSE_POSITIVE" or not re.search(
+            r"\b(?:duplicate|consolidat(?:e|ed|ion))\b",
+            disposition.reason,
+            flags=re.IGNORECASE,
+        ):
+            normalized_dispositions.append(disposition)
+            continue
+        canonical_id = disposition.canonical_finding_id
+        if not canonical_id:
+            canonical_id = next(
+                (
+                    finding_id
+                    for finding_id in canonical_issues
+                    if finding_id in disposition.reason
+                ),
+                "",
+            )
+        if not canonical_id:
+            nearby = [
+                issue
+                for issue in issues
+                if (issue.sink_file or issue.file) == disposition.file
+                and abs((issue.sink_line or issue.line) - disposition.line) <= 30
+            ]
+            if len(nearby) == 1:
+                canonical_id = nearby[0].finding_id
+        if canonical_id in canonical_issues:
+            disposition = disposition.model_copy(
+                update={
+                    "status": "DUPLICATE",
+                    "canonical_finding_id": canonical_id,
+                    "reason": disposition.reason,
+                }
+            )
+        normalized_dispositions.append(disposition)
+    dispositions = normalized_dispositions
+
+    related_by_canonical: dict[str, set[str]] = defaultdict(set)
+    for disposition in dispositions:
+        if disposition.status != "DUPLICATE" or not disposition.canonical_finding_id:
+            continue
+        weakness = _related_weakness(disposition.rule_id, disposition.message)
+        if weakness:
+            related_by_canonical[disposition.canonical_finding_id].add(weakness)
+    if related_by_canonical:
+        issues = [
+            issue.model_copy(
+                update={
+                    "related_weaknesses": list(
+                        dict.fromkeys(
+                            [
+                                *issue.related_weaknesses,
+                                *sorted(related_by_canonical.get(issue.finding_id, set())),
+                            ]
+                        )
+                    )
+                }
+            )
+            for issue in issues
+        ]
 
     return ReviewReport(
         analysis_scratchpad="\n\n".join(scratchpads),
@@ -724,6 +965,7 @@ def run_full_scan(
     """Scan an entire repository, triage bounded batches, and optionally open a PR."""
     notify = progress or logger.info
     audit_started = monotonic()
+    scan_started_at = datetime.now(UTC).isoformat(timespec="seconds")
     root = Path(repo_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Repository directory does not exist: {root}")
@@ -757,6 +999,7 @@ def run_full_scan(
         )
         if pattern.strip()
     )
+    repository_commit, repository_branch, repository_dirty = _git_provenance(root)
     notify(
         "[SETUP] Semgrep exclusions: "
         + (", ".join(configured_excludes) if configured_excludes else "none")
@@ -780,6 +1023,7 @@ def run_full_scan(
         max_target_bytes=max_target_bytes,
         rule_mode=semgrep_rule_mode,
     )
+    semgrep_diagnostics = list(getattr(formatted, "diagnostics", []))
     raw_findings = split_semgrep_findings(formatted)
     findings = _deduplicate_semgrep_findings(raw_findings)
     finding_files = {path for item in findings if (path := finding_file(item))}
@@ -787,6 +1031,11 @@ def run_full_scan(
         f"[DISCOVER] Semgrep completed in {monotonic() - semgrep_started:.1f}s · "
         f"{len(findings)} raw findings across {len(finding_files)} files"
     )
+    if semgrep_diagnostics:
+        notify(
+            f"[DIAGNOSTICS] Semgrep recorded {len(semgrep_diagnostics)} non-runtime "
+            "parse or resource diagnostics outside vulnerability totals"
+        )
     if len(raw_findings) != len(findings):
         notify(
             f"[DISCOVER] Removed {len(raw_findings) - len(findings)} exact duplicate "
@@ -809,6 +1058,15 @@ def run_full_scan(
             f"[DEPENDENCIES] Completed in {monotonic() - dependency_started:.1f}s · "
             f"{dependency_result.finding_count} vulnerable package findings"
         )
+        if dependency_result.telemetry:
+            notify(
+                "[DEPENDENCIES] Inventory · "
+                f"{dependency_result.telemetry.get('manifests_discovered', 0)} "
+                "manifest(s) discovered · "
+                f"{dependency_result.telemetry.get('packages_in_local_inventory', 0)} "
+                "package(s) counted locally · "
+                f"status {dependency_result.telemetry.get('status', 'unknown')}"
+            )
         for error in dependency_result.errors:
             notify(f"[WARNING] {error}")
     else:
@@ -963,12 +1221,17 @@ def run_full_scan(
             files={item.file for item in triage_findings if item.file},
         )
         ast_started = monotonic()
-        structural_context = build_ast_context(root, triage_batch.files)
+        python_context = build_ast_context(root, triage_batch.files)
+        related_context = build_related_context(root, triage_batch.files)
+        structural_context = "\n\n".join(
+            part for part in (python_context, related_context) if part
+        )
         python_files = sum(
             Path(path).suffix.casefold() == ".py" for path in triage_batch.files
         )
         notify(
-            f"[CONTEXT] Local AST map generated for {python_files} Python files in "
+            f"[CONTEXT] Local structural context generated for {python_files} Python "
+            f"files and imported JS/TS helpers in "
             f"{monotonic() - ast_started:.1f}s · {len(structural_context):,} context characters"
         )
         prompt = build_full_scan_prompt(
@@ -983,7 +1246,9 @@ def run_full_scan(
         )
         attempted_ai_batches += 1
         try:
-            report = call_gemini_with_failover(gemini_client, prompt, progress=notify)
+            report = redact_review_report(
+                call_gemini_with_failover(gemini_client, prompt, progress=notify)
+            )
         except RuntimeError as exc:
             logger.error("Batch %s failed: %s", index, exc)
             failed_batches.append(index)
@@ -1044,11 +1309,14 @@ def run_full_scan(
             "mode and every untriaged runtime candidate will remain in Needs review."
         )
 
-    merged = _merge_reports(reports, root)
+    merged = redact_review_report(
+        _normalize_manual_remediations(_merge_reports(reports, root))
+    )
     merged.dispositions.extend(failed_dispositions)
     base_scratchpad = merged.analysis_scratchpad.strip()
     supplemental_summaries: list[str] = []
     detector_errors: dict[str, list[str]] = {}
+    detector_telemetry: dict[str, dict[str, object]] = {}
     for detector_result in supplemental_results:
         supplemental_summaries.append(
             f"{detector_result.detector}: {detector_result.finding_count} finding(s), "
@@ -1056,6 +1324,8 @@ def run_full_scan(
         )
         if detector_result.errors:
             detector_errors[detector_result.detector] = detector_result.errors
+        if detector_result.telemetry:
+            detector_telemetry[detector_result.detector] = detector_result.telemetry
 
     accepted_before_merge = len(merged.issues) + sum(
         len(result.issues) for result in supplemental_results
@@ -1073,7 +1343,9 @@ def run_full_scan(
             )
             for index, result in enumerate(supplemental_results, start=1)
         )
-        merged = _merge_reports(combined_reports, root)
+        merged = redact_review_report(
+            _normalize_manual_remediations(_merge_reports(combined_reports, root))
+        )
 
     scratchpad_parts = [part for part in (base_scratchpad, *supplemental_summaries) if part]
     if not scratchpad_parts:
@@ -1111,6 +1383,10 @@ def run_full_scan(
             0,
         ),
         detector_errors=detector_errors,
+        detector_telemetry=detector_telemetry,
+        scanner_diagnostics=(
+            {"semgrep": semgrep_diagnostics} if semgrep_diagnostics else {}
+        ),
         dependency_scan_enabled=dependency_scan,
         secret_scan_enabled=secret_scan,
         secret_scanner=next(
@@ -1124,6 +1400,14 @@ def run_full_scan(
         ai_triage_enabled=ai_triage,
         semgrep_rule_mode=semgrep_rule_mode,
         semgrep_rules_sha256=rules_fingerprint,
+        scan_started_at=scan_started_at,
+        repository_name=root.name,
+        repository_commit=repository_commit,
+        repository_branch=repository_branch,
+        repository_dirty=repository_dirty,
+        ai_models=list(FAILOVER_MODELS) if ai_triage else [],
+        scan_exclusions=list(configured_excludes),
+        max_target_bytes=max(1, int(max_target_bytes)),
     )
     if apply_fixes and merged.issues:
         remediation_started = monotonic()
@@ -1167,13 +1451,16 @@ def run_full_scan(
     else:
         notify("[PUBLISH] GitHub pull-request publishing is disabled")
 
+    outcome.scan_completed_at = datetime.now(UTC).isoformat(timespec="seconds")
     notify(
         f"[COMPLETE] Audit finished"
         f"{' in degraded mode' if outcome.audit_degraded else ''} "
         f"in {monotonic() - audit_started:.1f}s · "
         f"{outcome.total_finding_count} detector findings · "
         f"{len(merged.issues)} confirmed · {outcome.disposition_count('NEEDS_REVIEW')} needs review · "
-        f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · {len(outcome.fixed_files)} changed files"
+        f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · "
+        f"{outcome.disposition_count('DUPLICATE')} duplicates · "
+        f"{len(outcome.fixed_files)} changed files"
     )
 
     return outcome

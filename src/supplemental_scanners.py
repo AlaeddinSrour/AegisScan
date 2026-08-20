@@ -34,6 +34,103 @@ class DetectorResult:
     issues: list[ReviewIssue] = field(default_factory=list)
     dispositions: list[FindingDisposition] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    telemetry: dict[str, object] = field(default_factory=dict)
+
+
+_DEPENDENCY_MANIFEST_NAMES = {
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "cargo.lock",
+    "go.mod",
+    "gemfile.lock",
+    "composer.lock",
+    "packages.lock.json",
+}
+_DEPENDENCY_SKIP_DIRS = {".git", ".venv", "node_modules", "vendor"}
+
+
+def _manifest_package_count(path: Path) -> int | None:
+    """Return a bounded local package inventory count when cheaply available."""
+    name = path.name.casefold()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        if name in {"package-lock.json", "npm-shrinkwrap.json"}:
+            payload = json.loads(text)
+            packages = payload.get("packages") if isinstance(payload, dict) else None
+            if isinstance(packages, dict):
+                return sum(bool(key) for key in packages)
+            dependencies = payload.get("dependencies") if isinstance(payload, dict) else None
+            return len(dependencies) if isinstance(dependencies, dict) else 0
+        if name == "pipfile.lock":
+            payload = json.loads(text)
+            return sum(
+                len(payload.get(section, {}))
+                for section in ("default", "develop")
+                if isinstance(payload, dict) and isinstance(payload.get(section), dict)
+            )
+        if name == "composer.lock":
+            payload = json.loads(text)
+            return sum(
+                len(payload.get(section, []))
+                for section in ("packages", "packages-dev")
+                if isinstance(payload, dict) and isinstance(payload.get(section), list)
+            )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if name in {"poetry.lock", "cargo.lock"}:
+        return len(re.findall(r"(?m)^\[\[package\]\]\s*$", text))
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return sum(
+            bool(line.strip()) and not line.lstrip().startswith(("#", "-"))
+            for line in text.splitlines()
+        )
+    if name == "go.mod":
+        block_entries = len(re.findall(r"(?m)^\s+[A-Za-z0-9_.\-/]+\s+v\S+", text))
+        inline_entries = len(re.findall(r"(?m)^require\s+[A-Za-z0-9_.\-/]+\s+v\S+", text))
+        return block_entries + inline_entries
+    return None
+
+
+def _dependency_inventory(root: Path) -> tuple[list[str], int, int]:
+    manifests: list[str] = []
+    known_package_count = 0
+    uncounted_manifests = 0
+    for directory, child_directories, files in os.walk(root):
+        child_directories[:] = [
+            name for name in child_directories if name not in _DEPENDENCY_SKIP_DIRS
+        ]
+        directory_path = Path(directory)
+        for filename in files:
+            normalized = filename.casefold()
+            is_manifest = (
+                normalized in _DEPENDENCY_MANIFEST_NAMES
+                or (normalized.startswith("requirements") and normalized.endswith(".txt"))
+                or normalized.endswith(".csproj")
+            )
+            if not is_manifest:
+                continue
+            path = directory_path / filename
+            try:
+                relative = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue
+            manifests.append(relative)
+            package_count = _manifest_package_count(path)
+            if package_count is None:
+                uncounted_manifests += 1
+            else:
+                known_package_count += package_count
+    return sorted(manifests), known_package_count, uncounted_manifests
 
 
 def _executable(command: str, environment_name: str) -> str | None:
@@ -122,14 +219,33 @@ def _fixed_versions(vulnerability: dict[str, object]) -> list[str]:
 def scan_dependencies(repo_path: str) -> DetectorResult:
     """Run OSV-Scanner V2 and normalize known vulnerable dependencies."""
     result = DetectorResult(detector="osv")
+    root = Path(repo_path).resolve()
+    manifests, package_count, uncounted_manifests = _dependency_inventory(root)
+    result.telemetry = {
+        "status": "not_started",
+        "command_completed": False,
+        "exit_code": None,
+        "manifests_discovered": len(manifests),
+        "manifest_files": manifests[:100],
+        "manifest_files_truncated": len(manifests) > 100,
+        "packages_in_local_inventory": package_count,
+        "manifests_without_local_package_count": uncounted_manifests,
+        "manifest_inventory_complete": uncounted_manifests == 0,
+        "manifests_scanned": 0,
+        "packages_queried": 0,
+        "skip_reasons": [],
+        "osv_result_sources": 0,
+        "packages_with_advisory_data": 0,
+    }
     executable = _executable("osv-scanner", "OSV_SCANNER_COMMAND")
     if executable is None:
+        result.telemetry["status"] = "tool_unavailable"
+        result.telemetry["skip_reasons"] = ["OSV-Scanner is not installed."]
         result.errors.append(
             "OSV-Scanner is unavailable. Install it with `brew install osv-scanner`."
         )
         return result
 
-    root = Path(repo_path).resolve()
     command = [
         executable,
         "scan",
@@ -148,14 +264,30 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
             shell=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        result.telemetry["status"] = "execution_failed"
+        result.telemetry["skip_reasons"] = ["OSV-Scanner did not complete."]
         result.errors.append(f"OSV-Scanner could not complete: {_compact_error(str(exc))}")
         return result
 
+    result.telemetry["exit_code"] = completed.returncode
     if completed.returncode == 128:
         # OSV-Scanner documents 128 as "no packages found". This is a valid,
         # non-applicable result for repositories without supported manifests.
+        result.telemetry.update(
+            {
+                "status": "no_packages_found",
+                "command_completed": True,
+                "skip_reasons": [
+                    "OSV-Scanner found no supported package inventory."
+                ],
+            }
+        )
         return result
     if completed.returncode not in {0, 1} or not completed.stdout.strip():
+        result.telemetry["status"] = "execution_failed"
+        result.telemetry["skip_reasons"] = [
+            "OSV-Scanner exited without a usable report."
+        ]
         detail = _compact_error(completed.stderr or "no JSON output")
         result.errors.append(
             f"OSV-Scanner exited with status {completed.returncode}: {detail}"
@@ -164,23 +296,31 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
+        result.telemetry["status"] = "invalid_output"
+        result.telemetry["skip_reasons"] = [
+            "OSV-Scanner returned invalid JSON."
+        ]
         result.errors.append(f"OSV-Scanner returned invalid JSON: {exc}")
         return result
 
     ignore_patterns = load_ignore_patterns(root)
     seen: set[tuple[str, str, str, str]] = set()
     scan_results = payload.get("results") if isinstance(payload, dict) else None
+    reported_sources: set[str] = set()
+    packages_with_advisory_data = 0
     for scan_result in scan_results if isinstance(scan_results, list) else []:
         if not isinstance(scan_result, dict):
             continue
         source = scan_result.get("source")
         source_path = source.get("path") if isinstance(source, dict) else ""
         relative_file, current_file = _relative_file(root, source_path)
+        reported_sources.add(relative_file)
         role = classify_code_role(relative_file, ignore_patterns)
         packages = scan_result.get("packages")
         for package_entry in packages if isinstance(packages, list) else []:
             if not isinstance(package_entry, dict):
                 continue
+            packages_with_advisory_data += 1
             package = package_entry.get("package")
             package = package if isinstance(package, dict) else {}
             package_name = str(package.get("name") or "unknown package")
@@ -269,6 +409,16 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
                     )
                 )
     result.finding_count = len(seen)
+    result.telemetry.update(
+        {
+            "status": "completed",
+            "command_completed": True,
+            "manifests_scanned": len(manifests),
+            "packages_queried": package_count,
+            "osv_result_sources": len(reported_sources),
+            "packages_with_advisory_data": packages_with_advisory_data,
+        }
+    )
     return result
 
 
@@ -403,7 +553,7 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
         )
     result.errors.extend(error for error in (current_error, history_error) if error)
 
-    seen: set[tuple[str, str, int, int]] = set()
+    seen: dict[tuple[object, ...], int] = {}
     for mode, findings in (("current", current), ("history", history)):
         for finding in findings:
             rule_id = str(
@@ -435,15 +585,39 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                 )
             except (TypeError, ValueError):
                 column = 0
-            key = (rule_id, relative_file, line, column)
-            if key in seen:
-                continue
-            seen.add(key)
-            role = classify_code_role(relative_file, ignore_patterns)
-            finding_id = _finding_id("SECRET", *key)
             commit = str(
                 _finding_value(finding, "Commit", "git.sha", "commit") or ""
             )[:12]
+            fingerprint = str(
+                _finding_value(finding, "Fingerprint", "fingerprint") or ""
+            ).strip()
+            key: tuple[object, ...] = (
+                ("fingerprint", rule_id, fingerprint)
+                if fingerprint
+                else ("location", rule_id, relative_file, line, column)
+            )
+            if key in seen:
+                disposition_index = seen[key]
+                existing = result.dispositions[disposition_index]
+                commits = list(existing.commits)
+                if commit and commit not in commits:
+                    commits.append(commit)
+                evidence_scope = existing.evidence_scope
+                if mode == "history" and evidence_scope == "CURRENT":
+                    evidence_scope = "CURRENT_AND_HISTORY"
+                elif mode == "current" and evidence_scope == "GIT_HISTORY":
+                    evidence_scope = "CURRENT_AND_HISTORY"
+                result.dispositions[disposition_index] = existing.model_copy(
+                    update={
+                        "evidence_scope": evidence_scope,
+                        "commit": existing.commit or commit,
+                        "commits": commits,
+                        "occurrence_count": existing.occurrence_count + 1,
+                    }
+                )
+                continue
+            role = classify_code_role(relative_file, ignore_patterns)
+            finding_id = _finding_id("SECRET", *key)
             validation_status = str(
                 _finding_value(
                     finding,
@@ -541,7 +715,27 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                     message=description,
                     code_role=role,
                     confidence=confidence,
+                    evidence_scope=(
+                        "CURRENT" if mode == "current" else "GIT_HISTORY"
+                    ),
+                    commit=commit,
+                    commits=[commit] if commit else [],
                 )
             )
+            seen[key] = len(result.dispositions) - 1
     result.finding_count = len(seen)
+    result.telemetry = {
+        "current_raw_findings": len(current),
+        "history_raw_findings": len(history),
+        "unique_findings": len(seen),
+        "deduplicated_occurrences": len(current) + len(history) - len(seen),
+        "current_evidence": sum(
+            item.evidence_scope in {"CURRENT", "CURRENT_AND_HISTORY"}
+            for item in result.dispositions
+        ),
+        "history_evidence": sum(
+            item.evidence_scope in {"GIT_HISTORY", "CURRENT_AND_HISTORY"}
+            for item in result.dispositions
+        ),
+    }
     return result

@@ -55,6 +55,11 @@ def test_osv_findings_are_normalized_and_alias_groups_are_deduplicated(tmp_path)
     assert result.issues[0].remediation_type == "MANUAL_REQUIRED"
     assert "1.0.1" in result.issues[0].suggested_fix
     assert result.dispositions[0].status == "CONFIRMED"
+    assert result.telemetry["status"] == "completed"
+    assert result.telemetry["manifests_discovered"] == 1
+    assert result.telemetry["manifests_scanned"] == 1
+    assert result.telemetry["packages_queried"] == 1
+    assert result.telemetry["osv_result_sources"] == 1
     assert run.call_args.args[0][-1] == str(tmp_path.resolve())
 
 
@@ -66,6 +71,9 @@ def test_osv_no_packages_is_not_reported_as_a_detector_failure(tmp_path):
 
     assert result.finding_count == 0
     assert result.errors == []
+    assert result.telemetry["status"] == "no_packages_found"
+    assert result.telemetry["command_completed"] is True
+    assert result.telemetry["skip_reasons"]
 
 
 def test_betterleaks_redacts_values_scopes_tests_and_deduplicates_history(tmp_path):
@@ -130,6 +138,11 @@ def test_betterleaks_redacts_values_scopes_tests_and_deduplicates_history(tmp_pa
         "NON_RUNTIME",
         "NEEDS_REVIEW",
     ]
+    assert result.dispositions[0].evidence_scope == "CURRENT_AND_HISTORY"
+    assert result.dispositions[0].occurrence_count == 2
+    assert result.dispositions[2].evidence_scope == "GIT_HISTORY"
+    assert result.dispositions[2].commits == ["abcdef123456"]
+    assert result.telemetry["deduplicated_occurrences"] == 2
     serialized = json.dumps(
         {
             "issues": [item.model_dump() for item in result.issues],

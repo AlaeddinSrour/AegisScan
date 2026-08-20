@@ -5,6 +5,7 @@ import subprocess
 from src.semgrep_runner import (
     _aegisscan_rules_path,
     bundled_rules_sha256,
+    normalize_rule_id,
     run_semgrep_scan,
 )
 
@@ -72,6 +73,56 @@ def test_bundled_rule_fingerprint_is_stable_sha256():
 
     assert len(fingerprint) == 64
     assert int(fingerprint, 16) >= 0
+
+
+def test_bundled_rule_id_is_portable_across_absolute_config_paths():
+    polluted = (
+        "Users.analyst.AegisScan.dist.AegisScan.app.Contents.Resources.src."
+        "aegisscan.javascript.hardcoded-private-key"
+    )
+
+    assert normalize_rule_id(polluted) == (
+        "aegisscan.javascript.hardcoded-private-key"
+    )
+    assert normalize_rule_id("javascript.express.audit.rule") == (
+        "javascript.express.audit.rule"
+    )
+
+
+def test_semgrep_output_normalizes_rule_id_and_redacts_source_context():
+    private_key = (
+        "-----BEGIN RSA PRIVATE KEY-----secret-material"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    finding = {
+        "path": "security.ts",
+        "start": {"line": 1},
+        "check_id": (
+            "Users.person.app.Resources.src."
+            "aegisscan.javascript.hardcoded-private-key"
+        ),
+        "extra": {
+            "message": "embedded key",
+            "lines": f"const privateKey = '{private_key}'",
+        },
+    }
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"results": [finding], "errors": []}),
+            stderr="",
+        )
+        with patch("os.path.exists", return_value=True):
+            with patch(
+                "builtins.open",
+                mock_open(read_data=f"const privateKey = '{private_key}'\n"),
+            ):
+                result = run_semgrep_scan("/repo")
+
+    assert "Rule ID: aegisscan.javascript.hardcoded-private-key" in result
+    assert "Users.person" not in result
+    assert private_key not in result
+    assert "[REDACTED SECRET]" in result
 
 
 def test_unknown_rule_mode_is_rejected_before_semgrep_runs():
@@ -198,7 +249,7 @@ def test_zero_exit_does_not_hide_json_scan_errors():
             run_semgrep_scan("/repo")
 
 
-def test_non_runtime_syntax_error_is_retained_as_evidence():
+def test_non_runtime_syntax_error_is_recorded_as_a_scanner_diagnostic():
     with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -219,12 +270,22 @@ def test_non_runtime_syntax_error_is_retained_as_evidence():
 
         result = run_semgrep_scan("/repo")
 
-    assert "aegisscan.semgrep.non-runtime-parse-error" in result
-    assert "data/static/codefixes/broken.ts:7" in result
-    assert "deterministically fixture code" in result
+    assert str(result) == ""
+    assert result.diagnostics == [
+        {
+            "kind": "Syntax error",
+            "file": "data/static/codefixes/broken.ts",
+            "line": 7,
+            "code_role": "FIXTURE",
+            "message": (
+                "Semgrep could not fully parse or scan this fixture file; "
+                "runtime completeness is unaffected."
+            ),
+        }
+    ]
 
 
-def test_non_runtime_partial_parsing_variant_is_retained():
+def test_non_runtime_partial_parsing_variant_is_a_scanner_diagnostic():
     with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -245,8 +306,10 @@ def test_non_runtime_partial_parsing_variant_is_retained():
 
         result = run_semgrep_scan("/repo")
 
-    assert "aegisscan.semgrep.non-runtime-parse-error" in result
-    assert "tests/broken.ts:9" in result
+    assert str(result) == ""
+    assert result.diagnostics[0]["file"] == "tests/broken.ts"
+    assert result.diagnostics[0]["line"] == 9
+    assert result.diagnostics[0]["code_role"] == "TEST"
 
 
 def test_runtime_timeout_is_retained_for_manual_review():

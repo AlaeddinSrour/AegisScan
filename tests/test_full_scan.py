@@ -3,13 +3,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.full_scan import (
+    _normalize_manual_remediations,
     _requires_manual_remediation,
     batch_findings,
     run_full_scan,
     split_semgrep_findings,
 )
 from src.models import FindingDisposition, ReviewIssue, ReviewReport
-from src.semgrep_runner import DEFAULT_EXCLUDES, DEFAULT_MAX_TARGET_BYTES
+from src.semgrep_runner import (
+    DEFAULT_EXCLUDES,
+    DEFAULT_MAX_TARGET_BYTES,
+    SemgrepScanOutput,
+)
 from src.supplemental_scanners import DetectorResult
 
 
@@ -63,6 +68,61 @@ def test_full_scan_removes_exact_duplicate_semgrep_findings(tmp_path):
     assert outcome.raw_finding_count == 1
     assert len(outcome.report.dispositions) == 1
     assert any("Removed 1 exact duplicate" in event for event in progress)
+
+
+def test_non_runtime_semgrep_diagnostics_do_not_inflate_finding_totals(tmp_path):
+    diagnostic = {
+        "kind": "Syntax error",
+        "file": "tests/broken.ts",
+        "line": 9,
+        "code_role": "TEST",
+        "message": "Semgrep could not fully parse this test file.",
+    }
+    semgrep_output = SemgrepScanOutput("", [diagnostic])
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=semgrep_output):
+        with patch("src.full_scan.call_gemini_with_failover") as ai_call:
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    ai_call.assert_not_called()
+    assert outcome.raw_finding_count == 0
+    assert outcome.total_finding_count == 0
+    assert outcome.scanner_diagnostic_count == 1
+    assert outcome.scanner_diagnostics == {"semgrep": [diagnostic]}
+
+
+def test_typescript_imported_helper_context_is_sent_for_triage(tmp_path):
+    routes = tmp_path / "routes"
+    lib = tmp_path / "lib"
+    routes.mkdir()
+    lib.mkdir()
+    (routes / "redirect.ts").write_text(
+        "import * as security from '../lib/insecurity'\n"
+        "export const redirect = (url: string) => {\n"
+        "  if (security.isRedirectAllowed(url)) return url\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (lib / "insecurity.ts").write_text(
+        "export const isRedirectAllowed = (url: string) => {\n"
+        "  return new URL(url).hostname === 'example.test'\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    report = ReviewReport(analysis_scratchpad="reviewed", issues=[])
+
+    with patch(
+        "src.full_scan.run_semgrep_scan",
+        return_value=_finding(1, "routes/redirect.ts", 3),
+    ):
+        with patch(
+            "src.full_scan.call_gemini_with_failover", return_value=report
+        ) as ai_call:
+            run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    prompt = ai_call.call_args.args[1]
+    assert "Imported helper: isRedirectAllowed" in prompt
+    assert "new URL(url).hostname" in prompt
 
 
 def test_run_full_scan_disables_diff_filter_and_merges_report(tmp_path):
@@ -172,7 +232,10 @@ def test_clean_semgrep_still_runs_supplemental_detectors(tmp_path, monkeypatch):
     assert outcome.raw_finding_count == 0
     assert outcome.dependency_finding_count == 1
     assert outcome.total_finding_count == 1
-    assert outcome.report.issues == [dependency_issue]
+    assert len(outcome.report.issues) == 1
+    assert outcome.report.issues[0].finding_id == dependency_issue.finding_id
+    assert outcome.report.issues[0].suggested_fix == ""
+    assert outcome.report.issues[0].remediation_guidance
     assert not outcome.audit_degraded
 
 
@@ -330,6 +393,8 @@ def test_runtime_scan_incomplete_candidate_bypasses_ai_and_needs_review(tmp_path
     assert outcome.report.issues == []
     assert outcome.disposition_count("NEEDS_REVIEW") == 1
     assert "resource limit" in outcome.report.dispositions[0].reason
+    assert outcome.runtime_scan_gap_count == 1
+    assert outcome.audit_degraded
 
 
 def test_hardcoded_private_key_requires_manual_remediation(tmp_path):
@@ -376,6 +441,27 @@ def test_ssrf_and_toctou_require_manual_remediation(issue_name, rule_id):
     )
 
     assert _requires_manual_remediation(issue, rule_id)
+
+
+def test_manual_remediation_replaces_patch_fragments_with_actionable_guidance():
+    issue = ReviewIssue(
+        file="proxy.ts",
+        line=4,
+        severity="HIGH",
+        issue_name="Server-Side Request Forgery",
+        description="Request data reaches fetch.",
+        original_code="await fetch(url)",
+        suggested_fix="await fetch(url) // validate this first",
+        remediation_type="MANUAL_REQUIRED",
+    )
+
+    normalized = _normalize_manual_remediations(
+        ReviewReport(analysis_scratchpad="ssrf", issues=[issue])
+    ).issues[0]
+
+    assert normalized.suggested_fix == ""
+    assert "allow" in normalized.remediation_guidance.casefold()
+    assert "redirect" in normalized.remediation_guidance.casefold()
 
 
 def test_partial_batch_failure_preserves_candidates_for_review(tmp_path):
@@ -478,7 +564,11 @@ def test_helper_candidate_is_consolidated_into_canonical_sink(tmp_path):
         ("routes/videoHandler.ts", 71)
     ]
     assert outcome.disposition_count("CONFIRMED") == 1
-    assert outcome.disposition_count("FALSE_POSITIVE") == 1
+    assert outcome.disposition_count("DUPLICATE") == 1
+    duplicate = next(
+        item for item in outcome.report.dispositions if item.status == "DUPLICATE"
+    )
+    assert duplicate.canonical_finding_id
 
 
 def test_semgrep_and_secret_scanner_findings_share_one_canonical_issue(
@@ -547,4 +637,4 @@ def test_semgrep_and_secret_scanner_findings_share_one_canonical_issue(
     assert outcome.secret_finding_count == 1
     assert outcome.secret_scanner == "betterleaks"
     assert outcome.disposition_count("CONFIRMED") == 1
-    assert outcome.disposition_count("FALSE_POSITIVE") == 1
+    assert outcome.disposition_count("DUPLICATE") == 1

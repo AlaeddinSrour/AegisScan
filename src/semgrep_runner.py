@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from .redaction import redact_text
 from .scope import classify_code_role, is_runtime_role, load_ignore_patterns
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,27 @@ SEMGREP_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_SEMGREP_TIMEOUT", "300")
 DEFAULT_MAX_TARGET_BYTES = 1_000_000
 DEFAULT_EXCLUDES = (".git", ".venv", "node_modules")
 SEMGREP_RULE_MODES = ("bundled", "extended")
+
+
+class SemgrepScanOutput(str):
+    """Formatted findings plus non-finding scanner diagnostics."""
+
+    diagnostics: list[dict[str, object]]
+
+    def __new__(
+        cls, value: str, diagnostics: list[dict[str, object]] | None = None
+    ) -> "SemgrepScanOutput":
+        instance = super().__new__(cls, value)
+        instance.diagnostics = list(diagnostics or [])
+        return instance
+
+
+def normalize_rule_id(value: object) -> str:
+    """Strip Semgrep's absolute-config prefix from bundled AegisScan rule IDs."""
+    rule_id = str(value or "").strip()
+    bundled_marker = "aegisscan."
+    marker_index = rule_id.find(bundled_marker)
+    return rule_id[marker_index:] if marker_index >= 0 else rule_id
 
 
 def _error_detail(error: object) -> str:
@@ -148,7 +170,7 @@ def run_semgrep_scan(
     exclude_patterns: Iterable[str] | None = None,
     max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES,
     rule_mode: str = "bundled",
-) -> str:
+) -> SemgrepScanOutput:
     """
     Run Semgrep on the repository and return formatted findings for LLM triage.
 
@@ -224,10 +246,10 @@ def run_semgrep_scan(
         ) = _partition_scan_errors(repo_path, scan_errors)
         returncode = result.returncode if isinstance(result.returncode, int) else 0
         if returncode != 0:
-            diagnostics = " ".join((result.stderr or "").split())
+            stderr_summary = " ".join((result.stderr or "").split())
             benign_signal_warning = (
-                "Failed to register segfault signal handler" in diagnostics
-                and "Failed to register unwind handler" in diagnostics
+                "Failed to register segfault signal handler" in stderr_summary
+                and "Failed to register unwind handler" in stderr_summary
                 and not fatal_errors
             )
             if benign_signal_warning:
@@ -238,7 +260,7 @@ def run_semgrep_scan(
             else:
                 raise RuntimeError(
                     f"Semgrep exited with status {returncode}: "
-                    f"{diagnostics[:400] or 'no diagnostic output'}"
+                    f"{stderr_summary[:400] or 'no diagnostic output'}"
                 )
         if fatal_errors:
             detail = _error_detail(fatal_errors[0])
@@ -249,7 +271,7 @@ def run_semgrep_scan(
         if non_runtime_errors:
             logger.warning(
                 "Semgrep could not completely scan %s deterministically non-runtime file(s); "
-                "retaining them as NON_RUNTIME evidence.",
+                "recording them as scanner diagnostics.",
                 len(non_runtime_errors),
             )
         if runtime_incomplete_errors:
@@ -259,8 +281,25 @@ def run_semgrep_scan(
                 len(runtime_incomplete_errors),
             )
         results = data.get("results", [])
-        if not results and not non_runtime_errors and not runtime_incomplete_errors:
-            return ""
+        diagnostic_records = [
+            {
+                "kind": (
+                    redact_text(str(error.get("type") or "Syntax error"))
+                    if isinstance(error, dict)
+                    else "Syntax error"
+                ),
+                "file": path,
+                "line": line,
+                "code_role": role,
+                "message": (
+                    f"Semgrep could not fully parse or scan this {role.lower()} file; "
+                    "runtime completeness is unaffected."
+                ),
+            }
+            for error, path, line, role in non_runtime_errors
+        ]
+        if not results and not runtime_incomplete_errors:
+            return SemgrepScanOutput("", diagnostic_records)
 
         formatted_findings = []
         for i, finding in enumerate(results):
@@ -279,7 +318,7 @@ def run_semgrep_scan(
                 if start_line not in changed_files_lines[path]:
                     continue  # Skip vulnerabilities on lines not modified in the PR
 
-            rule_id = finding.get("check_id", "")
+            rule_id = normalize_rule_id(finding.get("check_id", ""))
             message = finding.get("extra", {}).get("message", "")
             snippet = finding.get("extra", {}).get("lines", "").strip()
 
@@ -321,26 +360,9 @@ def run_semgrep_scan(
                     f"--- END FILE CONTEXT ---\n"
                 )
 
-            formatted_findings.append(block)
+            formatted_findings.append(redact_text(block))
 
-        for offset, (error, path, line, role) in enumerate(
-            non_runtime_errors, start=len(results) + 1
-        ):
-            error_type = (
-                str(error.get("type") or "Syntax error")
-                if isinstance(error, dict)
-                else "Syntax error"
-            )
-            formatted_findings.append(
-                f"Finding #{offset}:\n"
-                "Rule ID: aegisscan.semgrep.non-runtime-parse-error\n"
-                f"File: {path}:{line}\n"
-                f"Message: Semgrep {error_type} in deterministically {role.lower()} code; "
-                "the file was not fully parsed and is retained for auditability.\n"
-                "Code Snippet: [Scan error; source context intentionally omitted.]\n"
-            )
-
-        runtime_start = len(results) + len(non_runtime_errors) + 1
+        runtime_start = len(results) + 1
         for offset, (error, path, line, _role) in enumerate(
             runtime_incomplete_errors, start=runtime_start
         ):
@@ -358,7 +380,7 @@ def run_semgrep_scan(
                 "Code Snippet: [Resource-limit error; source context intentionally omitted.]\n"
             )
 
-        return "\n".join(formatted_findings)
+        return SemgrepScanOutput("\n".join(formatted_findings), diagnostic_records)
 
     except FileNotFoundError as exc:
         raise RuntimeError(

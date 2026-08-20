@@ -36,6 +36,16 @@ FIXTURE_SEGMENTS = {
     "training",
 }
 DOCUMENTATION_SEGMENTS = {"doc", "docs", "documentation"}
+KNOWN_VENDORED_ASSETS = {
+    "angular.js",
+    "bootstrap.js",
+    "d3.js",
+    "jquery.js",
+    "moment.js",
+    "react.js",
+    "three.js",
+    "vue.js",
+}
 
 
 def load_ignore_patterns(repo_root: Path) -> list[str]:
@@ -91,9 +101,13 @@ def classify_code_role(path: str, ignore_patterns: list[str] | None = None) -> C
     part_set = set(lowered_parts)
     filename = lowered_parts[-1] if lowered_parts else ""
 
-    if part_set & DEPENDENCY_SEGMENTS:
+    if part_set & DEPENDENCY_SEGMENTS or (
+        "assets" in part_set and filename in KNOWN_VENDORED_ASSETS
+    ):
         return "DEPENDENCY"
-    if part_set & GENERATED_SEGMENTS or filename.endswith((".min.js", ".min.css", ".generated.ts")):
+    if part_set & GENERATED_SEGMENTS or filename.endswith(
+        (".min.js", ".min.css", ".generated.ts", ".bundle.js", ".chunk.js", ".map")
+    ):
         return "GENERATED"
     if part_set & FIXTURE_SEGMENTS:
         return "FIXTURE"
