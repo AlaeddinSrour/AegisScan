@@ -57,9 +57,7 @@ def load_ignore_patterns(repo_root: Path) -> list[str]:
     for raw_line in ignore_file.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw_line.strip()
         if line and not line.startswith("#"):
-            patterns.append(
-                "!" + line[2:] if line.startswith("!/") else line.lstrip("/")
-            )
+            patterns.append("!" + line[2:] if line.startswith("!/") else line.lstrip("/"))
     return patterns
 
 
@@ -69,9 +67,7 @@ def is_ignored(path: str, patterns: list[str]) -> bool:
     for raw_pattern in patterns:
         forced_runtime = raw_pattern.startswith("!")
         pattern = raw_pattern[1:] if forced_runtime else raw_pattern
-        if fnmatch(normalized, pattern) or fnmatch(
-            normalized, pattern.rstrip("/") + "/**"
-        ):
+        if fnmatch(normalized, pattern) or fnmatch(normalized, pattern.rstrip("/") + "/**"):
             ignored = not forced_runtime
     return ignored
 
@@ -82,9 +78,7 @@ def is_forced_runtime(path: str, patterns: list[str]) -> bool:
     forced = False
     for raw_pattern in patterns:
         pattern = raw_pattern[1:] if raw_pattern.startswith("!") else raw_pattern
-        if fnmatch(normalized, pattern) or fnmatch(
-            normalized, pattern.rstrip("/") + "/**"
-        ):
+        if fnmatch(normalized, pattern) or fnmatch(normalized, pattern.rstrip("/") + "/**"):
             forced = raw_pattern.startswith("!")
     return forced
 

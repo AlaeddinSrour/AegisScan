@@ -10,6 +10,7 @@ import re
 
 from typing import Optional
 
+
 def get_modified_lines(patch: Optional[str]) -> set[int]:
     """
     Parse a unified diff patch and return the set of line numbers
@@ -28,18 +29,18 @@ def get_modified_lines(patch: Optional[str]) -> set[int]:
         return modified_lines
 
     current_line = 0
-    for line in patch.split('\n'):
-        if line.startswith('@@'):
-            m = re.search(r'\+([0-9]+)', line)
+    for line in patch.split("\n"):
+        if line.startswith("@@"):
+            m = re.search(r"\+([0-9]+)", line)
             if m:
                 current_line = int(m.group(1))
-        elif line.startswith('+++') or line.startswith('---'):
+        elif line.startswith("+++") or line.startswith("---"):
             # File header lines — skip
             continue
-        elif line.startswith('+'):
+        elif line.startswith("+"):
             modified_lines.add(current_line)
             current_line += 1
-        elif line.startswith('-'):
+        elif line.startswith("-"):
             # Deleted lines don't advance the new-file line counter
             continue
         else:

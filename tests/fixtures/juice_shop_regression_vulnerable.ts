@@ -3,6 +3,7 @@ import { exec } from 'node:child_process'
 import serialize from 'node-serialize'
 
 declare const User: any
+declare const sequelize: any
 
 export function commandInjection(req: any): void {
   const command = req.query.command
@@ -33,3 +34,27 @@ export function reflectedXss(req: any, res: any): void {
   const html = req.query.html
   res.send(html)
 }
+
+export function openRedirect({ query }: any, res: any): void {
+  const target = query.to
+  if (isRedirectAllowed(target)) res.redirect(target)
+}
+
+export function sqlInjection(req: any): unknown {
+  const email = req.body.email
+  return sequelize.query(`SELECT * FROM Users WHERE email = '${email}'`)
+}
+
+export function serverSideRequestForgery(req: any): unknown {
+  const target = req.body.url
+  return fetch(target)
+}
+
+export function checkThenUse(path: string): string {
+  if (fs.existsSync(path)) {
+    return fs.readFileSync(path, 'utf8')
+  }
+  return ''
+}
+
+declare function isRedirectAllowed(value: string): boolean

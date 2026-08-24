@@ -128,6 +128,31 @@ rules:
       cwe: CWE-918
       technology: [express, fetch, axios, node]
 
+  - id: aegisscan.javascript.express-open-redirect
+    message: User-controlled URL data reaches an HTTP redirect and may permit an open redirect.
+    languages: [javascript, typescript]
+    severity: WARNING
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.body.$FIELD
+          - pattern: $REQ.body[$FIELD]
+          - pattern: $REQ.query.$FIELD
+          - pattern: $REQ.query[$FIELD]
+          - pattern: $REQ.params.$FIELD
+          - pattern: $REQ.params[$FIELD]
+          - pattern: query.$FIELD
+          - pattern: query[$FIELD]
+    pattern-sinks:
+      - patterns:
+          - pattern: $RES.redirect($URL)
+          - focus-metavariable: $URL
+    metadata:
+      confidence: MEDIUM
+      category: security
+      cwe: CWE-601
+      technology: [express, node]
+
   - id: aegisscan.python.filesystem-check-then-use
     message: A filesystem check is followed by a path operation that may be vulnerable to a TOCTOU race.
     languages: [python]

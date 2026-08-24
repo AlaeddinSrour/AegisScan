@@ -118,8 +118,10 @@ def _partition_scan_errors(
         path = _error_path(root, error)
         role = classify_code_role(path, patterns) if path else "UNKNOWN"
         location = (error, path, _error_line(error), role)
-        if path and not is_runtime_role(role) and (
-            _is_target_parse_error(error) or _is_resource_limit_error(error)
+        if (
+            path
+            and not is_runtime_role(role)
+            and (_is_target_parse_error(error) or _is_resource_limit_error(error))
         ):
             non_runtime_errors.append(location)
         elif path and is_runtime_role(role) and _is_resource_limit_error(error):
@@ -189,25 +191,28 @@ def run_semgrep_scan(
         target_limit = max(1, int(max_target_bytes))
         excludes = tuple(
             pattern.strip()
-            for pattern in (
-                DEFAULT_EXCLUDES if exclude_patterns is None else exclude_patterns
-            )
+            for pattern in (DEFAULT_EXCLUDES if exclude_patterns is None else exclude_patterns)
             if pattern.strip()
         )
         semgrep_cmd = [
-            _semgrep_executable(), "scan",
+            _semgrep_executable(),
+            "scan",
             "--disable-version-check",
-            "--metrics", "off",
+            "--metrics",
+            "off",
         ]
         for config in _semgrep_configs(rule_mode):
             semgrep_cmd.extend(("--config", config))
         for pattern in excludes:
             semgrep_cmd.extend(("--exclude", pattern))
-        semgrep_cmd.extend([
-            "--max-target-bytes", str(target_limit),
-            "--json",
-            "--quiet",
-        ])
+        semgrep_cmd.extend(
+            [
+                "--max-target-bytes",
+                str(target_limit),
+                "--json",
+                "--quiet",
+            ]
+        )
         scan_environment = os.environ.copy()
         system_certificate_store = Path("/etc/ssl/cert.pem")
         if system_certificate_store.is_file():

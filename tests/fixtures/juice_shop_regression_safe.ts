@@ -23,4 +23,8 @@ export function safeResponse(req: any, res: any): void {
   res.send(escapeHtml(req.query.html))
 }
 
+export function safeRedirect(res: any): void {
+  res.redirect('/account')
+}
+
 declare function escapeHtml(value: string): string

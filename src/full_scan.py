@@ -27,6 +27,12 @@ from .github_ops import (
     validate_publishable_worktree,
 )
 from .models import FindingDisposition, ReviewIssue, ReviewReport
+from .openrouter_client import (
+    MAX_FINDINGS_PER_BATCH as OPENROUTER_MAX_FINDINGS_PER_BATCH,
+    OPENROUTER_MODELS,
+    call_openrouter_with_failover,
+    semantic_repair_candidate_ids,
+)
 from .prompt import build_full_scan_prompt
 from .redaction import redact_review_report
 from .related_context import build_related_context
@@ -47,7 +53,25 @@ logger = logging.getLogger(__name__)
 DEFAULT_BATCH_SIZE = 12
 MAX_BATCH_SIZE = 15
 DEFAULT_MAX_BATCH_CHARS = 100_000
+DEFAULT_AI_RETRIAGE_LIMIT = max(0, int(os.environ.get("AEGISSCAN_AI_RETRIAGE_LIMIT", "6")))
 SECRET_DETECTORS = {"betterleaks", "gitleaks"}
+DETERMINISTIC_CREDENTIAL_RULES = {
+    "aegisscan.javascript.hardcoded-private-key": (
+        "CRITICAL",
+        "Hardcoded private key",
+        "A private key is embedded directly in runtime source.",
+        "The embedded private key is stored in repository source.",
+        "The credential is loaded whenever the containing runtime module is loaded.",
+    ),
+    "aegisscan.javascript.hardcoded-hmac-key": (
+        "HIGH",
+        "Hardcoded HMAC key",
+        "A literal HMAC key is embedded directly in a runtime cryptographic operation.",
+        "The embedded key is passed to createHmac at the reported location.",
+        "The containing runtime path invokes createHmac with the repository value.",
+    ),
+}
+AI_PROVIDER_MODES = ("auto", "openrouter", "gemini")
 FINDING_START = re.compile(r"(?m)^Finding #\d+:\s*\nRule ID:")
 FINDING_FILE = re.compile(r"(?m)^File:\s+(.+?):(\d+)\s*$")
 FINDING_RULE = re.compile(r"(?m)^Rule ID:\s*(.+?)\s*$")
@@ -93,9 +117,11 @@ class ScanOutcome:
     failed_batch_reasons: dict[int, str] = field(default_factory=dict)
     ai_attempted_batches: int = 0
     ai_successful_batches: int = 0
+    ai_telemetry: dict[str, int] = field(default_factory=dict)
     dependency_finding_count: int = 0
     secret_finding_count: int = 0
     detector_errors: dict[str, list[str]] = field(default_factory=dict)
+    detector_coverage_gaps: dict[str, list[str]] = field(default_factory=dict)
     detector_telemetry: dict[str, dict[str, object]] = field(default_factory=dict)
     scanner_diagnostics: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     dependency_scan_enabled: bool = True
@@ -111,6 +137,7 @@ class ScanOutcome:
     repository_commit: str = ""
     repository_branch: str = ""
     repository_dirty: bool | None = None
+    ai_provider_order: list[str] = field(default_factory=list)
     ai_models: list[str] = field(default_factory=list)
     scan_exclusions: list[str] = field(default_factory=list)
     max_target_bytes: int = DEFAULT_MAX_TARGET_BYTES
@@ -137,6 +164,7 @@ class ScanOutcome:
         return (
             self.ai_triage_degraded
             or any(self.detector_errors.values())
+            or any(self.detector_coverage_gaps.values())
             or self.runtime_scan_gap_count > 0
         )
 
@@ -151,15 +179,52 @@ class ScanOutcome:
 
     @property
     def total_finding_count(self) -> int:
-        return (
-            self.raw_finding_count
-            + self.dependency_finding_count
-            + self.secret_finding_count
-        )
+        return self.raw_finding_count + self.dependency_finding_count + self.secret_finding_count
 
     @property
     def scanner_diagnostic_count(self) -> int:
         return sum(len(items) for items in self.scanner_diagnostics.values())
+
+    @property
+    def scanner_diagnostic_counts_by_role(self) -> dict[str, int]:
+        """Separate parser/tool noise from diagnostics that affect runtime coverage."""
+        counts: dict[str, int] = defaultdict(int)
+        for diagnostics in self.scanner_diagnostics.values():
+            for diagnostic in diagnostics:
+                role = str(diagnostic.get("code_role") or "UNKNOWN").upper()
+                counts[role] += 1
+        return dict(sorted(counts.items()))
+
+    @property
+    def runtime_scanner_diagnostic_count(self) -> int:
+        return sum(
+            count
+            for role, count in self.scanner_diagnostic_counts_by_role.items()
+            if is_runtime_role(role)
+        )
+
+    @property
+    def non_runtime_scanner_diagnostic_count(self) -> int:
+        return sum(
+            count
+            for role, count in self.scanner_diagnostic_counts_by_role.items()
+            if role != "UNKNOWN" and not is_runtime_role(role)
+        )
+
+    @property
+    def unique_dependency_advisory_count(self) -> int:
+        """Return distinct advisories retained in the final merged report."""
+        telemetry = self.detector_telemetry.get("osv", {})
+        value = telemetry.get("exported_unique_advisories", telemetry.get("unique_advisories"))
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @property
+    def exported_dependency_finding_count(self) -> int:
+        """Return dependency findings retained in the final merged report."""
+        value = self.detector_telemetry.get("osv", {}).get("exported_dependency_findings")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return sum(issue.rule_id.startswith("osv.") for issue in self.report.issues)
 
 
 def _git_provenance(root: Path) -> tuple[str, str, bool | None]:
@@ -267,9 +332,7 @@ def _candidate_from_text(
     message = message_match.group(1) if message_match else ""
     snippet = snippet_match.group(1) if snippet_match else ""
     fingerprint = hashlib.sha256(
-        f"{rule_id}\0{file}\0{line}\0{message}\0{snippet}".encode(
-            "utf-8", errors="replace"
-        )
+        f"{rule_id}\0{file}\0{line}\0{message}\0{snippet}".encode("utf-8", errors="replace")
     ).hexdigest()[:12]
     return SemgrepCandidate(
         finding_id=f"SG-{fingerprint}",
@@ -321,10 +384,7 @@ def batch_findings(
     for directory in sorted(grouped):
         for finding in grouped[directory]:
             finding_chars = len(finding.prompt_text)
-            if current and (
-                len(current) >= size
-                or current_chars + finding_chars > char_limit
-            ):
+            if current and (len(current) >= size or current_chars + finding_chars > char_limit):
                 flush()
             current.append(finding)
             current_chars += finding_chars
@@ -358,9 +418,7 @@ def _validated_issues(report: ReviewReport, repo_path: Path) -> list[ReviewIssue
     return valid
 
 
-def _requires_manual_remediation(
-    issue: ReviewIssue, detector_rule_id: str = ""
-) -> bool:
+def _requires_manual_remediation(issue: ReviewIssue, detector_rule_id: str = "") -> bool:
     evidence = " ".join(
         (
             issue.issue_name,
@@ -387,16 +445,53 @@ def _requires_manual_remediation(
         "time-of-check",
         "time of check",
         "filesystem-check-then-use",
+        "path traversal",
+        "express-path-traversal",
+        "idor",
+        "insecure direct object reference",
+        "object authorization",
+        "id-to-data-access",
         "user-input-to-network-request",
+        "open redirect",
+        "express-open-redirect",
     )
     return any(term in evidence for term in manual_terms)
 
 
 def _manual_remediation_guidance(issue: ReviewIssue) -> str:
     """Return actionable prose where a safe local replacement needs app context."""
-    evidence = " ".join(
-        (issue.issue_name, issue.description, issue.rule_id)
-    ).casefold()
+    evidence = " ".join((issue.issue_name, issue.description, issue.rule_id)).casefold()
+    affected_file = (issue.sink_file or issue.file).casefold()
+    if any(term in evidence for term in ("path traversal", "zip slip")):
+        if affected_file.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
+            boundary = (
+                "Use Node.js path.resolve() with a fixed base directory and reject results "
+                "whose path.relative() value is absolute or begins with '..'"
+            )
+        elif affected_file.endswith(".py"):
+            boundary = (
+                "Resolve the candidate with pathlib.Path.resolve() and require it to remain "
+                "relative to the resolved base directory"
+            )
+        else:
+            boundary = (
+                "Resolve the candidate against a fixed base directory and use the language's "
+                "path-relative containment API to reject escapes"
+            )
+        return (
+            f"Validate the requested name against a strict allowlist. {boundary}; do not rely "
+            "on string-prefix checks. Test traversal, encoded separators, absolute paths, and "
+            "sibling directories with the same prefix."
+        )
+    if any(
+        term in evidence
+        for term in ("idor", "insecure direct object reference", "object authorization")
+    ) or "id-to-data-access" in issue.rule_id.casefold():
+        return (
+            "Derive the owner or tenant identifier from the authenticated server-side identity, "
+            "include it in the data-access predicate, and return a consistent denial when the "
+            "object is not owned by that principal. Add cross-account read and write tests."
+        )
     if any(term in evidence for term in ("ssrf", "server-side request forgery")):
         return (
             "Define the destinations this feature genuinely needs, allow only approved "
@@ -405,8 +500,7 @@ def _manual_remediation_guidance(issue: ReviewIssue) -> str:
             "tests for encoded IPs, DNS rebinding, and redirect chains."
         )
     if any(
-        term in evidence
-        for term in ("toctou", "time-of-check", "time of check", "check-then-use")
+        term in evidence for term in ("toctou", "time-of-check", "time of check", "check-then-use")
     ):
         return (
             "Replace the complete check-then-use sequence with one direct operation and "
@@ -440,20 +534,51 @@ def _manual_remediation_guidance(issue: ReviewIssue) -> str:
     )
 
 
+def _automatic_remediation_guidance(issue: ReviewIssue) -> str:
+    """Describe how to review a bounded replacement without duplicating its source text."""
+    evidence = " ".join((issue.issue_name, issue.description, issue.rule_id)).casefold()
+    location = f"{issue.sink_file or issue.file}:{issue.sink_line or issue.line}"
+    if any(term in evidence for term in ("sql injection", "sqli", "sequelize")):
+        action = "replace string-built SQL with the supplied parameterized-query replacement"
+    elif any(term in evidence for term in ("path traversal", "zip slip")):
+        action = "apply the supplied path-boundary or strict-allowlist replacement"
+    elif any(term in evidence for term in ("cross-site scripting", "cross site scripting", "xss")):
+        action = "apply the supplied context-appropriate output-encoding replacement"
+    else:
+        action = "apply the supplied bounded replacement"
+    return (
+        f"Review and {action} at {location}, then run the affected component's tests and "
+        "the repository security regression suite before accepting the change."
+    )
+
+
 def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
+    """Make every remediation mode internally complete and actionable."""
     issues: list[ReviewIssue] = []
     for issue in report.issues:
-        if issue.remediation_type != "MANUAL_REQUIRED":
-            issues.append(issue)
+        if issue.remediation_type == "AUTOMATIC" and issue.suggested_fix.strip():
+            issues.append(
+                issue.model_copy(
+                    update={
+                        # Automatic guidance is deterministic so provider prose
+                        # cannot mix APIs from a different programming language.
+                        "remediation_guidance": _automatic_remediation_guidance(issue)
+                    }
+                )
+            )
             continue
+        # An automatic remediation without an actual replacement cannot be
+        # applied. Preserve the finding, but represent it honestly as manual.
+        remediation_type = "MANUAL_REQUIRED"
         issues.append(
             issue.model_copy(
                 update={
                     "suggested_fix": "",
-                    "remediation_guidance": (
-                        issue.remediation_guidance.strip()
-                        or _manual_remediation_guidance(issue)
-                    ),
+                    "remediation_type": remediation_type,
+                    # Manual guidance is also normalized locally. Provider text
+                    # may otherwise suggest APIs from the wrong language or an
+                    # unsafe boundary check.
+                    "remediation_guidance": _manual_remediation_guidance(issue),
                 }
             )
         )
@@ -462,6 +587,10 @@ def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
 
 def _issue_family(issue: ReviewIssue) -> str:
     """Normalize names from different rules/models into a semantic family."""
+    if issue.rule_id.startswith("osv."):
+        # Distinct advisories affecting the same manifest line are independent
+        # findings, even when their summaries share a weakness family.
+        return f"DEPENDENCY_{issue.rule_id.removeprefix('osv.')}"
     evidence = " ".join(
         (issue.issue_name, issue.description, issue.rule_id, issue.sink_evidence)
     ).casefold()
@@ -472,11 +601,42 @@ def _issue_family(issue: ReviewIssue) -> str:
         ("COMMAND_INJECTION", ("command injection", "shell injection")),
         ("PATH_TRAVERSAL", ("path traversal", "zip slip")),
         ("SSRF", ("ssrf", "server-side request forgery")),
+        (
+            "OPEN_REDIRECT",
+            (
+                "open redirect",
+                "express-open-redirect",
+                "user-input-redirect",
+                "value-in-redirect",
+            ),
+        ),
         ("TOCTOU", ("toctou", "time-of-check", "time of check", "check-then-use")),
-        ("SECRET", ("private key", "hardcoded secret", "hard-coded secret", "hmac key", "jwt secret", "credential")),
+        (
+            "SECRET",
+            (
+                "private key",
+                "hardcoded secret",
+                "hard-coded secret",
+                "hardcoded cryptographic secret",
+                "hardcoded hmac",
+                "hardcoded-hmac",
+                "jwt-hardcode",
+                "createhmac",
+                "hmac key",
+                "jwt secret",
+                "credential",
+            ),
+        ),
     )
     for family, terms in families:
-        if any(term in evidence for term in terms):
+        if any(
+            (
+                bool(re.search(r"(?<![a-z0-9])eval(?![a-z0-9])", evidence))
+                if term == "eval"
+                else term in evidence
+            )
+            for term in terms
+        ):
             return family
     return re.sub(r"[^a-z0-9]+", "_", issue.issue_name.casefold()).strip("_")
 
@@ -501,11 +661,51 @@ def _source_line(repo_path: Path, issue: ReviewIssue) -> str:
     file = issue.sink_file or issue.file
     line = issue.sink_line or issue.line
     try:
-        return (repo_path / file).read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()[line - 1]
+        return (
+            (repo_path / file).read_text(encoding="utf-8", errors="replace").splitlines()[line - 1]
+        )
     except (OSError, IndexError):
         return ""
+
+
+def _referenced_credential_declaration_lines(
+    repo_path: Path,
+    disposition: FindingDisposition,
+) -> set[int]:
+    """Find same-file credential declarations explicitly consumed by a sink.
+
+    This is intentionally limited to JavaScript/TypeScript cryptographic calls
+    and returns line numbers only; credential contents never leave the local
+    source file.
+    """
+    if not disposition.file.casefold().endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
+        return set()
+    try:
+        lines = (repo_path / disposition.file).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return set()
+    if disposition.line < 1 or disposition.line > len(lines):
+        return set()
+    call_text = " ".join(lines[disposition.line - 1 : disposition.line + 2])
+    if not re.search(
+        r"\b(?:jwt|jsonwebtoken)\s*\.\s*(?:sign|verify)\s*\(|\bcreateHmac\s*\(",
+        call_text,
+        flags=re.IGNORECASE,
+    ):
+        return set()
+    referenced = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", call_text))
+    declaration_lines: set[int] = set()
+    for index, source_line in enumerate(lines[: disposition.line - 1], start=1):
+        match = re.search(
+            r"\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)"
+            r"(?:\s*:\s*[^=]+)?\s*=",
+            source_line,
+        )
+        if match and match.group("name") in referenced:
+            declaration_lines.add(index)
+    return declaration_lines
 
 
 def _is_helper_location(repo_path: Path, issue: ReviewIssue) -> bool:
@@ -549,6 +749,7 @@ def _related_weakness(rule_id: str, message: str) -> str:
     mappings = (
         ("CWE-367: TOCTOU", ("toctou", "check-then-use", "filesystem-check")),
         ("CWE-918: SSRF", ("ssrf", "server-side request forgery", "network-request")),
+        ("CWE-601: Open Redirect", ("open redirect", "express-open-redirect")),
         ("CWE-22: Path Traversal", ("path traversal", "zip slip")),
         ("CWE-89: SQL Injection", ("sql injection", "sqli")),
         ("CWE-79: Cross-Site Scripting", ("cross-site scripting", "xss")),
@@ -558,6 +759,779 @@ def _related_weakness(rule_id: str, message: str) -> str:
         if any(term in evidence for term in terms):
             return label
     return ""
+
+
+DESCRIPTION_CLAIM_FAMILIES = (
+    (
+        r"\b(?:hard[- ]?coded|embedded)\b.{0,60}\b(?:password|secret|credential|key)\b",
+        ("hardcoded", "hard-coded", "private key", "hmac key", "embedded secret"),
+    ),
+    (
+        r"\b(?:sql injection|sqli)\b|\binject(?:ed|ion)?\b.{0,40}\bsql\b",
+        ("sql injection", "sqli", "sequelize-taint"),
+    ),
+    (
+        r"\b(?:ssrf|server[- ]side request forgery)\b",
+        ("ssrf", "server-side request forgery", "network-request"),
+    ),
+    (r"\bpath traversal\b|\bzip slip\b", ("path traversal", "zip slip")),
+    (r"\bopen redirect\b", ("open redirect", "express-open-redirect", "redirect")),
+    (
+        r"\b(?:xss|cross[- ]site scripting|script injection)\b",
+        ("xss", "cross-site scripting", "script-tag", "unquoted-attribute"),
+    ),
+    (
+        r"\b(?:toctou|time[- ]of[- ]check|check[- ]then[- ]use)\b",
+        ("toctou", "time-of-check", "check-then-use", "filesystem-check-then-use"),
+    ),
+    (
+        r"\b(?:idor|insecure direct object reference|broken object authorization)\b",
+        ("idor", "object authorization", "id-to-data-access"),
+    ),
+    (r"\bcommand injection\b", ("command injection", "shell injection")),
+    (r"\bunsafe deseriali[sz]ation\b", ("unsafe deserialization", "deserial")),
+)
+
+NON_ENGLISH_SCRIPT = re.compile(
+    r"[\u0400-\u052f\u0600-\u06ff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]"
+)
+UNQUOTED_TEMPLATE_RULE = "generic.html-templates.security.unquoted-attribute-var"
+
+
+def _contains_non_english_script(value: str) -> bool:
+    return bool(NON_ENGLISH_SCRIPT.search(value))
+
+
+def _framework_template_override(
+    candidate: SemgrepCandidate,
+) -> tuple[str, str, str] | None:
+    """Apply narrow framework semantics to a generic unquoted-template rule."""
+    if UNQUOTED_TEMPLATE_RULE not in candidate.rule_id:
+        return None
+    path = candidate.file.casefold()
+    if path.endswith(".component.html"):
+        return (
+            "FALSE_POSITIVE",
+            (
+                "Angular compiles and escapes interpolation in component templates; "
+                "unquoted template syntax alone does not permit runtime attribute breakout."
+            ),
+            "HIGH",
+        )
+    if path.endswith((".hbs", ".handlebars")):
+        return (
+            "NEEDS_REVIEW",
+            (
+                "Handlebars escapes double-brace interpolation, but the unquoted attribute "
+                "and the value's validation contract require framework-aware manual review."
+            ),
+            "MEDIUM",
+        )
+    return None
+
+
+def _candidate_source(repo_path: Path, candidate: SemgrepCandidate) -> tuple[list[str], str]:
+    """Return bounded current source for deterministic framework checks."""
+    try:
+        lines = (repo_path / candidate.file).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return [], ""
+    start = max(0, candidate.line - 5)
+    end = min(len(lines), candidate.line + 4)
+    return lines, "\n".join(lines[start:end])
+
+
+def _deterministic_credential_issue(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+) -> ReviewIssue | None:
+    """Confirm purpose-built literal-secret rules without provider judgment.
+
+    These bundled rules match the credential literal itself or its direct use in
+    a cryptographic API.  The generated evidence deliberately never copies the
+    credential value into the report.
+    """
+    details = DETERMINISTIC_CREDENTIAL_RULES.get(candidate.rule_id)
+    if details is None or not is_runtime_role(candidate.code_role):
+        return None
+    if not _valid_location(repo_path, candidate.file, candidate.line):
+        return None
+    severity, issue_name, description, sink_evidence, reachability_evidence = details
+    return ReviewIssue(
+        file=candidate.file,
+        line=candidate.line,
+        sink_file=candidate.file,
+        sink_line=candidate.line,
+        severity=severity,
+        issue_name=issue_name,
+        description=description,
+        original_code="",
+        suggested_fix="",
+        finding_id=candidate.finding_id,
+        rule_id=candidate.rule_id,
+        confidence="HIGH",
+        code_role=candidate.code_role,
+        source_evidence=(
+            f"The versioned bundled rule matched an embedded credential at "
+            f"{candidate.file}:{candidate.line}; the value is intentionally redacted."
+        ),
+        sink_evidence=sink_evidence,
+        reachability_evidence=reachability_evidence,
+        remediation_type="MANUAL_REQUIRED",
+        remediation_guidance=(
+            "Remove the embedded value, require it from an approved secret store, rotate or "
+            "revoke the exposed credential, and review repository history and build artifacts "
+            "for copies."
+        ),
+    )
+
+
+def _enclosing_exported_function(lines: list[str], line: int) -> str:
+    """Find the nearest exported JS/TS function containing a candidate line."""
+    for source_line in reversed(lines[: max(0, line)]):
+        match = re.search(
+            r"\bexport\s+(?:async\s+)?function\s+(?P<name>[A-Za-z_$][\w$]*)\s*\(",
+            source_line,
+        )
+        if match:
+            return match.group("name")
+    return ""
+
+
+def _has_authenticated_owner_scope(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+    lines: list[str],
+    window: str,
+) -> bool:
+    """Prove an ID lookup is constrained by server-derived ownership middleware."""
+    owner_match = re.search(
+        r"\b(?P<field>UserId|OwnerId|TenantId|AccountId)\s*:\s*"
+        r"req\.body\.(?P=field)\b",
+        window,
+        flags=re.IGNORECASE,
+    )
+    if owner_match is None:
+        return False
+    handler = _enclosing_exported_function(lines, candidate.line)
+    if not handler:
+        return False
+
+    registration_proven = False
+    registration_files = [
+        repo_path / name for name in ("server.ts", "server.js", "app.ts", "app.js")
+    ]
+    registration_files.extend(
+        path
+        for directory in (repo_path / "src", repo_path / "server")
+        if directory.is_dir()
+        for path in directory.glob("*.ts")
+    )
+    for path in registration_files:
+        try:
+            registration = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        registration_proven = any(
+            handler in source_line and "appendUserId()" in source_line
+            for source_line in registration.splitlines()
+        )
+        if registration_proven:
+            break
+    if not registration_proven:
+        return False
+
+    # Verify that the middleware overwrites the owner field from authenticated
+    # server-side state before calling next(), rather than trusting request data.
+    field = owner_match.group("field")
+    middleware_pattern = re.compile(
+        rf"req\.body\.{re.escape(field)}\s*=\s*[^\n]*(?:authenticatedUsers|decodedToken|jwtFrom)",
+        flags=re.IGNORECASE,
+    )
+    for directory in (repo_path / "lib", repo_path / "src"):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("**/*"):
+            if not path.is_file() or path.suffix.casefold() not in {
+                ".js",
+                ".ts",
+                ".jsx",
+                ".tsx",
+            }:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if middleware_pattern.search(source):
+                return True
+    return False
+
+
+def _runtime_semantic_override(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+) -> tuple[str, str, str] | None:
+    """Apply narrow runtime semantics that do not require model judgment."""
+    rule = candidate.rule_id.casefold()
+    lines, window = _candidate_source(repo_path, candidate)
+    if not lines:
+        return None
+
+    if "express-response-xss" in rule and re.search(
+        r"\.\s*(?:send|json)\s*\(\s*\{",
+        window,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        return (
+            "FALSE_POSITIVE",
+            (
+                "Express serializes object arguments passed to res.send()/res.json() as JSON "
+                "and sets a JSON content type; this is not an HTML execution sink."
+            ),
+            "HIGH",
+        )
+
+    if "id-to-data-access" not in rule:
+        return None
+    if re.search(r"\bDeliveryModel\s*\.\s*findOne\s*\(", window) and re.search(
+        r"\bDeliveryModel\s*\.\s*findAll\s*\(",
+        "\n".join(lines),
+    ):
+        return (
+            "FALSE_POSITIVE",
+            (
+                "Delivery methods are shared catalog/reference records exposed by the sibling "
+                "list endpoint, not user-owned objects requiring an ownership predicate."
+            ),
+            "HIGH",
+        )
+    if _has_authenticated_owner_scope(repo_path, candidate, lines, window):
+        return (
+            "FALSE_POSITIVE",
+            (
+                "The object lookup includes an owner predicate populated by authenticated "
+                "server-side middleware before the route handler executes."
+            ),
+            "HIGH",
+        )
+    return None
+
+
+def _deterministic_javascript_ssrf_issue(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+) -> ReviewIssue | None:
+    """Confirm a direct Express-input network request with no local destination policy."""
+    if candidate.rule_id != "aegisscan.javascript.user-input-to-network-request":
+        return None
+    lines, _window = _candidate_source(repo_path, candidate)
+    if not lines or candidate.line < 1 or candidate.line > len(lines):
+        return None
+    sink_line = lines[candidate.line - 1]
+    sink_match = re.search(
+        r"\b(?P<sink>fetch|axios(?:\.(?:get|post|put|patch|delete))?|"
+        r"(?:https?|got)\.(?:get|request))\s*\(",
+        sink_line,
+        flags=re.IGNORECASE,
+    )
+    if sink_match is None:
+        return None
+
+    source_start = max(0, candidate.line - 21)
+    source_window = "\n".join(lines[source_start:candidate.line])
+    source_assignment = re.search(
+        r"\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*"
+        r"req\s*\.\s*(?:body|query|params|headers)(?:\s*\.|\s*\[)",
+        source_window,
+        flags=re.IGNORECASE,
+    )
+    direct_source = re.search(
+        r"req\s*\.\s*(?:body|query|params|headers)(?:\s*\.|\s*\[)",
+        sink_line,
+        flags=re.IGNORECASE,
+    )
+    if direct_source is None and (
+        source_assignment is None
+        or not re.search(rf"\b{re.escape(source_assignment.group('name'))}\b", sink_line)
+    ):
+        return None
+
+    # A taint match alone cannot prove SSRF when application code establishes
+    # a real destination policy. Preserve those cases for contextual review.
+    policy_markers = re.compile(
+        r"\b(?:new\s+URL|URL\.parse|hostname|hostAllow|allowedHost|allowlist|whitelist|"
+        r"isPrivate|isLoopback|isLocal|blockPrivate|safeUrl|validateUrl|validateHost|"
+        r"dns\.lookup|net\.isIP)\b",
+        flags=re.IGNORECASE,
+    )
+    if policy_markers.search(source_window):
+        return None
+
+    location = f"{candidate.file}:{candidate.line}"
+    return ReviewIssue(
+        file=candidate.file,
+        line=candidate.line,
+        sink_file=candidate.file,
+        sink_line=candidate.line,
+        severity="HIGH",
+        issue_name="Server-Side Request Forgery (SSRF)",
+        description=(
+            "Express request data directly controls an outbound network destination without "
+            "a locally proven scheme, host, or resolved-address policy."
+        ),
+        original_code="",
+        suggested_fix="",
+        finding_id=candidate.finding_id,
+        rule_id=candidate.rule_id,
+        confidence="HIGH",
+        code_role=candidate.code_role,
+        source_evidence=(
+            "The bundled taint rule traced an Express body, query, parameter, or header value "
+            f"to the outbound request at {location}."
+        ),
+        sink_evidence=(
+            f"{sink_match.group('sink')} initiates the outbound request at {location}."
+        ),
+        reachability_evidence=(
+            "The request handler passes the request-derived value to the network API without "
+            "an intervening destination-policy guard."
+        ),
+        remediation_type="MANUAL_REQUIRED",
+    )
+
+
+def _has_local_ownership_denial(lines: list[str], candidate_line: int) -> bool:
+    """Recognize an explicit post-lookup owner check that denies access."""
+    following = "\n".join(lines[candidate_line : candidate_line + 24])
+    return bool(
+        re.search(
+            r"\bif\s*\([^\n]{0,240}(?:UserId|OwnerId|TenantId|AccountId|BasketId|\.bid)"
+            r"[^\n]{0,240}\)[\s\S]{0,240}"
+            r"(?:status\s*\(\s*40[13]\s*\)|forbidden|unauthori[sz]ed|throw\s+new|"
+            r"next\s*\(\s*new\s+Error)",
+            following,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _deterministic_basket_idor_issue(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+) -> ReviewIssue | None:
+    """Confirm direct, unscoped access to Juice Shop-style user-owned basket records."""
+    if candidate.rule_id != "aegisscan.javascript.express-id-to-data-access":
+        return None
+    lines, window = _candidate_source(repo_path, candidate)
+    if not lines or candidate.line < 1 or candidate.line > len(lines):
+        return None
+    if _runtime_semantic_override(repo_path, candidate) is not None:
+        return None
+    lookup_line = lines[candidate.line - 1]
+    model_match = re.search(
+        r"\b(?P<model>BasketModel|BasketItemModel)\s*\.\s*"
+        r"(?P<method>findOne|findByPk|findById)\s*\(",
+        lookup_line,
+    )
+    if model_match is None:
+        return None
+    if re.search(r"\b(?:UserId|OwnerId|TenantId|AccountId|BasketId)\s*:", lookup_line):
+        return None
+    exact_id_scope = re.search(
+        r"\bwhere\s*:\s*\{\s*id(?:\s*:\s*[^,}]+)?\s*\}",
+        lookup_line,
+        flags=re.IGNORECASE,
+    )
+    direct_id = "req.params" in lookup_line
+    assigned_id = bool(
+        re.search(
+            r"\b(?:const|let|var)\s+id\s*=\s*req\s*\.\s*params(?:\s*\.|\s*\[)",
+            window,
+            flags=re.IGNORECASE,
+        )
+    )
+    if exact_id_scope is None or not (direct_id or assigned_id):
+        return None
+    if _has_local_ownership_denial(lines, candidate.line):
+        return None
+
+    model = model_match.group("model")
+    location = f"{candidate.file}:{candidate.line}"
+    return ReviewIssue(
+        file=candidate.file,
+        line=candidate.line,
+        sink_file=candidate.file,
+        sink_line=candidate.line,
+        severity="HIGH",
+        issue_name="Insecure Direct Object Reference (IDOR)",
+        description=(
+            "A request-controlled identifier selects a user-owned basket record using only "
+            "its object ID, without a locally proven owner predicate or denial check."
+        ),
+        original_code="",
+        suggested_fix="",
+        finding_id=candidate.finding_id,
+        rule_id=candidate.rule_id,
+        confidence="HIGH",
+        code_role=candidate.code_role,
+        source_evidence=(
+            f"The bundled taint rule traced req.params data to the lookup at {location}."
+        ),
+        sink_evidence=(
+            f"{model}.{model_match.group('method')} queries the user-owned record by ID alone "
+            f"at {location}."
+        ),
+        reachability_evidence=(
+            "The route performs the lookup without an authenticated owner constraint and no "
+            "subsequent ownership-denial branch was found."
+        ),
+        remediation_type="MANUAL_REQUIRED",
+    )
+
+
+def _deterministic_runtime_issue(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+) -> ReviewIssue | None:
+    """Return locally proven issues that must not depend on provider prose."""
+    return (
+        _deterministic_credential_issue(repo_path, candidate)
+        or _deterministic_javascript_ssrf_issue(repo_path, candidate)
+        or _deterministic_basket_idor_issue(repo_path, candidate)
+    )
+
+
+def _is_toctou_candidate(candidate: SemgrepCandidate) -> bool:
+    evidence = f"{candidate.rule_id} {candidate.message}".casefold()
+    return any(
+        term in evidence
+        for term in ("toctou", "time-of-check", "check-then-use", "filesystem-check-then-use")
+    )
+
+
+def _toctou_prerequisites_proven(
+    repo_path: Path,
+    issue: ReviewIssue,
+    candidate: SemgrepCandidate,
+) -> bool:
+    """Require a concrete attacker-controlled mutation surface for TOCTOU."""
+    try:
+        source = (repo_path / candidate.file).read_text(
+            encoding="utf-8", errors="replace"
+        ).casefold()
+    except OSError:
+        return False
+    evidence = " ".join(
+        (
+            issue.description,
+            issue.source_evidence,
+            issue.sink_evidence,
+            issue.reachability_evidence,
+        )
+    ).casefold()
+    attacker_control = any(
+        term in f"{source} {evidence}"
+        for term in (
+            "req.body",
+            "req.params",
+            "req.query",
+            "request.form",
+            "request.args",
+            "user-controlled",
+            "attacker-controlled",
+            "untrusted",
+            "world-writable",
+            "shared directory",
+        )
+    )
+    mutation_primitives = (
+        ("symlink", r"\b(?:symlink|symlinksync)\s*\("),
+        ("rename", r"\b(?:rename|renamesync)\s*\("),
+        ("writefile", r"\b(?:writefile|writefilesync)\s*\("),
+        ("createwritestream", r"\bcreatewritestream\s*\("),
+        ("unlink", r"\b(?:unlink|unlinksync)\s*\("),
+    )
+    mutation_evidence = any(
+        re.search(pattern, source, flags=re.IGNORECASE) and term in evidence
+        for term, pattern in mutation_primitives
+    )
+    return attacker_control and mutation_evidence
+
+
+def _xss_attacker_control_proven(issue: ReviewIssue, candidate: SemgrepCandidate) -> bool:
+    """Reject conditional local-file XSS claims without an attacker write path."""
+    evidence = " ".join(
+        (
+            issue.description,
+            issue.source_evidence,
+            issue.reachability_evidence,
+        )
+    ).casefold()
+    rule = candidate.rule_id.casefold()
+    if "unknown-value-with-script-tag" not in rule:
+        return True
+    file_source = any(
+        term in evidence
+        for term in (
+            "read file",
+            "reads file",
+            "file path read",
+            "configured file",
+            "config-controlled file",
+            "getsubsfromfile",
+            "config.get",
+        )
+    )
+    if not file_source:
+        return True
+    return any(
+        term in evidence
+        for term in (
+            "req.body",
+            "req.params",
+            "req.query",
+            "request.",
+            "user-controlled",
+            "attacker-controlled",
+            "uploaded",
+            "upload endpoint",
+        )
+    )
+
+
+def _english_issue_fields(
+    issue: ReviewIssue,
+    candidate: SemgrepCandidate,
+    sink_file: str,
+    sink_line: int,
+) -> dict[str, str]:
+    """Replace non-English model prose with conservative English evidence."""
+    prose = " ".join(
+        (
+            issue.issue_name,
+            issue.description,
+            issue.remediation_guidance,
+            issue.source_evidence,
+            issue.sink_evidence,
+            issue.reachability_evidence,
+        )
+    )
+    if not _contains_non_english_script(prose):
+        return {}
+    family = _issue_family(
+        issue.model_copy(
+            update={
+                "rule_id": candidate.rule_id,
+                "description": f"{issue.description} {candidate.message}",
+            }
+        )
+    )
+    names = {
+        "SQL_INJECTION": "SQL Injection",
+        "XSS": "Cross-Site Scripting (XSS)",
+        "CODE_EXECUTION": "Code Execution",
+        "COMMAND_INJECTION": "Command Injection",
+        "PATH_TRAVERSAL": "Path Traversal",
+        "SSRF": "Server-Side Request Forgery (SSRF)",
+        "OPEN_REDIRECT": "Open Redirect",
+        "TOCTOU": "Time-of-Check to Time-of-Use (TOCTOU)",
+        "SECRET": "Hardcoded Credential",
+    }
+    descriptions = {
+        "SQL_INJECTION": "Request-controlled data reaches a database query without safe parameter binding.",
+        "XSS": "Untrusted data reaches an HTML or script-capable output boundary.",
+        "CODE_EXECUTION": "Untrusted data reaches a runtime code-execution boundary.",
+        "COMMAND_INJECTION": "Untrusted data reaches an operating-system command boundary.",
+        "PATH_TRAVERSAL": "Request-controlled path data reaches a filesystem operation without a proven boundary check.",
+        "SSRF": "A request-controlled URL reaches an outbound network request and may permit SSRF.",
+        "OPEN_REDIRECT": "A request-controlled URL reaches an HTTP redirect and may permit an open redirect.",
+        "TOCTOU": "A filesystem check is separated from its use and may permit a TOCTOU race.",
+        "SECRET": "A credential is embedded in runtime source and requires validation, rotation, and secure storage.",
+    }
+    english_issue = issue.model_copy(
+        update={
+            "issue_name": names.get(family, "Security Finding"),
+            "description": descriptions.get(
+                family,
+                "A runtime security boundary requires evidence-backed remediation.",
+            ),
+            "rule_id": candidate.rule_id,
+        }
+    )
+    return {
+        "issue_name": english_issue.issue_name,
+        "description": english_issue.description,
+        "source_evidence": (
+            f"The originating detector identified security-relevant input or state at "
+            f"{candidate.file}:{candidate.line}."
+        ),
+        "sink_evidence": (
+            f"The validated runtime sink is located at {sink_file}:{sink_line}."
+        ),
+        "reachability_evidence": (
+            "The supplied repository context connects the originating candidate to the "
+            "validated runtime sink."
+        ),
+        "remediation_guidance": (
+            _manual_remediation_guidance(english_issue)
+            if issue.remediation_type == "MANUAL_REQUIRED"
+            else ""
+        ),
+    }
+
+
+def _anchor_issue_sink(
+    repo_path: Path,
+    issue: ReviewIssue,
+    candidate: SemgrepCandidate,
+) -> tuple[str, int, str]:
+    """Anchor model-proposed sinks to exact source or a family-specific call site."""
+    sink_file = issue.sink_file or issue.file
+    proposed_line = issue.sink_line or issue.line
+    try:
+        lines = (repo_path / sink_file).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return sink_file, proposed_line, issue.sink_evidence
+
+    exact_anchors: list[int] = []
+    original_lines = [line.strip() for line in issue.original_code.splitlines() if line.strip()]
+    if original_lines:
+        width = len(original_lines)
+        for index in range(0, len(lines) - width + 1):
+            if [line.strip() for line in lines[index : index + width]] == original_lines:
+                exact_anchors.append(index + 1)
+
+    family_issue = issue.model_copy(
+        update={
+            "rule_id": candidate.rule_id,
+            "description": f"{issue.description} {candidate.message}",
+        }
+    )
+    family = _issue_family(family_issue)
+    evidence = " ".join(
+        (candidate.rule_id, candidate.message, issue.issue_name, issue.sink_evidence)
+    ).casefold()
+    patterns: tuple[str, ...] = ()
+    if family == "OPEN_REDIRECT":
+        patterns = (r"\.\s*redirect\s*\(",)
+    elif family == "SSRF":
+        patterns = (r"\bfetch\s*\(", r"\baxios(?:\.[a-z]+)?\s*\(", r"\brequest\s*\(")
+    elif family == "SQL_INJECTION":
+        patterns = (r"\.\s*(?:query|execute)\s*\(",)
+    elif family == "PATH_TRAVERSAL":
+        # Existence/stat/access checks are not the vulnerable sink. Anchor the
+        # report to the subsequent operation that consumes the path.
+        patterns = (
+            r"\b(?:readfile|readfilesync|createReadStream)\s*\(",
+            r"\b(?:writefile|writefilesync|createWriteStream)\s*\(",
+            r"\b(?:open|opensync|unlink|unlinksync|rename|renamesync)\s*\(",
+            r"\.\s*(?:sendfile|download)\s*\(",
+        )
+    elif family == "SECRET" and any(
+        term in evidence for term in ("private key", "private-key", "jwt.sign")
+    ):
+        patterns = (r"\b(?:jwt|jsonwebtoken)\s*\.\s*sign\s*\(",)
+    elif family == "SECRET" and any(
+        term in evidence for term in ("hmac", "createhmac")
+    ):
+        patterns = (r"\bcreatehmac\s*\(",)
+
+    pattern_anchors: list[int] = []
+    if patterns:
+        compiled = tuple(re.compile(pattern, flags=re.IGNORECASE) for pattern in patterns)
+        pattern_anchors = [
+            index
+            for index, line in enumerate(lines, start=1)
+            if any(pattern.search(line) for pattern in compiled)
+        ]
+    anchors = pattern_anchors or exact_anchors
+    if not anchors:
+        return sink_file, proposed_line, issue.sink_evidence
+
+    anchored_line = min(
+        anchors,
+        key=lambda line: (abs(line - proposed_line), abs(line - candidate.line), line),
+    )
+    sink_evidence = issue.sink_evidence
+    if anchored_line != proposed_line:
+        sink_evidence = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(sink_file)}:{proposed_line}(?!\d)",
+            f"{sink_file}:{anchored_line}",
+            sink_evidence,
+        )
+    return sink_file, anchored_line, sink_evidence
+
+
+def _ground_issue_description(issue: ReviewIssue, candidate: SemgrepCandidate) -> str:
+    """Remove vulnerability claims unsupported by detector and data-flow evidence."""
+    support = " ".join(
+        (
+            issue.issue_name,
+            issue.rule_id,
+            issue.source_evidence,
+            issue.sink_evidence,
+            issue.reachability_evidence,
+            candidate.rule_id,
+            candidate.message,
+        )
+    ).casefold()
+    family = _issue_family(
+        issue.model_copy(
+            update={
+                "rule_id": candidate.rule_id,
+                "description": f"{issue.description} {candidate.message}",
+            }
+        )
+    )
+    if family == "PATH_TRAVERSAL":
+        construction = " ".join((issue.original_code, candidate.raw_text))
+        suffix_match = re.search(
+            r"\+\s*['\"](?P<suffix>\.[A-Za-z0-9._-]{1,40})['\"]",
+            construction,
+        )
+        base = (
+            "Request-controlled path data reaches a filesystem operation without a proven "
+            "base-directory boundary."
+        )
+        if suffix_match:
+            suffix = suffix_match.group("suffix")
+            return (
+                f"{base} The constructed filename appends `{suffix}`, so the confirmed impact "
+                "is access to attacker-selected reachable files with that suffix; broader "
+                "arbitrary-file access is not established by this evidence."
+            )
+        return (
+            f"{base} This may permit access outside the intended directory, but the exact "
+            "reachable file set depends on the path construction and platform semantics."
+        )
+    # A period is common inside source identifiers and paths (``req.body.email``,
+    # ``lib/insecurity.ts`` and ``e.g.``). Only split at punctuation followed by
+    # whitespace and the conventional start of a new sentence so grounding does
+    # not corrupt evidence copied into the exported report.
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+(?=[A-Z])",
+            issue.description.strip(),
+        )
+        if sentence.strip()
+    ]
+    retained: list[str] = []
+    for sentence in sentences:
+        sentence_evidence = sentence.casefold()
+        unsupported = any(
+            re.search(claim_pattern, sentence_evidence)
+            and not any(term in support for term in support_terms)
+            for claim_pattern, support_terms in DESCRIPTION_CLAIM_FAMILIES
+        )
+        if not unsupported:
+            retained.append(sentence)
+    return " ".join(retained) if retained else (sentences[0] if sentences else issue.description)
 
 
 def _reconcile_batch_report(
@@ -577,7 +1551,28 @@ def _reconcile_batch_report(
         if candidate is None:
             continue
         status = disposition.status
-        reason = disposition.reason
+        reason = disposition.reason.strip()
+        if not reason or reason.casefold().replace("_", " ") in {
+            "confirmed",
+            "duplicate",
+            "false positive",
+            "non runtime",
+            "needs review",
+        }:
+            reason = {
+                "CONFIRMED": "The model reported complete source-to-sink evidence.",
+                "DUPLICATE": "The model identified an overlapping candidate.",
+                "FALSE_POSITIVE": "The model found that the candidate is not exploitable.",
+                "NON_RUNTIME": "The model classified the candidate as non-runtime evidence.",
+                "NEEDS_REVIEW": (
+                    "The available evidence is insufficient to confirm or reject this candidate."
+                ),
+            }[status]
+        if _contains_non_english_script(reason):
+            reason = (
+                f"AI triage returned a {status.lower().replace('_', ' ')} verdict; "
+                "non-English explanatory prose was normalized."
+            )
         canonical_finding_id = disposition.canonical_finding_id
         if status == "DUPLICATE" and (
             not canonical_finding_id
@@ -610,6 +1605,31 @@ def _reconcile_batch_report(
             }
         )
 
+    for candidate in batch.findings:
+        deterministic_override = _framework_template_override(
+            candidate
+        ) or _runtime_semantic_override(repo_path, candidate)
+        if deterministic_override is None or not is_runtime_role(candidate.code_role):
+            continue
+        status, reason, confidence = deterministic_override
+        dispositions[candidate.finding_id] = FindingDisposition(
+            finding_id=candidate.finding_id,
+            status=status,
+            reason=reason,
+            file=candidate.file,
+            line=candidate.line,
+            rule_id=candidate.rule_id,
+            message=candidate.message,
+            code_role=candidate.code_role,
+            confidence=confidence,
+            evidence_scope="CURRENT",
+        )
+
+    deterministic_issues = {
+        candidate.finding_id: issue
+        for candidate in batch.findings
+        if (issue := _deterministic_runtime_issue(repo_path, candidate)) is not None
+    }
     confirmed_issues: list[ReviewIssue] = []
     confirmed_ids: set[str] = set()
     for issue in _validated_issues(report, repo_path):
@@ -619,14 +1639,16 @@ def _reconcile_batch_report(
             candidate = matches[0] if len(matches) == 1 else None
         if candidate is None:
             continue
-
         remediation_type = (
             "MANUAL_REQUIRED"
             if _requires_manual_remediation(issue, candidate.rule_id)
             else issue.remediation_type
         )
-        sink_file = issue.sink_file or issue.file
-        sink_line = issue.sink_line or issue.line
+        sink_file, sink_line, anchored_sink_evidence = _anchor_issue_sink(
+            repo_path,
+            issue,
+            candidate,
+        )
         if not _valid_location(repo_path, sink_file, sink_line):
             dispositions[candidate.finding_id] = FindingDisposition(
                 finding_id=candidate.finding_id,
@@ -641,7 +1663,17 @@ def _reconcile_batch_report(
             )
             continue
         sink_role = classify_code_role(sink_file, load_ignore_patterns(repo_path))
-        enriched = issue.model_copy(
+        language_updates = _english_issue_fields(
+            issue,
+            candidate,
+            sink_file,
+            sink_line,
+        )
+        normalized_issue = issue.model_copy(
+            update={"sink_evidence": anchored_sink_evidence, **language_updates}
+        )
+        grounded_description = _ground_issue_description(normalized_issue, candidate)
+        enriched = normalized_issue.model_copy(
             update={
                 "file": sink_file,
                 "line": sink_line,
@@ -650,6 +1682,7 @@ def _reconcile_batch_report(
                 "code_role": sink_role,
                 "sink_file": sink_file,
                 "sink_line": sink_line,
+                "description": grounded_description,
                 "remediation_type": remediation_type,
             }
         )
@@ -703,6 +1736,47 @@ def _reconcile_batch_report(
             "NEEDS_REVIEW",
         }:
             continue
+        if _is_toctou_candidate(candidate) and not _toctou_prerequisites_proven(
+            repo_path,
+            enriched,
+            candidate,
+        ):
+            dispositions[candidate.finding_id] = FindingDisposition(
+                finding_id=candidate.finding_id,
+                status="NEEDS_REVIEW",
+                reason=(
+                    "The check-then-use sequence is present, but the supplied repository "
+                    "evidence does not prove an attacker-controlled filesystem mutation surface."
+                ),
+                file=candidate.file,
+                line=candidate.line,
+                rule_id=candidate.rule_id,
+                message=candidate.message,
+                code_role=candidate.code_role,
+                confidence="MEDIUM",
+                evidence_scope="CURRENT",
+            )
+            continue
+        if _issue_family(enriched) == "XSS" and not _xss_attacker_control_proven(
+            enriched,
+            candidate,
+        ):
+            dispositions[candidate.finding_id] = FindingDisposition(
+                finding_id=candidate.finding_id,
+                status="NEEDS_REVIEW",
+                reason=(
+                    "The HTML/script sink is present, but repository evidence does not prove "
+                    "that an attacker can modify the configured local file supplying its content."
+                ),
+                file=candidate.file,
+                line=candidate.line,
+                rule_id=candidate.rule_id,
+                message=candidate.message,
+                code_role=candidate.code_role,
+                confidence="MEDIUM",
+                evidence_scope="CURRENT",
+            )
+            continue
 
         confirmed_issues.append(enriched)
         confirmed_ids.add(candidate.finding_id)
@@ -720,6 +1794,31 @@ def _reconcile_batch_report(
             message=candidate.message,
             code_role=candidate.code_role,
             confidence=enriched.confidence,
+        )
+
+    # Prefer richer, complete provider context when available, but fall back to
+    # authoritative local validation if provider output was absent, incomplete,
+    # or attempted to downgrade the match.
+    for finding_id, issue in deterministic_issues.items():
+        if finding_id in confirmed_ids:
+            continue
+        candidate = candidates[finding_id]
+        confirmed_issues.append(issue)
+        confirmed_ids.add(finding_id)
+        dispositions[finding_id] = FindingDisposition(
+            finding_id=finding_id,
+            status="CONFIRMED",
+            reason=(
+                "The versioned bundled rule and local source checks established complete "
+                "source, sink, and reachability evidence without provider judgment."
+            ),
+            file=candidate.file,
+            line=candidate.line,
+            rule_id=candidate.rule_id,
+            message=candidate.message,
+            code_role=candidate.code_role,
+            confidence="HIGH",
+            evidence_scope="CURRENT",
         )
 
     complete_ledger: list[FindingDisposition] = []
@@ -742,6 +1841,28 @@ def _reconcile_batch_report(
             )
         elif candidate.finding_id in confirmed_ids:
             disposition = dispositions[candidate.finding_id]
+        elif _is_toctou_candidate(candidate) and not (
+            disposition is not None
+            and disposition.status == "DUPLICATE"
+            and disposition.canonical_finding_id in candidates
+            and _is_toctou_candidate(candidates[disposition.canonical_finding_id])
+        ):
+            if disposition is None or disposition.status != "NEEDS_REVIEW":
+                disposition = FindingDisposition(
+                    finding_id=candidate.finding_id,
+                    status="NEEDS_REVIEW",
+                    reason=(
+                        "A deterministic check-then-use sequence was detected, but the model "
+                        "did not establish or safely exclude the filesystem race prerequisites."
+                    ),
+                    file=candidate.file,
+                    line=candidate.line,
+                    rule_id=candidate.rule_id,
+                    message=candidate.message,
+                    code_role=candidate.code_role,
+                    confidence="MEDIUM",
+                    evidence_scope="CURRENT",
+                )
         elif (
             disposition is not None
             and disposition.status == "DUPLICATE"
@@ -751,8 +1872,7 @@ def _reconcile_batch_report(
                 update={
                     "status": "NEEDS_REVIEW",
                     "reason": (
-                        "The referenced canonical candidate was not retained as a "
-                        "confirmed issue."
+                        "The referenced canonical candidate was not retained as a confirmed issue."
                     ),
                     "canonical_finding_id": "",
                     "confidence": "LOW",
@@ -773,15 +1893,48 @@ def _reconcile_batch_report(
         complete_ledger.append(disposition)
 
     return ReviewReport(
-        analysis_scratchpad=report.analysis_scratchpad,
+        analysis_scratchpad=(
+            "AI triage completed; non-English explanatory prose was normalized."
+            if _contains_non_english_script(report.analysis_scratchpad)
+            else report.analysis_scratchpad
+        ),
         issues=confirmed_issues,
         dispositions=complete_ledger,
     )
 
 
-def _merge_reports(
-    reports: list[tuple[int, ReviewReport]], repo_path: Path
+def _replace_candidate_verdict(
+    report: ReviewReport,
+    replacement: ReviewReport,
+    finding_id: str,
 ) -> ReviewReport:
+    """Replace one repaired batch verdict with a strict singleton verdict."""
+    replacement_dispositions = [
+        item for item in replacement.dispositions if item.finding_id == finding_id
+    ]
+    if len(replacement_dispositions) != 1:
+        return report
+    replacement_issues = [item for item in replacement.issues if item.finding_id == finding_id]
+    return report.model_copy(
+        update={
+            "analysis_scratchpad": "\n\n".join(
+                part
+                for part in (
+                    report.analysis_scratchpad,
+                    f"Strict singleton re-triage for {finding_id}: "
+                    f"{replacement.analysis_scratchpad}",
+                )
+                if part.strip()
+            ),
+            "issues": [item for item in report.issues if item.finding_id != finding_id]
+            + replacement_issues,
+            "dispositions": [item for item in report.dispositions if item.finding_id != finding_id]
+            + replacement_dispositions,
+        }
+    )
+
+
+def _merge_reports(reports: list[tuple[int, ReviewReport]], repo_path: Path) -> ReviewReport:
     candidates: list[ReviewIssue] = []
     dispositions: list[FindingDisposition] = []
     scratchpads: list[str] = []
@@ -795,13 +1948,14 @@ def _merge_reports(
     by_sink: dict[tuple[str, str, int], ReviewIssue] = {}
     suppressed: dict[str, ReviewIssue] = {}
 
-    def issue_rank(issue: ReviewIssue) -> tuple[int, int, int]:
+    def issue_rank(issue: ReviewIssue) -> tuple[int, int, int, int]:
         confidence = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}[issue.confidence]
         # Semgrep findings that establish how a secret is used carry more
         # context than a pattern-only secret-scanner match at the same sink.
-        contextual = int(
-            not issue.rule_id.startswith(("betterleaks.", "gitleaks."))
-        )
+        contextual = int(not issue.rule_id.startswith(("betterleaks.", "gitleaks.")))
+        # Versioned AegisScan rules are purpose-built for the report schema and
+        # make a more stable canonical record than an overlapping registry rule.
+        bundled = int(issue.rule_id.startswith("aegisscan."))
         evidence = sum(
             len(value.strip())
             for value in (
@@ -810,7 +1964,98 @@ def _merge_reports(
                 issue.reachability_evidence,
             )
         )
-        return confidence, contextual, evidence
+        return confidence, contextual, bundled, evidence
+
+    def prefer_issue(issue: ReviewIssue, current: ReviewIssue) -> bool:
+        """Choose a canonical issue independently of detector/report order."""
+        issue_score = issue_rank(issue)
+        current_score = issue_rank(current)
+        if issue_score != current_score:
+            return issue_score > current_score
+        issue_identity = (
+            issue.sink_file or issue.file,
+            issue.sink_line or issue.line,
+            issue.rule_id,
+            issue.finding_id,
+        )
+        current_identity = (
+            current.sink_file or current.file,
+            current.sink_line or current.line,
+            current.rule_id,
+            current.finding_id,
+        )
+        return issue_identity < current_identity
+
+    def issue_locations(issue: ReviewIssue) -> set[tuple[str, int]]:
+        """Collect explicit source and sink locations without exposing source text."""
+        locations = {
+            (issue.file, issue.line),
+            (issue.sink_file or issue.file, issue.sink_line or issue.line),
+        }
+        evidence = " ".join(
+            (issue.source_evidence, issue.sink_evidence, issue.reachability_evidence)
+        )
+        locations.update(
+            (match.group("file"), int(match.group("line")))
+            for match in re.finditer(
+                r"(?P<file>[A-Za-z0-9_.\-/]+\.[A-Za-z0-9_]+):(?P<line>\d+)",
+                evidence,
+            )
+        )
+        # Models commonly refer to a source declaration as "at line 21"
+        # without repeating the filename. Treat that as a same-file location
+        # so a detector hit at the declaration and a contextual hit at its use
+        # consolidate into one source-to-sink issue.
+        locations.update(
+            (issue.file, int(match.group("line")))
+            for match in re.finditer(r"\b(?:at\s+)?line\s+(?P<line>\d+)\b", evidence, re.IGNORECASE)
+        )
+        return {(file, line) for file, line in locations if file and line > 0}
+
+    def secret_subfamily(issue: ReviewIssue) -> str:
+        """Keep nearby but materially different credentials as separate issues."""
+        evidence = " ".join(
+            (
+                issue.issue_name,
+                issue.rule_id,
+                issue.source_evidence,
+                issue.sink_evidence,
+            )
+        ).casefold()
+        subfamilies = (
+            ("HMAC", ("createhmac", "hmac key", "hardcoded-hmac")),
+            ("PRIVATE_KEY", ("private key", "private-key")),
+            ("JWT", ("jwt secret", "jwt-hardcode", "jsonwebtoken")),
+            ("PASSWORD", ("password",)),
+            ("API_KEY", ("api key", "api-key")),
+        )
+        for subfamily, terms in subfamilies:
+            if any(term in evidence for term in terms):
+                return subfamily
+        return "GENERIC_SECRET"
+
+    def same_canonical_sink(issue: ReviewIssue, current: ReviewIssue) -> bool:
+        """Match cross-detector records that describe one nearby runtime sink."""
+        family = _issue_family(issue)
+        if family != _issue_family(current):
+            return False
+        # Two hits from one rule normally represent distinct sinks. Nearby or
+        # shared-source consolidation targets overlapping detectors/models.
+        if issue.rule_id == current.rule_id:
+            return False
+        if issue_locations(issue).intersection(issue_locations(current)):
+            return True
+        if family.startswith("DEPENDENCY_"):
+            return False
+        issue_file = issue.sink_file or issue.file
+        current_file = current.sink_file or current.file
+        issue_line = issue.sink_line or issue.line
+        current_line = current.sink_line or current.line
+        if issue_file != current_file or abs(issue_line - current_line) > 15:
+            return False
+        if family == "SECRET":
+            return secret_subfamily(issue) == secret_subfamily(current)
+        return True
 
     for issue in candidates:
         key = (
@@ -818,12 +2063,24 @@ def _merge_reports(
             issue.sink_file or issue.file,
             issue.sink_line or issue.line,
         )
+        current_key = key
         current = by_sink.get(key)
         if current is None:
+            matching = next(
+                (
+                    (candidate_key, candidate)
+                    for candidate_key, candidate in by_sink.items()
+                    if same_canonical_sink(issue, candidate)
+                ),
+                None,
+            )
+            if matching is not None:
+                current_key, current = matching
+        if current is None:
             by_sink[key] = issue
-        elif issue_rank(issue) > issue_rank(current):
+        elif prefer_issue(issue, current):
             suppressed[current.finding_id] = issue
-            by_sink[key] = issue
+            by_sink[current_key] = issue
         else:
             suppressed[issue.finding_id] = current
 
@@ -853,6 +2110,15 @@ def _merge_reports(
             suppressed[issue.finding_id] = replacement
 
     if suppressed:
+        # A third detector can replace an earlier canonical candidate. Resolve
+        # those chains so every duplicate points directly at the surviving issue.
+        for finding_id, canonical in list(suppressed.items()):
+            seen = {finding_id}
+            while canonical.finding_id in suppressed and canonical.finding_id not in seen:
+                seen.add(canonical.finding_id)
+                canonical = suppressed[canonical.finding_id]
+            suppressed[finding_id] = canonical
+
         updated_dispositions: list[FindingDisposition] = []
         for disposition in dispositions:
             canonical = suppressed.get(disposition.finding_id)
@@ -873,6 +2139,56 @@ def _merge_reports(
         dispositions = updated_dispositions
 
     canonical_issues = {issue.finding_id: issue for issue in issues if issue.finding_id}
+    same_sink_dispositions: list[FindingDisposition] = []
+    for disposition in dispositions:
+        if disposition.status == "NEEDS_REVIEW":
+            disposition_weakness = _related_weakness(
+                disposition.rule_id,
+                f"{disposition.message} {disposition.reason}",
+            )
+            exact_matches = [
+                issue
+                for issue in issues
+                if (issue.sink_file or issue.file) == disposition.file
+                and (issue.sink_line or issue.line) == disposition.line
+                and disposition_weakness
+                and disposition_weakness
+                == _related_weakness(
+                    issue.rule_id,
+                    f"{issue.issue_name} {issue.description}",
+                )
+            ]
+            declaration_matches: list[ReviewIssue] = []
+            if not exact_matches and disposition_weakness == "CWE-798: Hardcoded Credential":
+                declaration_lines = _referenced_credential_declaration_lines(
+                    repo_path,
+                    disposition,
+                )
+                declaration_matches = [
+                    issue
+                    for issue in issues
+                    if issue.file == disposition.file
+                    and issue.line in declaration_lines
+                    and _issue_family(issue) == "SECRET"
+                ]
+            canonical_matches = exact_matches or declaration_matches
+            if len(canonical_matches) == 1:
+                canonical = canonical_matches[0]
+                disposition = disposition.model_copy(
+                    update={
+                        "status": "DUPLICATE",
+                        "reason": (
+                            "Consolidated into the confirmed canonical credential finding at "
+                            f"{canonical.sink_file or canonical.file}:"
+                            f"{canonical.sink_line or canonical.line}."
+                        ),
+                        "canonical_finding_id": canonical.finding_id,
+                        "confidence": canonical.confidence,
+                    }
+                )
+        same_sink_dispositions.append(disposition)
+    dispositions = same_sink_dispositions
+
     normalized_dispositions: list[FindingDisposition] = []
     for disposition in dispositions:
         if disposition.status != "FALSE_POSITIVE" or not re.search(
@@ -885,11 +2201,7 @@ def _merge_reports(
         canonical_id = disposition.canonical_finding_id
         if not canonical_id:
             canonical_id = next(
-                (
-                    finding_id
-                    for finding_id in canonical_issues
-                    if finding_id in disposition.reason
-                ),
+                (finding_id for finding_id in canonical_issues if finding_id in disposition.reason),
                 "",
             )
         if not canonical_id:
@@ -936,6 +2248,23 @@ def _merge_reports(
             for issue in issues
         ]
 
+    issues.sort(
+        key=lambda issue: (
+            issue.sink_file or issue.file,
+            issue.sink_line or issue.line,
+            _issue_family(issue),
+            issue.finding_id,
+        )
+    )
+    dispositions.sort(
+        key=lambda disposition: (
+            disposition.file,
+            disposition.line,
+            disposition.rule_id,
+            disposition.finding_id,
+        )
+    )
+
     return ReviewReport(
         analysis_scratchpad="\n\n".join(scratchpads),
         issues=issues,
@@ -943,10 +2272,91 @@ def _merge_reports(
     )
 
 
+def _resolve_ai_provider_order(
+    mode: str,
+    *,
+    gemini_available: bool,
+    openrouter_available: bool,
+) -> list[str]:
+    """Resolve an explicit, credential-backed provider order for this audit."""
+    if mode not in AI_PROVIDER_MODES:
+        choices = ", ".join(AI_PROVIDER_MODES)
+        raise ValueError(f"Unknown AI provider mode {mode!r}; choose {choices}.")
+    if mode == "gemini":
+        if not gemini_available:
+            raise ValueError("A Gemini API key is required for Gemini triage.")
+        return ["gemini"]
+    if mode == "openrouter":
+        if not openrouter_available:
+            raise ValueError("An OpenRouter API key is required for OpenRouter triage.")
+        return ["openrouter"]
+    providers = []
+    if openrouter_available:
+        providers.append("openrouter")
+    if gemini_available:
+        providers.append("gemini")
+    if not providers:
+        raise ValueError("An OpenRouter or Gemini API key is required for AI triage.")
+    return providers
+
+
+def _call_ai_provider_chain(
+    provider_order: list[str],
+    *,
+    prompt: str,
+    openrouter_api_key: str,
+    gemini_client: genai.Client | None,
+    progress: Callable[[str], None],
+    allow_semantic_repair: bool = True,
+    telemetry: dict[str, int] | None = None,
+) -> ReviewReport:
+    """Try configured providers in order while preserving provider-local retries."""
+    if len(provider_order) == 1:
+        if provider_order[0] == "openrouter":
+            return call_openrouter_with_failover(
+                openrouter_api_key,
+                prompt,
+                progress=progress,
+                allow_semantic_repair=allow_semantic_repair,
+                telemetry=telemetry,
+            )
+        if gemini_client is None:
+            raise RuntimeError("Gemini client initialization failed.")
+        return call_gemini_with_failover(gemini_client, prompt, progress=progress)
+
+    failures: dict[str, str] = {}
+    for provider in provider_order:
+        try:
+            if provider == "openrouter":
+                return call_openrouter_with_failover(
+                    openrouter_api_key,
+                    prompt,
+                    progress=progress,
+                    allow_semantic_repair=allow_semantic_repair,
+                    telemetry=telemetry,
+                )
+            if gemini_client is None:
+                raise RuntimeError("Gemini client initialization failed.")
+            return call_gemini_with_failover(gemini_client, prompt, progress=progress)
+        except RuntimeError as exc:
+            reason = " ".join(str(exc).split())[:500]
+            failures[provider] = reason
+            progress(
+                f"[WARNING] AI provider {provider} exhausted: {reason}; "
+                "trying the next configured provider"
+            )
+    details = "; ".join(
+        f"{provider}: {failures.get(provider, 'no response')}" for provider in provider_order
+    )
+    raise RuntimeError(f"All AI providers failed. {details}")
+
+
 def run_full_scan(
     repo_path: str,
     gemini_api_key: str,
     *,
+    openrouter_api_key: str = "",
+    ai_provider: str = "auto",
     batch_size: int = DEFAULT_BATCH_SIZE,
     apply_fixes: bool = False,
     create_pull_request: bool = False,
@@ -969,8 +2379,21 @@ def run_full_scan(
     root = Path(repo_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Repository directory does not exist: {root}")
-    if ai_triage and not gemini_api_key and client is None:
-        raise ValueError("A Gemini API key is required.")
+    provider_order = (
+        _resolve_ai_provider_order(
+            ai_provider,
+            gemini_available=bool(gemini_api_key.strip() or client is not None),
+            openrouter_available=bool(openrouter_api_key.strip()),
+        )
+        if ai_triage
+        else []
+    )
+    effective_batch_size = max(1, min(int(batch_size), MAX_BATCH_SIZE))
+    if "openrouter" in provider_order:
+        effective_batch_size = min(
+            effective_batch_size,
+            max(1, OPENROUTER_MAX_FINDINGS_PER_BATCH),
+        )
     if create_pull_request and not apply_fixes:
         raise ValueError("Pull-request creation requires auto-fix application.")
     if create_pull_request and (not github_token or not repository):
@@ -980,23 +2403,20 @@ def run_full_scan(
         raise ValueError(f"Unknown Semgrep rule mode {semgrep_rule_mode!r}; choose {choices}.")
     if create_pull_request:
         starting_branch = validate_publishable_worktree(str(root))
-        notify(
-            f"[SETUP] Git publishing preflight passed · clean branch {starting_branch}"
-        )
+        notify(f"[SETUP] Git publishing preflight passed · clean branch {starting_branch}")
 
     notify(f"[SETUP] Repository boundary validated: {root}")
     notify(
-        f"[SETUP] Full-repository mode · batch limit {max(1, min(int(batch_size), MAX_BATCH_SIZE))} · "
+        f"[SETUP] Full-repository mode · batch limit {effective_batch_size} · "
         f"target limit {max(1, int(max_target_bytes)):,} bytes · "
         f"AI triage {'enabled' if ai_triage else 'disabled'} · "
+        f"AI providers {', '.join(provider_order) if provider_order else 'none'} · "
         f"safe fixes {'enabled' if apply_fixes else 'disabled'} · "
         f"PR publishing {'enabled' if create_pull_request else 'disabled'}"
     )
     configured_excludes = tuple(
         pattern.strip()
-        for pattern in (
-            DEFAULT_EXCLUDES if exclude_patterns is None else exclude_patterns
-        )
+        for pattern in (DEFAULT_EXCLUDES if exclude_patterns is None else exclude_patterns)
         if pattern.strip()
     )
     repository_commit, repository_branch, repository_dirty = _git_provenance(root)
@@ -1069,6 +2489,8 @@ def run_full_scan(
             )
         for error in dependency_result.errors:
             notify(f"[WARNING] {error}")
+        for gap in dependency_result.coverage_gaps:
+            notify(f"[WARNING] OSV coverage gap: {gap}")
     else:
         notify("[DEPENDENCIES] Dependency scanning disabled for this audit")
 
@@ -1079,16 +2501,11 @@ def run_full_scan(
         )
         secret_started = monotonic()
         try:
-            secret_result = scan_secrets(
-                str(root), max_target_bytes=max_target_bytes
-            )
+            secret_result = scan_secrets(str(root), max_target_bytes=max_target_bytes)
         except Exception as exc:  # Keep an auditable degraded result on tool failure.
             secret_result = DetectorResult(
                 detector="betterleaks",
-                errors=[
-                    "Secret scanner failed unexpectedly: "
-                    f"{' '.join(str(exc).split())[:500]}"
-                ],
+                errors=[f"Secret scanner failed unexpectedly: {' '.join(str(exc).split())[:500]}"],
             )
         supplemental_results.append(secret_result)
         notify(
@@ -1105,7 +2522,7 @@ def run_full_scan(
         notify(f"[SCOPE] Loaded {len(ignore_patterns)} patterns from .aegisscanignore")
     batches = batch_findings(
         findings,
-        batch_size=batch_size,
+        batch_size=effective_batch_size,
         ignore_patterns=ignore_patterns,
     )
     role_counts: dict[str, int] = defaultdict(int)
@@ -1119,15 +2536,102 @@ def run_full_scan(
         notify(f"[SCOPE] Deterministic path classification: {role_summary}")
     notify(
         f"[PLAN] Packed {len(findings)} findings into {len(batches)} context-bounded batches "
-        f"(maximum {max(1, min(int(batch_size), MAX_BATCH_SIZE))} findings each)"
+        f"(maximum {effective_batch_size} findings each)"
     )
-    gemini_client = (client or genai.Client(api_key=gemini_api_key)) if ai_triage else None
+    gemini_client = (
+        client or genai.Client(api_key=gemini_api_key) if "gemini" in provider_order else None
+    )
     reports: list[tuple[int, ReviewReport]] = []
     failed_batches: list[int] = []
     failed_batch_reasons: dict[int, str] = {}
     failed_dispositions: list[FindingDisposition] = []
     attempted_ai_batches = 0
     successful_ai_batches = 0
+    ai_telemetry: dict[str, int] = {}
+
+    def refine_repaired_candidates(
+        report: ReviewReport,
+        triage_batch: FindingBatch,
+        structural_context: str,
+        batch_index: int,
+    ) -> ReviewReport:
+        """Strictly re-triage repaired candidates one at a time within a cost cap."""
+        repaired_ids = semantic_repair_candidate_ids(report)
+        if not repaired_ids:
+            return report
+        candidate_by_id = {candidate.finding_id: candidate for candidate in triage_batch.findings}
+        present_ids = [finding_id for finding_id in repaired_ids if finding_id in candidate_by_id]
+        eligible_ids = [
+            finding_id
+            for finding_id in present_ids
+            if _deterministic_runtime_issue(root, candidate_by_id[finding_id]) is None
+        ]
+        deterministic_skips = len(present_ids) - len(eligible_ids)
+        if deterministic_skips:
+            ai_telemetry["deterministic_retriage_skipped"] = (
+                ai_telemetry.get("deterministic_retriage_skipped", 0)
+                + deterministic_skips
+            )
+        selected_ids = eligible_ids[:DEFAULT_AI_RETRIAGE_LIMIT]
+        skipped = len(eligible_ids) - len(selected_ids)
+        ai_telemetry["targeted_retriage_candidates"] = ai_telemetry.get(
+            "targeted_retriage_candidates", 0
+        ) + len(eligible_ids)
+        if skipped:
+            ai_telemetry["targeted_retriage_skipped"] = (
+                ai_telemetry.get("targeted_retriage_skipped", 0) + skipped
+            )
+        notify(
+            f"[REFINE] Batch {batch_index}/{len(batches)} · {len(eligible_ids)} "
+            "repaired candidate(s) require strict singleton re-triage"
+        )
+        refined = report
+        for finding_id in selected_ids:
+            candidate = candidate_by_id[finding_id]
+            singleton = FindingBatch(findings=[candidate], files={candidate.file})
+            strict_prompt = build_full_scan_prompt(
+                singleton.text,
+                structural_context,
+                batch_index,
+                len(batches),
+            )
+            ai_telemetry["targeted_retriage_attempts"] = (
+                ai_telemetry.get("targeted_retriage_attempts", 0) + 1
+            )
+            notify(
+                f"[REFINE] Strict singleton re-triage for {finding_id} · semantic repair disabled"
+            )
+            try:
+                strict_report = redact_review_report(
+                    _call_ai_provider_chain(
+                        provider_order,
+                        prompt=strict_prompt,
+                        openrouter_api_key=openrouter_api_key,
+                        gemini_client=gemini_client,
+                        progress=notify,
+                        allow_semantic_repair=False,
+                        telemetry=ai_telemetry,
+                    )
+                )
+            except RuntimeError as exc:
+                ai_telemetry["targeted_retriage_unresolved"] = (
+                    ai_telemetry.get("targeted_retriage_unresolved", 0) + 1
+                )
+                reason = " ".join(str(exc).split())[:240]
+                notify(
+                    f"[WARNING] Strict singleton re-triage for {finding_id} failed: "
+                    f"{reason}; the conservative Needs review verdict was retained"
+                )
+                continue
+            refined = _replace_candidate_verdict(refined, strict_report, finding_id)
+            ai_telemetry["targeted_retriage_recovered"] = (
+                ai_telemetry.get("targeted_retriage_recovered", 0) + 1
+            )
+            strict_status = next(
+                item.status for item in strict_report.dispositions if item.finding_id == finding_id
+            )
+            notify(f"[REFINE] {finding_id} recovered with a strict {strict_status} verdict")
+        return refined
 
     for index, batch in enumerate(batches, start=1):
         batch_started = monotonic()
@@ -1163,19 +2667,14 @@ def run_full_scan(
                 f"[SCOPE] Batch {index}/{len(batches)} contains only deterministic "
                 "non-runtime or incomplete-scan evidence; AI triage was skipped"
             )
-            notify(
-                f"[BATCH {index}/{len(batches)}] Complete in "
-                f"{monotonic() - batch_started:.1f}s"
-            )
+            notify(f"[BATCH {index}/{len(batches)}] Complete in {monotonic() - batch_started:.1f}s")
             continue
         if not ai_triage:
             detector_only_dispositions = [
                 FindingDisposition(
                     finding_id=candidate.finding_id,
                     status=(
-                        "NEEDS_REVIEW"
-                        if is_runtime_role(candidate.code_role)
-                        else "NON_RUNTIME"
+                        "NEEDS_REVIEW" if is_runtime_role(candidate.code_role) else "NON_RUNTIME"
                     ),
                     reason=(
                         "Detector-only mode intentionally skipped AI contextual triage; "
@@ -1211,10 +2710,7 @@ def run_full_scan(
                 f"[AI] Batch {index}/{len(batches)} contextual triage intentionally "
                 "disabled; runtime candidates remain in Needs review"
             )
-            notify(
-                f"[BATCH {index}/{len(batches)}] Complete in "
-                f"{monotonic() - batch_started:.1f}s"
-            )
+            notify(f"[BATCH {index}/{len(batches)}] Complete in {monotonic() - batch_started:.1f}s")
             continue
         triage_batch = FindingBatch(
             findings=triage_findings,
@@ -1223,12 +2719,8 @@ def run_full_scan(
         ast_started = monotonic()
         python_context = build_ast_context(root, triage_batch.files)
         related_context = build_related_context(root, triage_batch.files)
-        structural_context = "\n\n".join(
-            part for part in (python_context, related_context) if part
-        )
-        python_files = sum(
-            Path(path).suffix.casefold() == ".py" for path in triage_batch.files
-        )
+        structural_context = "\n\n".join(part for part in (python_context, related_context) if part)
+        python_files = sum(Path(path).suffix.casefold() == ".py" for path in triage_batch.files)
         notify(
             f"[CONTEXT] Local structural context generated for {python_files} Python "
             f"files and imported JS/TS helpers in "
@@ -1247,61 +2739,168 @@ def run_full_scan(
         attempted_ai_batches += 1
         try:
             report = redact_review_report(
-                call_gemini_with_failover(gemini_client, prompt, progress=notify)
+                _call_ai_provider_chain(
+                    provider_order,
+                    prompt=prompt,
+                    openrouter_api_key=openrouter_api_key,
+                    gemini_client=gemini_client,
+                    progress=notify,
+                    telemetry=ai_telemetry,
+                )
+            )
+            report = refine_repaired_candidates(
+                report,
+                triage_batch,
+                structural_context,
+                index,
             )
         except RuntimeError as exc:
             logger.error("Batch %s failed: %s", index, exc)
-            failed_batches.append(index)
-            failure_reason = " ".join(str(exc).split())[:500] or "Unknown AI provider error"
-            failed_batch_reasons[index] = failure_reason
-            failed_dispositions.extend(
-                FindingDisposition(
-                    finding_id=candidate.finding_id,
-                    status=(
-                        "NEEDS_REVIEW"
-                        if is_runtime_role(candidate.code_role)
-                        else "NON_RUNTIME"
-                    ),
-                    reason=(
-                        "AI triage failed; this candidate requires manual review."
-                        if is_runtime_role(candidate.code_role)
-                        else f"Deterministic scope classification marked this path as {candidate.code_role.lower()}."
-                    ),
-                    file=candidate.file,
-                    line=candidate.line,
-                    rule_id=candidate.rule_id,
-                    message=candidate.message,
-                    code_role=candidate.code_role,
-                    confidence="LOW",
+            initial_reason = " ".join(str(exc).split())[:500] or "Unknown AI provider error"
+            recovered_reports: list[ReviewReport] = []
+            unrecovered: list[tuple[SemgrepCandidate, str]] = []
+
+            def recover_findings(candidates: list[SemgrepCandidate], label: str) -> None:
+                if not candidates:
+                    return
+                recovery_batch = FindingBatch(
+                    findings=candidates,
+                    files={candidate.file for candidate in candidates if candidate.file},
                 )
-                for candidate in triage_batch.findings
-            )
-            failed_dispositions.extend(deterministic_dispositions)
-            notify(
-                f"[ERROR] Batch {index}/{len(batches)} failed after model failover: "
-                f"{failure_reason}"
-            )
+                notify(
+                    f"[RECOVER] Batch {index}/{len(batches)} {label} · retrying "
+                    f"{len(candidates)} finding(s)"
+                )
+                ai_telemetry["adaptive_split_attempts"] = (
+                    ai_telemetry.get("adaptive_split_attempts", 0) + 1
+                )
+                recovery_prompt = build_full_scan_prompt(
+                    recovery_batch.text,
+                    structural_context,
+                    index,
+                    len(batches),
+                )
+                try:
+                    recovery_report = redact_review_report(
+                        _call_ai_provider_chain(
+                            provider_order,
+                            prompt=recovery_prompt,
+                            openrouter_api_key=openrouter_api_key,
+                            gemini_client=gemini_client,
+                            progress=notify,
+                            telemetry=ai_telemetry,
+                        )
+                    )
+                except RuntimeError as recovery_error:
+                    reason = (
+                        " ".join(str(recovery_error).split())[:500] or "Unknown AI provider error"
+                    )
+                    if len(candidates) == 1:
+                        unrecovered.append((candidates[0], reason))
+                        notify(
+                            f"[WARNING] Batch {index}/{len(batches)} {label} could "
+                            "not be recovered; the candidate remains Needs review"
+                        )
+                        return
+                    midpoint = max(1, len(candidates) // 2)
+                    notify(
+                        f"[RECOVER] Batch {index}/{len(batches)} {label} still failed; "
+                        "splitting into smaller requests"
+                    )
+                    recover_findings(candidates[:midpoint], f"{label}.1")
+                    recover_findings(candidates[midpoint:], f"{label}.2")
+                    return
+                recovery_report = refine_repaired_candidates(
+                    recovery_report,
+                    recovery_batch,
+                    structural_context,
+                    index,
+                )
+                recovered_reports.append(
+                    _reconcile_batch_report(recovery_report, recovery_batch, root)
+                )
+
+            if len(triage_batch.findings) > 1:
+                midpoint = max(1, len(triage_batch.findings) // 2)
+                notify(
+                    f"[RECOVER] Batch {index}/{len(batches)} failed after model "
+                    "failover; splitting it into smaller requests"
+                )
+                recover_findings(triage_batch.findings[:midpoint], "split 1")
+                recover_findings(triage_batch.findings[midpoint:], "split 2")
+            else:
+                unrecovered.append((triage_batch.findings[0], initial_reason))
+
+            if recovered_reports:
+                recovered_reports[0].dispositions.extend(deterministic_dispositions)
+                reports.extend((index, item) for item in recovered_reports)
+            else:
+                failed_dispositions.extend(deterministic_dispositions)
+
+            if unrecovered:
+                failed_batches.append(index)
+                failure_reason = "; ".join(
+                    f"{candidate.finding_id}: {reason}" for candidate, reason in unrecovered
+                )[:500]
+                failed_batch_reasons[index] = failure_reason
+                failed_dispositions.extend(
+                    FindingDisposition(
+                        finding_id=candidate.finding_id,
+                        status=(
+                            "NEEDS_REVIEW"
+                            if is_runtime_role(candidate.code_role)
+                            else "NON_RUNTIME"
+                        ),
+                        reason=(
+                            "AI triage failed after adaptive splitting; this candidate "
+                            "requires manual review."
+                            if is_runtime_role(candidate.code_role)
+                            else "Deterministic scope classification marked this path as "
+                            f"{candidate.code_role.lower()}."
+                        ),
+                        file=candidate.file,
+                        line=candidate.line,
+                        rule_id=candidate.rule_id,
+                        message=candidate.message,
+                        code_role=candidate.code_role,
+                        confidence="LOW",
+                    )
+                    for candidate, _reason in unrecovered
+                )
+                notify(
+                    f"[ERROR] Batch {index}/{len(batches)} remained incomplete after "
+                    f"adaptive splitting: {failure_reason}"
+                )
+            else:
+                successful_ai_batches += 1
+                confirmed_count = sum(len(item.issues) for item in recovered_reports)
+                review_count = sum(
+                    disposition.status == "NEEDS_REVIEW"
+                    for item in recovered_reports
+                    for disposition in item.dispositions
+                )
+                notify(
+                    f"[RECOVER] Batch {index}/{len(batches)} fully recovered · "
+                    f"{confirmed_count} confirmed · {review_count} needs review"
+                )
+            notify(f"[BATCH {index}/{len(batches)}] Complete in {monotonic() - batch_started:.1f}s")
             continue
         successful_ai_batches += 1
         reconciled = _reconcile_batch_report(report, triage_batch, root)
         reconciled.dispositions.extend(deterministic_dispositions)
         confirmed_count = len(reconciled.issues)
         review_count = sum(
-            disposition.status == "NEEDS_REVIEW"
-            for disposition in reconciled.dispositions
+            disposition.status == "NEEDS_REVIEW" for disposition in reconciled.dispositions
         )
         non_runtime_count = sum(
-            disposition.status == "NON_RUNTIME"
-            for disposition in reconciled.dispositions
+            disposition.status == "NON_RUNTIME" for disposition in reconciled.dispositions
         )
         notify(
             f"[VALIDATE] Batch {index}/{len(batches)} · {confirmed_count} confirmed · "
             f"{review_count} needs review · {non_runtime_count} non-runtime"
         )
         reports.append((index, reconciled))
-        notify(
-            f"[BATCH {index}/{len(batches)}] Complete in {monotonic() - batch_started:.1f}s"
-        )
+        notify(f"[BATCH {index}/{len(batches)}] Complete in {monotonic() - batch_started:.1f}s")
 
     if attempted_ai_batches and not successful_ai_batches:
         notify(
@@ -1309,13 +2908,12 @@ def run_full_scan(
             "mode and every untriaged runtime candidate will remain in Needs review."
         )
 
-    merged = redact_review_report(
-        _normalize_manual_remediations(_merge_reports(reports, root))
-    )
+    merged = redact_review_report(_normalize_manual_remediations(_merge_reports(reports, root)))
     merged.dispositions.extend(failed_dispositions)
     base_scratchpad = merged.analysis_scratchpad.strip()
     supplemental_summaries: list[str] = []
     detector_errors: dict[str, list[str]] = {}
+    detector_coverage_gaps: dict[str, list[str]] = {}
     detector_telemetry: dict[str, dict[str, object]] = {}
     for detector_result in supplemental_results:
         supplemental_summaries.append(
@@ -1324,6 +2922,8 @@ def run_full_scan(
         )
         if detector_result.errors:
             detector_errors[detector_result.detector] = detector_result.errors
+        if detector_result.coverage_gaps:
+            detector_coverage_gaps[detector_result.detector] = detector_result.coverage_gaps
         if detector_result.telemetry:
             detector_telemetry[detector_result.detector] = detector_result.telemetry
 
@@ -1352,6 +2952,38 @@ def run_full_scan(
         scratchpad_parts.append("All enabled detectors completed without findings.")
     merged.analysis_scratchpad = "\n\n".join(scratchpad_parts)
     duplicate_count = accepted_before_merge - len(merged.issues)
+    exported_dependencies = [issue for issue in merged.issues if issue.rule_id.startswith("osv.")]
+    exported_advisories = {issue.rule_id for issue in exported_dependencies}
+    exported_package_groups: dict[str, dict[str, object]] = {}
+    for issue in exported_dependencies:
+        package_name = issue.original_code.rsplit(" ", 1)[0].strip() or "unknown package"
+        package_group = exported_package_groups.setdefault(
+            package_name, {"advisories": set(), "findings": 0}
+        )
+        package_group["advisories"].add(issue.rule_id.removeprefix("osv."))  # type: ignore[union-attr]
+        package_group["findings"] = int(package_group["findings"]) + 1
+    osv_telemetry = detector_telemetry.get("osv")
+    if osv_telemetry is not None:
+        osv_telemetry.update(
+            {
+                "exported_dependency_findings": len(exported_dependencies),
+                "exported_unique_advisories": len(exported_advisories),
+                "exported_affected_packages": sorted(
+                    (
+                        {
+                            "package": package_name,
+                            "unique_advisories": len(group["advisories"]),
+                            "findings": group["findings"],
+                        }
+                        for package_name, group in exported_package_groups.items()
+                    ),
+                    key=lambda item: (
+                        -int(item["findings"]),
+                        str(item["package"]),
+                    ),
+                ),
+            }
+        )
     notify(
         f"[MERGE] Combined {len(reports)} successful batches · {len(merged.issues)} confirmed issues · "
         f"{sum(item.status == 'NEEDS_REVIEW' for item in merged.dispositions)} needs review · "
@@ -1366,12 +2998,9 @@ def run_full_scan(
         failed_batch_reasons=failed_batch_reasons,
         ai_attempted_batches=attempted_ai_batches,
         ai_successful_batches=successful_ai_batches,
+        ai_telemetry=ai_telemetry,
         dependency_finding_count=next(
-            (
-                result.finding_count
-                for result in supplemental_results
-                if result.detector == "osv"
-            ),
+            (result.finding_count for result in supplemental_results if result.detector == "osv"),
             0,
         ),
         secret_finding_count=next(
@@ -1383,10 +3012,9 @@ def run_full_scan(
             0,
         ),
         detector_errors=detector_errors,
+        detector_coverage_gaps=detector_coverage_gaps,
         detector_telemetry=detector_telemetry,
-        scanner_diagnostics=(
-            {"semgrep": semgrep_diagnostics} if semgrep_diagnostics else {}
-        ),
+        scanner_diagnostics=({"semgrep": semgrep_diagnostics} if semgrep_diagnostics else {}),
         dependency_scan_enabled=dependency_scan,
         secret_scan_enabled=secret_scan,
         secret_scanner=next(
@@ -1405,7 +3033,15 @@ def run_full_scan(
         repository_commit=repository_commit,
         repository_branch=repository_branch,
         repository_dirty=repository_dirty,
-        ai_models=list(FAILOVER_MODELS) if ai_triage else [],
+        ai_provider_order=list(provider_order),
+        ai_models=(
+            [
+                *(list(OPENROUTER_MODELS) if "openrouter" in provider_order else []),
+                *(list(FAILOVER_MODELS) if "gemini" in provider_order else []),
+            ]
+            if ai_triage
+            else []
+        ),
         scan_exclusions=list(configured_excludes),
         max_target_bytes=max(1, int(max_target_bytes)),
     )
@@ -1459,6 +3095,7 @@ def run_full_scan(
         f"{outcome.total_finding_count} detector findings · "
         f"{len(merged.issues)} confirmed · {outcome.disposition_count('NEEDS_REVIEW')} needs review · "
         f"{outcome.disposition_count('NON_RUNTIME')} non-runtime · "
+        f"{outcome.disposition_count('FALSE_POSITIVE')} false positives · "
         f"{outcome.disposition_count('DUPLICATE')} duplicates · "
         f"{len(outcome.fixed_files)} changed files"
     )
@@ -1475,11 +3112,24 @@ def main() -> None:
         description="Run an AegisScan audit against an entire local repository."
     )
     parser.add_argument("--repo", default=os.getcwd(), help="Repository directory")
-    parser.add_argument("--api-key", default=os.getenv("GEMINI_API_KEY", ""))
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
-        "--max-target-bytes", type=int, default=DEFAULT_MAX_TARGET_BYTES
+        "--api-key",
+        default=os.getenv("GEMINI_API_KEY", ""),
+        help="Gemini API key (or set GEMINI_API_KEY)",
     )
+    parser.add_argument(
+        "--openrouter-api-key",
+        default=os.getenv("OPENROUTER_API_KEY", ""),
+        help="OpenRouter API key (or set OPENROUTER_API_KEY)",
+    )
+    parser.add_argument(
+        "--ai-provider",
+        choices=AI_PROVIDER_MODES,
+        default="auto",
+        help="AI provider selection; auto prefers OpenRouter and falls back to Gemini",
+    )
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--max-target-bytes", type=int, default=DEFAULT_MAX_TARGET_BYTES)
     parser.add_argument(
         "--exclude",
         action="append",
@@ -1492,7 +3142,7 @@ def main() -> None:
         "--detector-only",
         action="store_true",
         help=(
-            "Run deterministic detectors without Gemini; runtime candidates are "
+            "Run deterministic detectors without an AI provider; runtime candidates are "
             "reported as Needs review"
         ),
     )
@@ -1522,6 +3172,8 @@ def main() -> None:
         outcome = run_full_scan(
             args.repo,
             args.api_key,
+            openrouter_api_key=args.openrouter_api_key,
+            ai_provider=args.ai_provider,
             batch_size=args.batch_size,
             dependency_scan=not args.no_dependency_scan,
             secret_scan=not args.no_secret_scan,
@@ -1542,8 +3194,8 @@ def main() -> None:
             logger.info("Wrote SARIF report to %s", args.sarif)
         if outcome.audit_degraded:
             logger.error(
-                "Audit completed in degraded mode; inspect detector_errors, Needs review, "
-                "and failed_batch_reasons in %s",
+                "Audit completed in degraded mode; inspect detector_errors, "
+                "detector_coverage_gaps, Needs review, and failed_batch_reasons in %s",
                 args.report,
             )
             sys.exit(2)

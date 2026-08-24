@@ -24,7 +24,7 @@ FAILOVER_MODELS = [
     model.strip()
     for model in os.environ.get(
         "AEGISSCAN_GEMINI_MODELS",
-        "gemini-3.6-flash,gemini-3.5-flash",
+        "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash",
     ).split(",")
     if model.strip()
 ]
@@ -36,7 +36,7 @@ MAX_RETRIES = int(os.environ.get("AEGISSCAN_MAX_RETRIES", "3"))
 API_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_API_TIMEOUT", "180"))
 
 # Batches are bounded, but evidence ledgers can still be verbose. Both default
-# models support a substantially larger output window than this conservative cap.
+# default models support a substantially larger output window than this conservative cap.
 MAX_OUTPUT_TOKENS = int(os.environ.get("AEGISSCAN_MAX_OUTPUT_TOKENS", "16384"))
 
 # Initial backoff delay (doubles on each retry)
@@ -135,8 +135,7 @@ def call_gemini_with_failover(
 
                 if response.parsed is None and not response.text:
                     raise ValueError(
-                        "Structured JSON parsing failed (likely truncated). "
-                        "Triggering retry."
+                        "Structured JSON parsing failed (likely truncated). Triggering retry."
                     )
 
                 if isinstance(response.parsed, ReviewReport):
@@ -150,8 +149,7 @@ def call_gemini_with_failover(
                     f"with {len(report.issues)} candidate issues"
                 )
                 logger.info(
-                    f"Received review from Gemini ({model_name}) "
-                    f"with {len(report.issues)} issues."
+                    f"Received review from Gemini ({model_name}) with {len(report.issues)} issues."
                 )
                 return report
 
@@ -159,9 +157,7 @@ def call_gemini_with_failover(
                 logger.warning(f"Request to {model_name} failed: {e}")
                 reason = _safe_error_summary(e)
                 last_failures[model_name] = reason
-                notify(
-                    f"[WARNING] Model {model_name} attempt {attempt + 1} failed: {reason}"
-                )
+                notify(f"[WARNING] Model {model_name} attempt {attempt + 1} failed: {reason}")
                 if not _is_retryable(e):
                     notify(
                         f"[WARNING] Provider returned non-retryable HTTP {e.code}; "
@@ -175,7 +171,6 @@ def call_gemini_with_failover(
         notify(f"[WARNING] Model {model_name} exhausted; moving to the next fallback model")
 
     details = "; ".join(
-        f"{model}: {last_failures.get(model, 'no response')}"
-        for model in FAILOVER_MODELS
+        f"{model}: {last_failures.get(model, 'no response')}" for model in FAILOVER_MODELS
     )
     raise RuntimeError(f"All Gemini models failed. {details}")

@@ -34,6 +34,12 @@ def test_redact_text_removes_a_truncated_pem_header_from_evidence():
     assert REDACTED_SECRET in redacted
 
 
+def test_redact_text_preserves_backticked_camel_case_code_identifiers():
+    text = "The `quantityCheckBeforeBasketItemUpdate` function validates the item."
+
+    assert redact_text(text) == text
+
+
 def test_full_scan_prompt_scrubs_repository_context_before_provider_call():
     prompt = build_full_scan_prompt(
         f"Code Snippet: const privateKey = '{PRIVATE_KEY}'",

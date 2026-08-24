@@ -24,14 +24,18 @@ def test_main_window_builds_with_isolated_settings(tmp_path):
     assert "dashboard" in window.page_indexes
     assert "readiness" in window.page_indexes
     assert window.new_scan.api_key_input.echoMode().name == "Password"
+    assert window.new_scan.openrouter_api_key_input.echoMode().name == "Password"
+    assert window.new_scan.ai_provider.currentData() == "auto"
     assert window.new_scan.audit_mode.currentData() == "bundled"
     window.set_semgrep_rule_mode("extended")
     assert window.new_scan.audit_mode.currentData() == "extended"
     assert window.app_settings.rule_mode.currentData() == "extended"
     window.set_ai_triage(False)
     assert not window.new_scan.api_key_input.isEnabled()
+    assert not window.new_scan.openrouter_api_key_input.isEnabled()
     assert not window.new_scan.batch_size.isEnabled()
     assert not window.app_settings.api_key.isEnabled()
+    assert not window.app_settings.openrouter_api_key.isEnabled()
     assert "detector-only" in window.new_scan.launch_button.text().lower()
 
     window.close()
@@ -58,9 +62,7 @@ def test_desktop_can_export_sarif(tmp_path, monkeypatch):
 
     payload = json.loads(destination.read_text(encoding="utf-8"))
     assert payload["version"] == "2.1.0"
-    assert payload["runs"][0]["invocations"][0]["properties"][
-        "semgrepRuleMode"
-    ] == "bundled"
+    assert payload["runs"][0]["invocations"][0]["properties"]["semgrepRuleMode"] == "bundled"
     window.close()
     application.processEvents()
 
@@ -83,6 +85,14 @@ def test_new_audit_controls_do_not_overlap_at_minimum_window_size(tmp_path):
         return top, top + widget.height()
 
     ordered_rows = [
+        page.ai_triage,
+        page.ai_provider_label,
+        page.ai_provider,
+        page.api_key_label,
+        page.api_key_input,
+        page.openrouter_api_key_label,
+        page.openrouter_api_key_input,
+        page.ai_privacy_note,
         page.options_panel,
         page.limits_panel,
         page.dependency_scan,
@@ -126,6 +136,8 @@ def test_scan_worker_passes_detector_only_setting(monkeypatch):
         {
             "repo_path": "/repo",
             "gemini_api_key": "",
+            "openrouter_api_key": "",
+            "ai_provider": "auto",
             "batch_size": 10,
             "apply_fixes": False,
             "create_pull_request": False,
@@ -223,6 +235,146 @@ def test_degraded_scan_opens_manual_review_without_failure_dialog(tmp_path):
     assert window.stack.currentIndex() == window.page_indexes["review_queue"]
     assert window.dashboard.security_ring.caption == "INCOMPLETE"
     assert not window.dashboard.security_ring.has_score
+
+    window.close()
+    application.processEvents()
+
+
+def test_dependency_coverage_gap_is_visible_on_dashboard(tmp_path):
+    application = QApplication.instance() or QApplication([])
+    window = AegisScanWindow(_test_settings(tmp_path))
+    outcome = ScanOutcome(
+        report=ReviewReport(analysis_scratchpad="Dependency inventory incomplete", issues=[]),
+        raw_finding_count=0,
+        batch_count=0,
+        detector_coverage_gaps={
+            "osv": ["package.json has no supported lockfile or resolved inventory."]
+        },
+        detector_telemetry={
+            "osv": {
+                "manifests_discovered": 1,
+                "packages_in_local_inventory": 0,
+                "packages_queried": 42,
+                "raw_unique_advisories": 7,
+                "exported_unique_advisories": 5,
+                "exported_dependency_findings": 6,
+                "exported_affected_packages": [
+                    {"package": "library", "unique_advisories": 5, "findings": 6}
+                ],
+            }
+        },
+    )
+
+    window.outcome = outcome
+    window.dashboard.refresh()
+
+    assert outcome.audit_degraded
+    assert window.dashboard.security_ring.caption == "INCOMPLETE"
+    assert "incomplete" in window.dashboard.dependency_status.text().lower()
+    assert "library: 5 advisories, 6 findings" in (window.dashboard.dependency_status.toolTip())
+
+    window.close()
+    application.processEvents()
+
+
+def test_dashboard_groups_dependencies_and_shows_ai_retriage_quality(tmp_path):
+    application = QApplication.instance() or QApplication([])
+    window = AegisScanWindow(_test_settings(tmp_path))
+    outcome = ScanOutcome(
+        report=ReviewReport(analysis_scratchpad="Complete audit", issues=[]),
+        raw_finding_count=0,
+        batch_count=1,
+        ai_attempted_batches=1,
+        ai_successful_batches=1,
+        ai_provider_order=["openrouter"],
+        ai_telemetry={
+            "request_attempts": 4,
+            "semantic_defects_repaired": 2,
+            "targeted_retriage_attempts": 2,
+            "targeted_retriage_recovered": 1,
+            "targeted_retriage_unresolved": 1,
+        },
+        detector_telemetry={
+            "osv": {
+                "exported_unique_advisories": 7,
+                "exported_dependency_findings": 9,
+                "exported_affected_packages": [
+                    {"package": "library-a", "unique_advisories": 5, "findings": 6},
+                    {"package": "library-b", "unique_advisories": 2, "findings": 3},
+                ],
+            }
+        },
+    )
+
+    window.outcome = outcome
+    window.dashboard.refresh()
+
+    assert "2 affected packages" in window.dashboard.dependency_status.text()
+    assert "7 advisories" in window.dashboard.dependency_status.text()
+    assert "strict re-triage 1/2 recovered" in window.dashboard.ai_status.text()
+    assert "Still needs review: 1" in window.dashboard.ai_status.toolTip()
+
+    window.close()
+    application.processEvents()
+
+
+def test_large_evidence_ledgers_are_lazy_and_paginated(tmp_path):
+    application = QApplication.instance() or QApplication([])
+    window = AegisScanWindow(_test_settings(tmp_path))
+    review_items = [
+        FindingDisposition(
+            finding_id=f"SG-review-{index}",
+            status="NEEDS_REVIEW",
+            reason="Manual review required.",
+            file=f"src/review_{index}.py",
+            line=index + 1,
+            rule_id="test.review",
+        )
+        for index in range(601)
+    ]
+    non_runtime_items = [
+        FindingDisposition(
+            finding_id=f"SG-non-runtime-{index}",
+            status="NON_RUNTIME",
+            reason="Fixture source.",
+            file=f"tests/fixture_{index}.py",
+            line=index + 1,
+            rule_id="test.fixture",
+        )
+        for index in range(601)
+    ]
+    outcome = ScanOutcome(
+        report=ReviewReport(
+            analysis_scratchpad="Large report",
+            issues=[],
+            dispositions=review_items + non_runtime_items,
+        ),
+        raw_finding_count=1_202,
+        batch_count=1,
+        ai_triage_enabled=False,
+    )
+
+    window._scan_completed(outcome)
+
+    assert window.stack.currentIndex() == window.page_indexes["review_queue"]
+    assert len(window.review_queue.filtered_dispositions) == 601
+    assert window.review_queue.table.rowCount() == 250
+    assert window.review_queue.page_status.text() == "Showing 1–250 of 601 candidates"
+    assert window.non_runtime.table.rowCount() == 0
+
+    window.review_queue.next_page.click()
+    assert window.review_queue.table.rowCount() == 250
+    assert window.review_queue.visible_dispositions[0].finding_id == "SG-review-250"
+    assert window.review_queue.page_status.text() == "Showing 251–500 of 601 candidates"
+
+    window.review_queue.search.setText("SG-review-600")
+    assert window.review_queue.page_index == 0
+    assert window.review_queue.table.rowCount() == 1
+    assert window.review_queue.visible_dispositions[0].finding_id == "SG-review-600"
+
+    window.navigate("non_runtime")
+    assert len(window.non_runtime.filtered_dispositions) == 601
+    assert window.non_runtime.table.rowCount() == 250
 
     window.close()
     application.processEvents()

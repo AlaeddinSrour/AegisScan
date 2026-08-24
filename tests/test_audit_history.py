@@ -99,3 +99,20 @@ def test_latest_completed_entry_skips_failures_and_other_repositories(tmp_path):
     ]
 
     assert latest_completed_entry(entries, str(repository)) is current
+
+
+def test_history_marks_same_clean_commit_as_scanner_variance(tmp_path):
+    first_outcome = _outcome("SG-one")
+    first_outcome.repository_commit = "abc123"
+    first_outcome.repository_dirty = False
+    first = build_history_entry(first_outcome, str(tmp_path))
+
+    second_outcome = _outcome("SG-two")
+    second_outcome.repository_commit = "abc123"
+    second_outcome.repository_dirty = False
+    second = build_history_entry(second_outcome, str(tmp_path), first)
+
+    assert second["comparison_basis"] == "same_clean_commit"
+    assert second["comparison"] == {"new": 1, "resolved": 1, "unchanged": 0}
+    assert second["repository_commit"] == "abc123"
+    assert second["false_positives"] == 0

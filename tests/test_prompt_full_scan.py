@@ -9,3 +9,4 @@ def test_full_scan_prompt_does_not_require_a_diff():
     assert "Finding #1" in prompt
     assert "exactly one `dispositions` entry" in prompt
     assert "Candidates must never disappear" in prompt
+    assert "human-readable response field in English" in prompt

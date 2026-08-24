@@ -41,9 +41,7 @@ def actionable_fingerprints(outcome: Any) -> set[str]:
     return fingerprints
 
 
-def compare_fingerprints(
-    current: Iterable[str], previous: Iterable[str]
-) -> dict[str, int]:
+def compare_fingerprints(current: Iterable[str], previous: Iterable[str]) -> dict[str, int]:
     current_set = set(current)
     previous_set = set(previous)
     return {
@@ -65,9 +63,7 @@ def latest_completed_entry(
             entry_repository = str(Path(raw_repository).expanduser().resolve())
         except (OSError, RuntimeError):
             continue
-        if entry_repository == canonical_repository and isinstance(
-            entry.get("fingerprints"), list
-        ):
+        if entry_repository == canonical_repository and isinstance(entry.get("fingerprints"), list):
             return entry
     return None
 
@@ -86,6 +82,13 @@ def build_history_entry(
         else []
     )
     comparison = compare_fingerprints(fingerprints, previous_fingerprints)
+    same_clean_commit = bool(
+        previous is not None
+        and outcome.repository_commit
+        and previous.get("repository_commit") == outcome.repository_commit
+        and previous.get("repository_dirty") is False
+        and outcome.repository_dirty is False
+    )
     completed_at = timestamp or datetime.now(UTC)
     return {
         "timestamp": completed_at.astimezone(UTC).isoformat(timespec="seconds"),
@@ -95,17 +98,23 @@ def build_history_entry(
         "issues": len(outcome.report.issues),
         "needs_review": outcome.disposition_count("NEEDS_REVIEW"),
         "non_runtime": outcome.disposition_count("NON_RUNTIME"),
+        "false_positives": outcome.disposition_count("FALSE_POSITIVE"),
         "duplicates": outcome.disposition_count("DUPLICATE"),
         "status": "Needs review" if outcome.audit_degraded else "Completed",
         "audit_mode": "AI triage" if outcome.ai_triage_enabled else "Detector only",
         "fingerprints": fingerprints,
         "comparison": comparison,
+        "comparison_basis": "same_clean_commit" if same_clean_commit else "repository_state",
+        "repository_commit": outcome.repository_commit,
+        "repository_dirty": outcome.repository_dirty,
+        "semgrep_rule_mode": outcome.semgrep_rule_mode,
+        "semgrep_rules_sha256": outcome.semgrep_rules_sha256,
+        "app_version": outcome.app_version,
+        "ai_models": list(outcome.ai_models),
     }
 
 
-def build_failure_entry(
-    repository: str, *, timestamp: datetime | None = None
-) -> dict[str, object]:
+def build_failure_entry(repository: str, *, timestamp: datetime | None = None) -> dict[str, object]:
     completed_at = timestamp or datetime.now(UTC)
     return {
         "timestamp": completed_at.astimezone(UTC).isoformat(timespec="seconds"),
@@ -115,6 +124,7 @@ def build_failure_entry(
         "issues": "—",
         "needs_review": "—",
         "non_runtime": "—",
+        "false_positives": "—",
         "status": "Failed",
         "audit_mode": "—",
         "fingerprints": [],

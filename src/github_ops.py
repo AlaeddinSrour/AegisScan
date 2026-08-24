@@ -68,18 +68,14 @@ def run_cmd(
     Returns:
         (success, stdout_or_stderr)
     """
-    result = subprocess.run(
-        cmd, shell=False, text=True, capture_output=True, env=env
-    )
+    result = subprocess.run(cmd, shell=False, text=True, capture_output=True, env=env)
     if result.returncode != 0:
-        display_cmd = ' '.join(cmd)
+        display_cmd = " ".join(cmd)
         if redact:
             display_cmd = display_cmd.replace(redact, "***")
         log_stderr = result.stderr.replace(redact, "***") if redact else result.stderr
         log_stdout = result.stdout.replace(redact, "***") if redact else result.stdout
-        logger.error(
-            f"Command failed: {display_cmd}\nStdout: {log_stdout}\nStderr: {log_stderr}"
-        )
+        logger.error(f"Command failed: {display_cmd}\nStdout: {log_stdout}\nStderr: {log_stderr}")
         return False, result.stderr
     return True, result.stdout
 
@@ -137,9 +133,7 @@ def validate_publishable_worktree(
     return branch
 
 
-def apply_auto_fixes_with_paths(
-    issues: List[ReviewIssue], repo_path: str = "."
-) -> list[str]:
+def apply_auto_fixes_with_paths(issues: List[ReviewIssue], repo_path: str = ".") -> list[str]:
     """
     Apply AI-suggested auto-fixes to local files using fuzzy matching.
 
@@ -369,9 +363,9 @@ def push_auto_fixes(
             raise RuntimeError(f"Failed to commit audit fixes: {error.strip()}")
 
         push_url = f"https://github.com/{repository}.git"
-        credential = base64.b64encode(
-            f"x-access-token:{github_token}".encode("utf-8")
-        ).decode("ascii")
+        credential = base64.b64encode(f"x-access-token:{github_token}".encode("utf-8")).decode(
+            "ascii"
+        )
         git_env = os.environ.copy()
         git_env.update(
             {
@@ -450,11 +444,7 @@ def post_inline_comments(pr, latest_commit, issues: List[ReviewIssue]) -> None:
     between comments to avoid hitting GitHub's secondary rate limits.
     """
     for i, issue in enumerate(issues):
-        body = (
-            f"### 🛡️ AegisScan [{issue.severity}]\n"
-            f"**{issue.issue_name}**\n\n"
-            f"{issue.description}"
-        )
+        body = f"### 🛡️ AegisScan [{issue.severity}]\n**{issue.issue_name}**\n\n{issue.description}"
         if issue.suggested_fix:
             body += f"\n\n```suggestion\n{issue.suggested_fix}\n```"
 
@@ -480,9 +470,7 @@ def post_inline_comments(pr, latest_commit, issues: List[ReviewIssue]) -> None:
                 f"{issue.description}"
             )
             if issue.suggested_fix:
-                fallback_body += (
-                    f"\n\n**Suggested Fix:**\n```\n{issue.suggested_fix}\n```"
-                )
+                fallback_body += f"\n\n**Suggested Fix:**\n```\n{issue.suggested_fix}\n```"
             try:
                 pr.create_issue_comment(fallback_body)
                 logger.info("Successfully posted fallback PR issue comment.")

@@ -49,11 +49,7 @@ def fuzzy_replace(
 
     if target_line is not None and target_line > 0:
         target_index = target_line - 1
-        anchored = [
-            index
-            for index in matches
-            if index <= target_index < index + window_size
-        ]
+        anchored = [index for index in matches if index <= target_index < index + window_size]
         if len(anchored) == 1:
             match_index = anchored[0]
         elif anchored:
@@ -71,8 +67,7 @@ def fuzzy_replace(
     leading_whitespace = re.match(r"^[ \t]*", first_line).group(0)
     normalized_replacement = _normalized_block(repl_lines)
     replacement_with_margin = [
-        leading_whitespace + line if line else ""
-        for line in normalized_replacement
+        leading_whitespace + line if line else "" for line in normalized_replacement
     ]
     content_lines[match_index : match_index + window_size] = replacement_with_margin
     return "\n".join(content_lines), True
