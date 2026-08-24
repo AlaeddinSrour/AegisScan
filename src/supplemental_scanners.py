@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,9 @@ from .scope import classify_code_role, load_ignore_patterns
 
 
 OSV_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_OSV_TIMEOUT", "300"))
+DEPENDENCY_RESOLVE_TIMEOUT_SECONDS = int(
+    os.environ.get("AEGISSCAN_DEPENDENCY_RESOLVE_TIMEOUT", "120")
+)
 SECRET_SCANNER_TIMEOUT_SECONDS = int(
     os.environ.get(
         "AEGISSCAN_BETTERLEAKS_TIMEOUT",
@@ -34,6 +38,7 @@ class DetectorResult:
     issues: list[ReviewIssue] = field(default_factory=list)
     dispositions: list[FindingDisposition] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    coverage_gaps: list[str] = field(default_factory=list)
     telemetry: dict[str, object] = field(default_factory=dict)
 
 
@@ -53,7 +58,31 @@ _DEPENDENCY_MANIFEST_NAMES = {
     "composer.lock",
     "packages.lock.json",
 }
+_DEPENDENCY_DESCRIPTOR_NAMES = {
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "pipfile",
+    "cargo.toml",
+    "gemfile",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+}
 _DEPENDENCY_SKIP_DIRS = {".git", ".venv", "node_modules", "vendor"}
+
+
+@dataclass
+class DependencyInventory:
+    """Local dependency descriptors and resolvable scanner inputs."""
+
+    manifests: list[str] = field(default_factory=list)
+    scan_inputs: list[str] = field(default_factory=list)
+    uncovered_manifests: list[str] = field(default_factory=list)
+    known_package_count: int = 0
+    uncounted_scan_inputs: int = 0
 
 
 def _manifest_package_count(path: Path) -> int | None:
@@ -101,10 +130,12 @@ def _manifest_package_count(path: Path) -> int | None:
     return None
 
 
-def _dependency_inventory(root: Path) -> tuple[list[str], int, int]:
+def _dependency_inventory(root: Path) -> DependencyInventory:
     manifests: list[str] = []
+    scan_inputs: list[str] = []
+    descriptor_entries: list[tuple[str, str, str]] = []
     known_package_count = 0
-    uncounted_manifests = 0
+    uncounted_scan_inputs = 0
     for directory, child_directories, files in os.walk(root):
         child_directories[:] = [
             name for name in child_directories if name not in _DEPENDENCY_SKIP_DIRS
@@ -112,12 +143,13 @@ def _dependency_inventory(root: Path) -> tuple[list[str], int, int]:
         directory_path = Path(directory)
         for filename in files:
             normalized = filename.casefold()
-            is_manifest = (
+            is_scan_input = (
                 normalized in _DEPENDENCY_MANIFEST_NAMES
                 or (normalized.startswith("requirements") and normalized.endswith(".txt"))
                 or normalized.endswith(".csproj")
             )
-            if not is_manifest:
+            is_descriptor = normalized in _DEPENDENCY_DESCRIPTOR_NAMES
+            if not (is_scan_input or is_descriptor):
                 continue
             path = directory_path / filename
             try:
@@ -125,12 +157,57 @@ def _dependency_inventory(root: Path) -> tuple[list[str], int, int]:
             except ValueError:
                 continue
             manifests.append(relative)
+            descriptor_entries.append((relative, normalized, path.parent.as_posix()))
+            if not is_scan_input:
+                continue
+            scan_inputs.append(relative)
             package_count = _manifest_package_count(path)
             if package_count is None:
-                uncounted_manifests += 1
+                uncounted_scan_inputs += 1
             else:
                 known_package_count += package_count
-    return sorted(manifests), known_package_count, uncounted_manifests
+
+    scan_names_by_directory: dict[str, set[str]] = {}
+    for relative, normalized, directory in descriptor_entries:
+        if relative in scan_inputs:
+            scan_names_by_directory.setdefault(directory, set()).add(normalized)
+    coverage_pairs = {
+        "package.json": {
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "bun.lock",
+            "bun.lockb",
+        },
+        "pyproject.toml": {
+            "poetry.lock",
+            "uv.lock",
+            "pipfile.lock",
+        },
+        "setup.py": {"requirements.txt", "pipfile.lock", "poetry.lock", "uv.lock"},
+        "setup.cfg": {"requirements.txt", "pipfile.lock", "poetry.lock", "uv.lock"},
+        "pipfile": {"pipfile.lock"},
+        "cargo.toml": {"cargo.lock"},
+        "gemfile": {"gemfile.lock"},
+        "composer.json": {"composer.lock"},
+    }
+    uncovered: list[str] = []
+    for relative, normalized, directory in descriptor_entries:
+        if normalized not in _DEPENDENCY_DESCRIPTOR_NAMES:
+            continue
+        expected = coverage_pairs.get(normalized)
+        if expected is None or not expected.intersection(
+            scan_names_by_directory.get(directory, set())
+        ):
+            uncovered.append(relative)
+    return DependencyInventory(
+        manifests=sorted(set(manifests)),
+        scan_inputs=sorted(set(scan_inputs)),
+        uncovered_manifests=sorted(set(uncovered)),
+        known_package_count=known_package_count,
+        uncounted_scan_inputs=uncounted_scan_inputs,
+    )
 
 
 def _executable(command: str, environment_name: str) -> str | None:
@@ -216,21 +293,140 @@ def _fixed_versions(vulnerability: dict[str, object]) -> list[str]:
     return versions
 
 
+def _run_osv_with_ephemeral_npm_locks(
+    executable: str,
+    root: Path,
+    inventory: DependencyInventory,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str], dict[str, object]]:
+    """Run OSV, resolving uncovered npm manifests only in a temporary directory."""
+    source_aliases: dict[str, str] = {}
+    attempted = 0
+    generated = 0
+    resolved_packages = 0
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="aegisscan-dependencies-") as temporary:
+        temporary_root = Path(temporary)
+        generated_lockfiles: list[Path] = []
+        npm = _executable("npm", "NPM_COMMAND")
+        npm_manifests = [
+            relative
+            for relative in inventory.uncovered_manifests
+            if Path(relative).name.casefold() == "package.json"
+        ]
+        attempted = len(npm_manifests)
+
+        def resolve(relative: str) -> tuple[str, Path | None, str]:
+            if npm is None:
+                return relative, None, "npm is unavailable"
+            source = root / relative
+            destination = temporary_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(source, destination)
+                executable_paths = [
+                    str(Path(npm).parent),
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    os.environ.get("PATH", ""),
+                ]
+                npm_result = subprocess.run(
+                    [
+                        npm,
+                        "install",
+                        "--package-lock-only",
+                        "--ignore-scripts",
+                        "--no-audit",
+                        "--no-fund",
+                        "--package-lock=true",
+                        "--workspaces=false",
+                    ],
+                    cwd=destination.parent,
+                    capture_output=True,
+                    text=True,
+                    timeout=DEPENDENCY_RESOLVE_TIMEOUT_SECONDS,
+                    shell=False,
+                    env={
+                        **os.environ,
+                        "PATH": os.pathsep.join(
+                            dict.fromkeys(path for path in executable_paths if path)
+                        ),
+                        "npm_config_update_notifier": "false",
+                    },
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return relative, None, _compact_error(str(exc))
+            lockfile = destination.with_name("package-lock.json")
+            if npm_result.returncode != 0 or not lockfile.is_file():
+                detail = _compact_error(
+                    npm_result.stderr or "npm did not produce package-lock.json"
+                )
+                return relative, None, detail
+            return relative, lockfile, ""
+
+        with ThreadPoolExecutor(max_workers=max(1, min(4, attempted))) as executor:
+            resolutions = list(executor.map(resolve, npm_manifests))
+        for relative, lockfile, failure in resolutions:
+            if failure or lockfile is None:
+                failures.append(f"{relative}: {failure or 'resolution failed'}")
+                continue
+            generated += 1
+            resolved_packages += _manifest_package_count(lockfile) or 0
+            generated_lockfiles.append(lockfile)
+            source_aliases[str(lockfile.resolve())] = relative
+
+        command = [
+            executable,
+            "scan",
+            "source",
+            "--format=json",
+            "--recursive",
+            str(root),
+        ]
+        for lockfile in generated_lockfiles:
+            command.extend(["--lockfile", str(lockfile)])
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=OSV_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    return (
+        completed,
+        source_aliases,
+        {
+            "ephemeral_resolution_attempted": attempted,
+            "ephemeral_lockfiles_generated": generated,
+            "ephemeral_packages_resolved": resolved_packages,
+            "ephemeral_resolution_failures": failures[:20],
+            "repository_modified_for_resolution": False,
+        },
+    )
+
+
 def scan_dependencies(repo_path: str) -> DetectorResult:
     """Run OSV-Scanner V2 and normalize known vulnerable dependencies."""
     result = DetectorResult(detector="osv")
     root = Path(repo_path).resolve()
-    manifests, package_count, uncounted_manifests = _dependency_inventory(root)
+    inventory = _dependency_inventory(root)
     result.telemetry = {
         "status": "not_started",
         "command_completed": False,
         "exit_code": None,
-        "manifests_discovered": len(manifests),
-        "manifest_files": manifests[:100],
-        "manifest_files_truncated": len(manifests) > 100,
-        "packages_in_local_inventory": package_count,
-        "manifests_without_local_package_count": uncounted_manifests,
-        "manifest_inventory_complete": uncounted_manifests == 0,
+        "coverage_complete": not inventory.uncovered_manifests,
+        "manifests_discovered": len(inventory.manifests),
+        "manifest_files": inventory.manifests[:100],
+        "manifest_files_truncated": len(inventory.manifests) > 100,
+        "supported_manifests_discovered": len(inventory.scan_inputs),
+        "supported_manifest_files": inventory.scan_inputs[:100],
+        "uncovered_manifests": len(inventory.uncovered_manifests),
+        "uncovered_manifest_files": inventory.uncovered_manifests[:100],
+        "packages_in_local_inventory": inventory.known_package_count,
+        "manifests_without_local_package_count": inventory.uncounted_scan_inputs,
+        "manifest_inventory_complete": (
+            not inventory.uncovered_manifests and inventory.uncounted_scan_inputs == 0
+        ),
         "manifests_scanned": 0,
         "packages_queried": 0,
         "skip_reasons": [],
@@ -246,60 +442,55 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
         )
         return result
 
-    command = [
-        executable,
-        "scan",
-        "source",
-        "--format=json",
-        "--recursive",
-        str(root),
-    ]
     try:
-        completed = subprocess.run(
-            command,
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=OSV_TIMEOUT_SECONDS,
-            shell=False,
+        completed, source_aliases, resolution_telemetry = _run_osv_with_ephemeral_npm_locks(
+            executable, root, inventory
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         result.telemetry["status"] = "execution_failed"
         result.telemetry["skip_reasons"] = ["OSV-Scanner did not complete."]
         result.errors.append(f"OSV-Scanner could not complete: {_compact_error(str(exc))}")
         return result
+    result.telemetry.update(resolution_telemetry)
+
+    unresolved_manifests = [
+        manifest
+        for manifest in inventory.uncovered_manifests
+        if manifest not in source_aliases.values()
+    ]
 
     result.telemetry["exit_code"] = completed.returncode
     if completed.returncode == 128:
         # OSV-Scanner documents 128 as "no packages found". This is a valid,
         # non-applicable result for repositories without supported manifests.
+        has_descriptors = bool(inventory.manifests)
+        if has_descriptors:
+            gap = (
+                "Dependency manifests were found, but OSV-Scanner could not resolve "
+                "a supported package inventory. Commit an ecosystem lockfile to enable "
+                "version-based dependency coverage."
+            )
+            result.coverage_gaps.append(gap)
         result.telemetry.update(
             {
-                "status": "no_packages_found",
+                "status": ("coverage_unavailable" if has_descriptors else "no_packages_found"),
+                "coverage_complete": not has_descriptors,
                 "command_completed": True,
-                "skip_reasons": [
-                    "OSV-Scanner found no supported package inventory."
-                ],
+                "skip_reasons": ["OSV-Scanner found no supported package inventory."],
             }
         )
         return result
     if completed.returncode not in {0, 1} or not completed.stdout.strip():
         result.telemetry["status"] = "execution_failed"
-        result.telemetry["skip_reasons"] = [
-            "OSV-Scanner exited without a usable report."
-        ]
+        result.telemetry["skip_reasons"] = ["OSV-Scanner exited without a usable report."]
         detail = _compact_error(completed.stderr or "no JSON output")
-        result.errors.append(
-            f"OSV-Scanner exited with status {completed.returncode}: {detail}"
-        )
+        result.errors.append(f"OSV-Scanner exited with status {completed.returncode}: {detail}")
         return result
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         result.telemetry["status"] = "invalid_output"
-        result.telemetry["skip_reasons"] = [
-            "OSV-Scanner returned invalid JSON."
-        ]
+        result.telemetry["skip_reasons"] = ["OSV-Scanner returned invalid JSON."]
         result.errors.append(f"OSV-Scanner returned invalid JSON: {exc}")
         return result
 
@@ -308,12 +499,26 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
     scan_results = payload.get("results") if isinstance(payload, dict) else None
     reported_sources: set[str] = set()
     packages_with_advisory_data = 0
+    unique_advisory_ids: set[str] = set()
+    affected_package_versions: set[tuple[str, str]] = set()
+    affected_packages: dict[str, dict[str, object]] = {}
     for scan_result in scan_results if isinstance(scan_results, list) else []:
         if not isinstance(scan_result, dict):
             continue
         source = scan_result.get("source")
         source_path = source.get("path") if isinstance(source, dict) else ""
-        relative_file, current_file = _relative_file(root, source_path)
+        source_key = ""
+        if source_path:
+            try:
+                source_key = str(Path(str(source_path)).resolve())
+            except OSError:
+                source_key = str(source_path)
+        aliased_manifest = source_aliases.get(source_key)
+        if aliased_manifest:
+            relative_file = aliased_manifest
+            current_file = root / aliased_manifest
+        else:
+            relative_file, current_file = _relative_file(root, source_path)
         reported_sources.add(relative_file)
         role = classify_code_role(relative_file, ignore_patterns)
         packages = scan_result.get("packages")
@@ -338,18 +543,28 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
                 if not isinstance(vulnerability, dict):
                     continue
                 raw_vulnerability_id = str(vulnerability.get("id") or "OSV-UNKNOWN")
-                vulnerability_id = grouped_ids.get(
-                    raw_vulnerability_id, raw_vulnerability_id
-                )
+                vulnerability_id = grouped_ids.get(raw_vulnerability_id, raw_vulnerability_id)
+                unique_advisory_ids.add(vulnerability_id)
+                affected_package_versions.add((package_name, package_version))
                 key = (relative_file, package_name, package_version, vulnerability_id)
                 if key in seen:
                     continue
                 seen.add(key)
+                package_group = affected_packages.setdefault(
+                    package_name,
+                    {"versions": set(), "advisories": set(), "occurrences": 0},
+                )
+                package_group["versions"].add(package_version)  # type: ignore[union-attr]
+                package_group["advisories"].add(vulnerability_id)  # type: ignore[union-attr]
+                package_group["occurrences"] = int(package_group["occurrences"]) + 1
                 finding_id = _finding_id("OSV", *key)
                 fixed = _fixed_versions(vulnerability)
                 fixed_text = ", ".join(fixed[:5]) if fixed else "a reviewed non-vulnerable release"
                 advisory_summary = _compact_error(
-                    str(vulnerability.get("summary") or "A known vulnerability affects this dependency version.")
+                    str(
+                        vulnerability.get("summary")
+                        or "A known vulnerability affects this dependency version."
+                    )
                 )
                 line = 1
                 if current_file is not None:
@@ -409,14 +624,47 @@ def scan_dependencies(repo_path: str) -> DetectorResult:
                     )
                 )
     result.finding_count = len(seen)
+    if unresolved_manifests:
+        result.coverage_gaps.append(
+            "One or more dependency manifests have no supported lockfile, so exact "
+            "version coverage is incomplete."
+        )
     result.telemetry.update(
         {
-            "status": "completed",
+            "status": ("partial_coverage" if unresolved_manifests else "completed"),
+            "coverage_complete": not unresolved_manifests,
             "command_completed": True,
-            "manifests_scanned": len(manifests),
-            "packages_queried": package_count,
+            "supported_manifests_discovered": (len(inventory.scan_inputs) + len(source_aliases)),
+            "supported_manifest_files": sorted(
+                set(inventory.scan_inputs).union(source_aliases.values())
+            )[:100],
+            "uncovered_manifests": len(unresolved_manifests),
+            "uncovered_manifest_files": unresolved_manifests[:100],
+            "manifest_inventory_complete": (
+                not unresolved_manifests and inventory.uncounted_scan_inputs == 0
+            ),
+            "manifests_scanned": len(inventory.scan_inputs) + len(source_aliases),
+            "packages_queried": inventory.known_package_count
+            + int(resolution_telemetry["ephemeral_packages_resolved"]),
             "osv_result_sources": len(reported_sources),
             "packages_with_advisory_data": packages_with_advisory_data,
+            "dependency_finding_occurrences": len(seen),
+            "raw_dependency_finding_occurrences": len(seen),
+            "unique_advisories": len(unique_advisory_ids),
+            "raw_unique_advisories": len(unique_advisory_ids),
+            "affected_package_versions": len(affected_package_versions),
+            "affected_packages": sorted(
+                (
+                    {
+                        "package": package_name,
+                        "versions": sorted(group["versions"]),
+                        "unique_advisories": len(group["advisories"]),
+                        "occurrences": group["occurrences"],
+                    }
+                    for package_name, group in affected_packages.items()
+                ),
+                key=lambda item: (-int(item["occurrences"]), str(item["package"])),
+            ),
         }
     )
     return result
@@ -463,10 +711,7 @@ def _run_secret_scanner_mode(
             shell=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], (
-            f"{scanner.title()} {mode} scan could not complete: "
-            f"{_compact_error(str(exc))}"
-        )
+        return [], (f"{scanner.title()} {mode} scan could not complete: {_compact_error(str(exc))}")
     if completed.returncode not in {0, 1}:
         return [], (
             f"{scanner.title()} {mode} scan exited with status {completed.returncode}: "
@@ -479,9 +724,7 @@ def _run_secret_scanner_mode(
     except (OSError, json.JSONDecodeError) as exc:
         return [], f"{scanner.title()} {mode} scan returned invalid JSON: {exc}"
     findings = (
-        [item for item in payload if isinstance(item, dict)]
-        if isinstance(payload, list)
-        else []
+        [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
     )
     return findings, None
 
@@ -511,10 +754,71 @@ def _strong_secret_rule(rule_id: str) -> bool:
         "password",
         "jwt",
     )
-    return not any(
-        normalized == value or normalized.startswith(f"{value}.")
-        for value in uncertain
+    return not any(normalized == value or normalized.startswith(f"{value}.") for value in uncertain)
+
+
+def _is_localization_password_noise(rule_id: str, relative_file: str) -> bool:
+    """Suppress generic password words from application translation catalogs."""
+    normalized_rule = rule_id.casefold().replace("_", "-")
+    path = Path(relative_file)
+    parts = tuple(part.casefold() for part in path.parts)
+    localization_directories = {"i18n", "l10n", "locale", "locales", "translations"}
+    return (
+        normalized_rule == "generic-password"
+        and path.suffix.casefold() in {".json", ".json5", ".yaml", ".yml"}
+        and any(part in localization_directories for part in parts[:-1])
     )
+
+
+def _credential_collection_key(rule_id: str, relative_file: str) -> tuple[str, str, str] | None:
+    """Group generic passwords in structured account collections by file.
+
+    These files still produce a review item; grouping only prevents a seed/demo
+    account list from overwhelming the queue with one row per credential.
+    """
+    normalized_rule = rule_id.casefold().replace("_", "-")
+    path = Path(relative_file)
+    if (
+        normalized_rule == "generic-password"
+        and path.suffix.casefold() in {".csv", ".json", ".json5", ".yaml", ".yml"}
+        and path.stem.casefold()
+        in {"account", "accounts", "credential", "credentials", "user", "users"}
+    ):
+        return ("credential-collection", normalized_rule, relative_file)
+    return None
+
+
+def _is_public_address_candidate(rule_id: str, current_file: Path | None, line: int) -> bool:
+    """Recognize public blockchain addresses mislabeled as generic API keys."""
+    if rule_id.casefold().replace("_", "-") != "generic-api-key":
+        return False
+    if current_file is None:
+        return False
+    try:
+        lines = current_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    if line < 1 or line > len(lines):
+        return False
+    source_line = lines[line - 1]
+    return bool(
+        re.search(r"\b0x[0-9a-fA-F]{40}\b", source_line)
+        and re.search(r"(?i)(?:address|contract|token)", source_line)
+    )
+
+
+def _current_file_digest(current_file: Path | None, cache: dict[Path, str]) -> str:
+    """Hash a current source file for copied-file secret consolidation."""
+    if current_file is None:
+        return ""
+    if current_file in cache:
+        return cache[current_file]
+    try:
+        digest = hashlib.sha256(current_file.read_bytes()).hexdigest()
+    except OSError:
+        digest = ""
+    cache[current_file] = digest
+    return digest
 
 
 def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorResult:
@@ -554,11 +858,15 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
     result.errors.extend(error for error in (current_error, history_error) if error)
 
     seen: dict[tuple[object, ...], int] = {}
+    seen_occurrences: dict[tuple[object, ...], set[tuple[object, ...]]] = {}
+    canonical_content_findings: dict[tuple[str, str, int, int], str] = {}
+    disposition_indexes: dict[str, int] = {}
+    file_digest_cache: dict[Path, str] = {}
+    suppressed_localization = {"current": 0, "history": 0}
+    consolidated_credential_collection_findings = 0
     for mode, findings in (("current", current), ("history", history)):
         for finding in findings:
-            rule_id = str(
-                _finding_value(finding, "RuleID", "rule_id") or "generic-secret"
-            )
+            rule_id = str(_finding_value(finding, "RuleID", "rule_id") or "generic-secret")
             description = _compact_error(
                 str(
                     _finding_value(finding, "Description", "description")
@@ -568,6 +876,9 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
             relative_file, current_file = _relative_file(
                 root, _finding_value(finding, "File", "path")
             )
+            if _is_localization_password_noise(rule_id, relative_file):
+                suppressed_localization[mode] += 1
+                continue
             try:
                 line = max(
                     1,
@@ -578,26 +889,32 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
             try:
                 column = max(
                     0,
-                    int(
-                        _finding_value(finding, "StartColumn", "start_column")
-                        or 0
-                    ),
+                    int(_finding_value(finding, "StartColumn", "start_column") or 0),
                 )
             except (TypeError, ValueError):
                 column = 0
-            commit = str(
-                _finding_value(finding, "Commit", "git.sha", "commit") or ""
-            )[:12]
-            fingerprint = str(
-                _finding_value(finding, "Fingerprint", "fingerprint") or ""
-            ).strip()
-            key: tuple[object, ...] = (
-                ("fingerprint", rule_id, fingerprint)
-                if fingerprint
-                else ("location", rule_id, relative_file, line, column)
+            commit = str(_finding_value(finding, "Commit", "git.sha", "commit") or "")[:12]
+            collection_key = _credential_collection_key(rule_id, relative_file)
+            key: tuple[object, ...] = collection_key or (
+                "location",
+                rule_id,
+                relative_file,
+                line,
+                column,
+            )
+            occurrence = (
+                mode,
+                commit if mode == "history" else "",
+                line,
+                column,
             )
             if key in seen:
                 disposition_index = seen[key]
+                if occurrence in seen_occurrences[key]:
+                    continue
+                seen_occurrences[key].add(occurrence)
+                if collection_key is not None:
+                    consolidated_credential_collection_findings += 1
                 existing = result.dispositions[disposition_index]
                 commits = list(existing.commits)
                 if commit and commit not in commits:
@@ -607,14 +924,29 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                     evidence_scope = "CURRENT_AND_HISTORY"
                 elif mode == "current" and evidence_scope == "GIT_HISTORY":
                     evidence_scope = "CURRENT_AND_HISTORY"
-                result.dispositions[disposition_index] = existing.model_copy(
-                    update={
-                        "evidence_scope": evidence_scope,
-                        "commit": existing.commit or commit,
-                        "commits": commits,
-                        "occurrence_count": existing.occurrence_count + 1,
-                    }
-                )
+                updates: dict[str, object] = {
+                    "evidence_scope": evidence_scope,
+                    "commit": existing.commit or commit,
+                    "commits": commits,
+                    "occurrence_count": existing.occurrence_count + 1,
+                }
+                if (
+                    mode == "history"
+                    and existing.status == "FALSE_POSITIVE"
+                    and "public blockchain address" in existing.reason
+                ):
+                    updates.update(
+                        {
+                            "status": "NEEDS_REVIEW",
+                            "reason": (
+                                "The current value is a public blockchain address, but "
+                                "redacted Git-history evidence at this location cannot be "
+                                "classified from the current source alone."
+                            ),
+                            "confidence": "MEDIUM",
+                        }
+                    )
+                result.dispositions[disposition_index] = existing.model_copy(update=updates)
                 continue
             role = classify_code_role(relative_file, ignore_patterns)
             finding_id = _finding_id("SECRET", *key)
@@ -627,19 +959,36 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                 )
                 or ""
             ).casefold()
-            is_current_runtime = mode == "current" and current_file is not None and role in {
-                "RUNTIME",
-                "UNKNOWN",
-            }
+            is_current_runtime = (
+                mode == "current"
+                and current_file is not None
+                and role
+                in {
+                    "RUNTIME",
+                    "UNKNOWN",
+                }
+            )
             is_confirmed = is_current_runtime and (
                 validation_status in {"valid", "revoked"}
                 or (not validation_status and _strong_secret_rule(rule_id))
             )
             rule_name = f"{scanner}.{rule_id}"
+            content_key: tuple[str, str, int, int] | None = None
+            canonical_finding_id = ""
+            if is_confirmed and _strong_secret_rule(rule_id):
+                file_digest = _current_file_digest(current_file, file_digest_cache)
+                if file_digest:
+                    content_key = (rule_id, file_digest, line, column)
+                    canonical_finding_id = canonical_content_findings.get(content_key, "")
             if validation_status == "invalid":
                 status = "FALSE_POSITIVE"
+                reason = f"{display_name} validation classified the redacted candidate as invalid."
+                confidence = "HIGH"
+            elif mode == "current" and _is_public_address_candidate(rule_id, current_file, line):
+                status = "FALSE_POSITIVE"
                 reason = (
-                    f"{display_name} validation classified the redacted candidate as invalid."
+                    "The generic API-key match is a public blockchain address, not a "
+                    "secret credential."
                 )
                 confidence = "HIGH"
             elif not is_current_runtime and role not in {"RUNTIME", "UNKNOWN"}:
@@ -647,6 +996,13 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                 reason = (
                     "Deterministic scope classification marked this redacted secret "
                     f"finding as {role.lower()}."
+                )
+                confidence = "HIGH"
+            elif canonical_finding_id:
+                status = "DUPLICATE"
+                reason = (
+                    "An identical source file contains the same specific secret pattern; "
+                    f"consolidated into {canonical_finding_id}."
                 )
                 confidence = "HIGH"
             elif is_confirmed:
@@ -715,20 +1071,49 @@ def scan_secrets(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorR
                     message=description,
                     code_role=role,
                     confidence=confidence,
-                    evidence_scope=(
-                        "CURRENT" if mode == "current" else "GIT_HISTORY"
-                    ),
+                    evidence_scope=("CURRENT" if mode == "current" else "GIT_HISTORY"),
                     commit=commit,
                     commits=[commit] if commit else [],
+                    canonical_finding_id=canonical_finding_id,
                 )
             )
             seen[key] = len(result.dispositions) - 1
-    result.finding_count = len(seen)
+            seen_occurrences[key] = {occurrence}
+            disposition_indexes[finding_id] = len(result.dispositions) - 1
+            if content_key is not None:
+                if canonical_finding_id:
+                    canonical_index = disposition_indexes.get(canonical_finding_id)
+                    if canonical_index is not None:
+                        canonical = result.dispositions[canonical_index]
+                        result.dispositions[canonical_index] = canonical.model_copy(
+                            update={"occurrence_count": canonical.occurrence_count + 1}
+                        )
+                else:
+                    canonical_content_findings[content_key] = finding_id
+    result.finding_count = len(result.dispositions)
+    retained_raw_findings = (
+        len(current)
+        + len(history)
+        - suppressed_localization["current"]
+        - suppressed_localization["history"]
+    )
     result.telemetry = {
         "current_raw_findings": len(current),
         "history_raw_findings": len(history),
-        "unique_findings": len(seen),
-        "deduplicated_occurrences": len(current) + len(history) - len(seen),
+        "unique_findings": result.finding_count,
+        "deduplicated_occurrences": retained_raw_findings - result.finding_count,
+        "suppressed_localization_findings": sum(suppressed_localization.values()),
+        "suppressed_current_localization_findings": suppressed_localization["current"],
+        "suppressed_history_localization_findings": suppressed_localization["history"],
+        "consolidated_credential_collection_findings": (
+            consolidated_credential_collection_findings
+        ),
+        "current_and_history_consolidations": sum(
+            item.evidence_scope == "CURRENT_AND_HISTORY" for item in result.dispositions
+        ),
+        "duplicate_secret_locations": sum(
+            item.status == "DUPLICATE" for item in result.dispositions
+        ),
         "current_evidence": sum(
             item.evidence_scope in {"CURRENT", "CURRENT_AND_HISTORY"}
             for item in result.dispositions

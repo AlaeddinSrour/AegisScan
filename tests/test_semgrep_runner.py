@@ -18,6 +18,7 @@ def test_bundled_ruleset_exists():
     assert "hardcoded-hmac-key" in rules
     assert "python.user-input-to-network-request" in rules
     assert "javascript.user-input-to-network-request" in rules
+    assert "javascript.express-open-redirect" in rules
     assert "python.filesystem-check-then-use" in rules
     assert "javascript.filesystem-check-then-use" in rules
     assert "go.user-input-to-network-request" in rules
@@ -27,21 +28,23 @@ def test_bundled_ruleset_exists():
     assert "csharp.user-input-to-network-request" in rules
     assert "csharp.filesystem-check-then-use" in rules
 
+
 def test_empty_stdout_fails_scan_completeness():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.stdout = ""
         mock_run.return_value = mock_result
-        
+
         with pytest.raises(RuntimeError, match="no JSON output"):
             run_semgrep_scan("/repo")
 
+
 def test_no_results_returns_empty():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.stdout = json.dumps({"results": []})
         mock_run.return_value = mock_result
-        
+
         result = run_semgrep_scan("/repo")
         assert result == ""
         command = mock_run.call_args.args[0]
@@ -81,26 +84,16 @@ def test_bundled_rule_id_is_portable_across_absolute_config_paths():
         "aegisscan.javascript.hardcoded-private-key"
     )
 
-    assert normalize_rule_id(polluted) == (
-        "aegisscan.javascript.hardcoded-private-key"
-    )
-    assert normalize_rule_id("javascript.express.audit.rule") == (
-        "javascript.express.audit.rule"
-    )
+    assert normalize_rule_id(polluted) == ("aegisscan.javascript.hardcoded-private-key")
+    assert normalize_rule_id("javascript.express.audit.rule") == ("javascript.express.audit.rule")
 
 
 def test_semgrep_output_normalizes_rule_id_and_redacts_source_context():
-    private_key = (
-        "-----BEGIN RSA PRIVATE KEY-----secret-material"
-        "-----END RSA PRIVATE KEY-----"
-    )
+    private_key = "-----BEGIN RSA PRIVATE KEY-----secret-material-----END RSA PRIVATE KEY-----"
     finding = {
         "path": "security.ts",
         "start": {"line": 1},
-        "check_id": (
-            "Users.person.app.Resources.src."
-            "aegisscan.javascript.hardcoded-private-key"
-        ),
+        "check_id": ("Users.person.app.Resources.src.aegisscan.javascript.hardcoded-private-key"),
         "extra": {
             "message": "embedded key",
             "lines": f"const privateKey = '{private_key}'",
@@ -153,47 +146,52 @@ def test_custom_exclusions_and_target_limit_are_forwarded():
     assert "vendor" in command
     assert "generated/**" in command
 
+
 def test_diff_aware_filtering_skips_unmodified_files():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         finding = {
             "path": "other.py",
             "start": {"line": 1},
             "check_id": "rule-1",
-            "extra": {"message": "err", "lines": "bad code"}
+            "extra": {"message": "err", "lines": "bad code"},
         }
         mock_result.stdout = json.dumps({"results": [finding]})
         mock_run.return_value = mock_result
-        
-        result = run_semgrep_scan("/repo", changed_files_lines={'main.py': {1, 2}})
+
+        result = run_semgrep_scan("/repo", changed_files_lines={"main.py": {1, 2}})
         assert result == ""
 
+
 def test_diff_aware_filtering_includes_modified_lines():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         finding = {
             "path": "main.py",
             "start": {"line": 5},
             "check_id": "rule-2",
-            "extra": {"message": "err", "lines": "bad code"}
+            "extra": {"message": "err", "lines": "bad code"},
         }
         mock_result.stdout = json.dumps({"results": [finding]})
         mock_run.return_value = mock_result
-        
-        with patch('os.path.exists', return_value=True):
-            with patch('builtins.open', mock_open(read_data="line1\nline2\nline3\nline4\nbad code\n")):
-                result = run_semgrep_scan("/repo", changed_files_lines={'main.py': {5}})
+
+        with patch("os.path.exists", return_value=True):
+            with patch(
+                "builtins.open", mock_open(read_data="line1\nline2\nline3\nline4\nbad code\n")
+            ):
+                result = run_semgrep_scan("/repo", changed_files_lines={"main.py": {5}})
                 assert "Finding #1" in result
                 assert "rule-2" in result
 
+
 def test_timeout_fails_scan_completeness():
-    with patch('subprocess.run', side_effect=subprocess.TimeoutExpired(cmd="semgrep", timeout=300)):
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="semgrep", timeout=300)):
         with pytest.raises(RuntimeError, match="cannot be reported as clean"):
             run_semgrep_scan("/repo")
 
 
 def test_nonzero_exit_fails_scan_completeness():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.returncode = 2
         mock_result.stdout = ""
@@ -204,7 +202,7 @@ def test_nonzero_exit_fails_scan_completeness():
 
 
 def test_known_macos_signal_warning_accepts_valid_error_free_json():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.returncode = 2
         mock_result.stdout = json.dumps({"results": [], "errors": []})
@@ -218,13 +216,15 @@ def test_known_macos_signal_warning_accepts_valid_error_free_json():
 
 
 def test_signal_warning_does_not_hide_json_scan_errors():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         mock_result.returncode = 2
-        mock_result.stdout = json.dumps({
-            "results": [],
-            "errors": [{"message": "rules failed"}],
-        })
+        mock_result.stdout = json.dumps(
+            {
+                "results": [],
+                "errors": [{"message": "rules failed"}],
+            }
+        )
         mock_result.stderr = (
             "Failed to register segfault signal handler!\n"
             "Failed to register unwind handler for some critical signals"
@@ -359,24 +359,25 @@ def test_runtime_syntax_error_still_fails_completeness():
         with pytest.raises(RuntimeError, match="runtime or global"):
             run_semgrep_scan("/repo")
 
+
 def test_file_context_limited_to_window():
-    with patch('subprocess.run') as mock_run:
+    with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()
         finding = {
             "path": "main.py",
             "start": {"line": 50},
             "check_id": "rule-3",
-            "extra": {"message": "err", "lines": "bad code"}
+            "extra": {"message": "err", "lines": "bad code"},
         }
         mock_result.stdout = json.dumps({"results": [finding]})
         mock_run.return_value = mock_result
-        
+
         # 100 lines
         file_content = "\n".join([f"line {i}" for i in range(1, 101)])
-        
-        with patch('os.path.exists', return_value=True):
-            with patch('builtins.open', mock_open(read_data=file_content)):
-                # Note: this test passes because we mock the *expected* behavior of limiting to +-30 lines. 
+
+        with patch("os.path.exists", return_value=True):
+            with patch("builtins.open", mock_open(read_data=file_content)):
+                # Note: this test passes because we mock the *expected* behavior of limiting to +-30 lines.
                 # If the function is modified to slice lines [start_line - 30 : start_line + 30], this test verifies that
                 # it correctly gets returned from run_semgrep_scan as part of the context block.
                 # However, since the source logic limits it, we just need to assert that not all lines are present.

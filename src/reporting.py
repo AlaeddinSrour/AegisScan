@@ -30,6 +30,10 @@ def build_report_payload(outcome: Any) -> dict[str, Any]:
         "summary": {
             "raw_semgrep_findings": outcome.raw_finding_count,
             "dependency_findings": outcome.dependency_finding_count,
+            "raw_dependency_finding_occurrences": outcome.dependency_finding_count,
+            "exported_dependency_findings": outcome.exported_dependency_finding_count,
+            "dependency_finding_occurrences": outcome.exported_dependency_finding_count,
+            "unique_dependency_advisories": outcome.unique_dependency_advisory_count,
             "secret_findings": outcome.secret_finding_count,
             "total_detector_findings": outcome.total_finding_count,
             "finding_batches": outcome.batch_count,
@@ -37,13 +41,18 @@ def build_report_payload(outcome: Any) -> dict[str, Any]:
             "failed_batch_reasons": outcome.failed_batch_reasons,
             "ai_attempted_batches": outcome.ai_attempted_batches,
             "ai_successful_batches": outcome.ai_successful_batches,
+            "ai_telemetry": outcome.ai_telemetry,
             "ai_triage_enabled": outcome.ai_triage_enabled,
             "ai_triage_degraded": outcome.ai_triage_degraded,
             "audit_degraded": outcome.audit_degraded,
             "detector_errors": outcome.detector_errors,
+            "detector_coverage_gaps": outcome.detector_coverage_gaps,
             "detector_telemetry": outcome.detector_telemetry,
             "scanner_diagnostics": outcome.scanner_diagnostics,
             "scanner_diagnostic_count": outcome.scanner_diagnostic_count,
+            "scanner_diagnostic_counts_by_role": outcome.scanner_diagnostic_counts_by_role,
+            "runtime_scanner_diagnostic_count": outcome.runtime_scanner_diagnostic_count,
+            "non_runtime_scanner_diagnostic_count": outcome.non_runtime_scanner_diagnostic_count,
             "dependency_scan_enabled": outcome.dependency_scan_enabled,
             "secret_scan_enabled": outcome.secret_scan_enabled,
             "secret_scanner": outcome.secret_scanner,
@@ -58,6 +67,7 @@ def build_report_payload(outcome: Any) -> dict[str, Any]:
                 "repository_commit": outcome.repository_commit,
                 "repository_branch": outcome.repository_branch,
                 "repository_dirty": outcome.repository_dirty,
+                "ai_provider_order": outcome.ai_provider_order,
                 "ai_models": outcome.ai_models,
             },
             "configuration": {
@@ -68,6 +78,7 @@ def build_report_payload(outcome: Any) -> dict[str, Any]:
                 "dependency_scan_enabled": outcome.dependency_scan_enabled,
                 "secret_scan_enabled": outcome.secret_scan_enabled,
                 "ai_triage_enabled": outcome.ai_triage_enabled,
+                "ai_provider_order": outcome.ai_provider_order,
             },
             "confirmed_issues": len(outcome.report.issues),
             "needs_review": outcome.disposition_count("NEEDS_REVIEW"),
@@ -75,6 +86,16 @@ def build_report_payload(outcome: Any) -> dict[str, Any]:
             "false_positives": outcome.disposition_count("FALSE_POSITIVE"),
             "duplicates": outcome.disposition_count("DUPLICATE"),
             "secret_evidence_scope": secret_scope_counts,
+            "current_tree_needs_review": sum(
+                disposition.status == "NEEDS_REVIEW" and disposition.evidence_scope != "GIT_HISTORY"
+                for disposition in safe_report.dispositions
+            ),
+            "historical_secret_needs_review": sum(
+                disposition.status == "NEEDS_REVIEW"
+                and disposition.evidence_scope == "GIT_HISTORY"
+                and disposition.rule_id.startswith(("betterleaks.", "gitleaks."))
+                for disposition in safe_report.dispositions
+            ),
             "fixed_files": outcome.fixed_files,
             "audit_branch": outcome.audit_branch,
             "pull_request_url": outcome.pull_request_url,
@@ -100,6 +121,7 @@ def _cwe_tags(rule_id: str, text: str) -> list[str]:
     evidence = f"{rule_id} {text}".casefold()
     mappings = (
         ("CWE-918", ("ssrf", "server-side request forgery", "network-request")),
+        ("CWE-601", ("open redirect", "express-open-redirect")),
         ("CWE-367", ("toctou", "check-then-use", "filesystem-check")),
         ("CWE-89", ("sql injection", "sqli")),
         ("CWE-78", ("command injection", "shell injection")),
@@ -126,8 +148,100 @@ def _location(file: str, line: int) -> list[dict[str, Any]]:
     ]
 
 
-def build_sarif_payload(outcome: Any) -> dict[str, Any]:
-    """Build SARIF 2.1.0 containing confirmed and manual-review findings."""
+def _sarif_notifications(
+    outcome: Any,
+    *,
+    omitted_historical_secrets: int = 0,
+    include_historical_secrets: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    execution: list[dict[str, Any]] = []
+    configuration: list[dict[str, Any]] = []
+    for batch in outcome.failed_batches:
+        reason = outcome.failed_batch_reasons.get(batch, "Unknown AI provider error")
+        execution.append(
+            {
+                "descriptor": {"id": "aegisscan.ai-triage-failed"},
+                "level": "error",
+                "message": {"text": f"AI triage batch {batch} failed: {str(reason)[:1800]}"},
+                "properties": {"batch": batch, "providerOrder": outcome.ai_provider_order},
+            }
+        )
+    for detector, diagnostics in outcome.scanner_diagnostics.items():
+        for diagnostic in diagnostics:
+            kind = str(diagnostic.get("kind") or "diagnostic")
+            message = str(diagnostic.get("message") or kind)
+            notification: dict[str, Any] = {
+                "descriptor": {
+                    "id": f"{detector}.{re.sub(r'[^a-z0-9]+', '-', kind.casefold()).strip('-')}"
+                },
+                "level": (
+                    "warning"
+                    if str(diagnostic.get("code_role") or "UNKNOWN").upper() == "RUNTIME"
+                    else "note"
+                ),
+                "message": {"text": message[:2000]},
+                "properties": {
+                    "detector": detector,
+                    "codeRole": diagnostic.get("code_role", "UNKNOWN"),
+                    "diagnosticKind": kind,
+                },
+            }
+            try:
+                diagnostic_line = int(diagnostic.get("line") or 0)
+            except (TypeError, ValueError):
+                diagnostic_line = 0
+            locations = _location(
+                str(diagnostic.get("file") or ""),
+                diagnostic_line,
+            )
+            if locations:
+                notification["locations"] = locations
+            execution.append(notification)
+    for detector, errors in outcome.detector_errors.items():
+        for error in errors:
+            execution.append(
+                {
+                    "descriptor": {"id": f"{detector}.execution-error"},
+                    "level": "error",
+                    "message": {"text": str(error)[:2000]},
+                    "properties": {"detector": detector},
+                }
+            )
+    for detector, gaps in outcome.detector_coverage_gaps.items():
+        for gap in gaps:
+            configuration.append(
+                {
+                    "descriptor": {"id": f"{detector}.coverage-gap"},
+                    "level": "warning",
+                    "message": {"text": str(gap)[:2000]},
+                    "properties": {"detector": detector},
+                }
+            )
+    if omitted_historical_secrets and not include_historical_secrets:
+        configuration.append(
+            {
+                "descriptor": {"id": "aegisscan.historical-secrets-omitted"},
+                "level": "note",
+                "message": {
+                    "text": (
+                        f"{omitted_historical_secrets} history-only secret findings were "
+                        "omitted because this SARIF export is current-tree-only. Export with "
+                        "historical secrets enabled to include the complete historical ledger."
+                    )
+                },
+                "properties": {
+                    "omittedFindings": omitted_historical_secrets,
+                    "exportPolicy": "CURRENT_TREE_ONLY",
+                },
+            }
+        )
+    return execution, configuration
+
+
+def build_sarif_payload(
+    outcome: Any, *, include_historical_secrets: bool = False
+) -> dict[str, Any]:
+    """Build current-tree SARIF; history-only secrets remain in the JSON ledger."""
     safe_report = redact_review_report(outcome.report)
     rules: dict[str, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
@@ -156,6 +270,7 @@ def build_sarif_payload(outcome: Any) -> dict[str, Any]:
                 },
             },
         )
+        is_dependency = issue.rule_id.startswith("osv.")
         result: dict[str, Any] = {
             "ruleId": rule_id,
             "level": level,
@@ -172,12 +287,32 @@ def build_sarif_payload(outcome: Any) -> dict[str, Any]:
                 "sinkEvidence": issue.sink_evidence,
                 "reachabilityEvidence": issue.reachability_evidence,
                 "relatedWeaknesses": issue.related_weaknesses,
+                "findingType": "DEPENDENCY_ADVISORY" if is_dependency else "CODE_SECURITY",
             },
         }
+        if is_dependency:
+            result["properties"].update(
+                {
+                    "affectedVersionStatus": "CONFIRMED",
+                    "runtimeReachability": "NOT_ESTABLISHED",
+                    "riskInterpretation": (
+                        "The resolved package version is affected; application runtime "
+                        "reachability requires separate validation."
+                    ),
+                }
+            )
         results.append(result)
 
+    omitted_historical_secrets = 0
     for disposition in safe_report.dispositions:
         if disposition.status != "NEEDS_REVIEW":
+            continue
+        is_history_only_secret = (
+            disposition.evidence_scope == "GIT_HISTORY"
+            and disposition.rule_id.startswith(("betterleaks.", "gitleaks."))
+        )
+        if is_history_only_secret and not include_historical_secrets:
+            omitted_historical_secrets += 1
             continue
         rule_id = _rule_id(disposition.rule_id, "Needs review")
         rules.setdefault(
@@ -199,17 +334,68 @@ def build_sarif_payload(outcome: Any) -> dict[str, Any]:
                 "level": "warning",
                 "message": {"text": f"Needs review: {disposition.reason}"},
                 "locations": _location(disposition.file, disposition.line),
-                "partialFingerprints": {
-                    "aegisscanFindingId": disposition.finding_id or rule_id
-                },
+                "partialFingerprints": {"aegisscanFindingId": disposition.finding_id or rule_id},
                 "properties": {
                     "status": disposition.status,
                     "confidence": disposition.confidence,
                     "codeRole": disposition.code_role,
                     "detectorMessage": disposition.message,
+                    "evidenceScope": disposition.evidence_scope,
+                    "commits": disposition.commits,
+                    "occurrenceCount": disposition.occurrence_count,
                 },
             }
         )
+
+    execution_notifications, configuration_notifications = _sarif_notifications(
+        outcome,
+        omitted_historical_secrets=omitted_historical_secrets,
+        include_historical_secrets=include_historical_secrets,
+    )
+    invocation: dict[str, Any] = {
+        "executionSuccessful": not outcome.audit_degraded,
+        "properties": {
+            "auditDegraded": outcome.audit_degraded,
+            "aiTriageEnabled": outcome.ai_triage_enabled,
+            "aiTriageDegraded": outcome.ai_triage_degraded,
+            "aiAttemptedBatches": outcome.ai_attempted_batches,
+            "aiSuccessfulBatches": outcome.ai_successful_batches,
+            "aiTelemetry": outcome.ai_telemetry,
+            "failedBatches": outcome.failed_batches,
+            "failedBatchReasons": outcome.failed_batch_reasons,
+            "semgrepRuleMode": outcome.semgrep_rule_mode,
+            "semgrepRulesSha256": outcome.semgrep_rules_sha256,
+            "runtimeScanGaps": outcome.runtime_scan_gap_count,
+            "scannerDiagnosticCount": outcome.scanner_diagnostic_count,
+            "scannerDiagnosticCountsByRole": outcome.scanner_diagnostic_counts_by_role,
+            "runtimeScannerDiagnosticCount": outcome.runtime_scanner_diagnostic_count,
+            "nonRuntimeScannerDiagnosticCount": outcome.non_runtime_scanner_diagnostic_count,
+            "rawDependencyFindingOccurrences": outcome.dependency_finding_count,
+            "dependencyFindingOccurrences": outcome.exported_dependency_finding_count,
+            "uniqueDependencyAdvisories": outcome.unique_dependency_advisory_count,
+            "aiProviderOrder": outcome.ai_provider_order,
+            "detectorCoverageGaps": outcome.detector_coverage_gaps,
+            "detectorTelemetry": outcome.detector_telemetry,
+            "historicalSecretFindingsOmitted": omitted_historical_secrets,
+            "historicalSecretsIncluded": include_historical_secrets,
+            "historicalSecretExportPolicy": (
+                "INCLUDE_HISTORY" if include_historical_secrets else "CURRENT_TREE_ONLY"
+            ),
+            "scanStartedAt": outcome.scan_started_at,
+            "scanCompletedAt": outcome.scan_completed_at,
+            "repositoryName": outcome.repository_name,
+            "repositoryCommit": outcome.repository_commit,
+            "repositoryBranch": outcome.repository_branch,
+            "repositoryDirty": outcome.repository_dirty,
+            "aiModels": outcome.ai_models,
+            "scanExclusions": outcome.scan_exclusions,
+            "maxTargetBytes": outcome.max_target_bytes,
+        },
+    }
+    if execution_notifications:
+        invocation["toolExecutionNotifications"] = execution_notifications
+    if configuration_notifications:
+        invocation["toolConfigurationNotifications"] = configuration_notifications
 
     return {
         "$schema": SARIF_SCHEMA,
@@ -225,36 +411,23 @@ def build_sarif_payload(outcome: Any) -> dict[str, Any]:
                     }
                 },
                 "automationDetails": {"id": "AegisScan/full-repository-audit"},
-                "invocations": [
-                    {
-                        "executionSuccessful": not outcome.audit_degraded,
-                        "properties": {
-                            "auditDegraded": outcome.audit_degraded,
-                            "aiTriageEnabled": outcome.ai_triage_enabled,
-                            "semgrepRuleMode": outcome.semgrep_rule_mode,
-                            "semgrepRulesSha256": outcome.semgrep_rules_sha256,
-                            "runtimeScanGaps": outcome.runtime_scan_gap_count,
-                            "scannerDiagnosticCount": outcome.scanner_diagnostic_count,
-                            "detectorTelemetry": outcome.detector_telemetry,
-                            "scanStartedAt": outcome.scan_started_at,
-                            "scanCompletedAt": outcome.scan_completed_at,
-                            "repositoryName": outcome.repository_name,
-                            "repositoryCommit": outcome.repository_commit,
-                            "repositoryBranch": outcome.repository_branch,
-                            "repositoryDirty": outcome.repository_dirty,
-                            "aiModels": outcome.ai_models,
-                            "scanExclusions": outcome.scan_exclusions,
-                            "maxTargetBytes": outcome.max_target_bytes,
-                        },
-                    }
-                ],
+                "invocations": [invocation],
                 "results": results,
             }
         ],
     }
 
 
-def write_sarif_report(outcome: Any, output_path: str | Path) -> None:
+def write_sarif_report(
+    outcome: Any,
+    output_path: str | Path,
+    *,
+    include_historical_secrets: bool = False,
+) -> None:
     Path(output_path).write_text(
-        json.dumps(build_sarif_payload(outcome), indent=2), encoding="utf-8"
+        json.dumps(
+            build_sarif_payload(outcome, include_historical_secrets=include_historical_secrets),
+            indent=2,
+        ),
+        encoding="utf-8",
     )

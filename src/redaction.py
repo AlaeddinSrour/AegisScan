@@ -59,6 +59,15 @@ def _entropy(value: str) -> float:
 
 def _redact_quoted_token(match: re.Match[str]) -> str:
     value = match.group("value")
+    if (
+        match.group("quote") == "`"
+        and re.fullmatch(r"[a-z_$][A-Za-z0-9_$]*", value)
+        and (sum(char.isupper() for char in value) >= 2 or "_" in value)
+    ):
+        # Markdown commonly wraps long function/variable names in backticks.
+        # Named-secret and known-token patterns run before this fallback, so
+        # preserving a clearly code-shaped identifier does not bypass them.
+        return match.group(0)
     character_classes = sum(
         (
             any(char.islower() for char in value),
@@ -82,11 +91,15 @@ def redact_text(value: str) -> str:
     redacted = _KNOWN_TOKEN.sub(REDACTED_SECRET, redacted)
     redacted = _JWT.sub(REDACTED_SECRET, redacted)
     redacted = _NAMED_SECRET.sub(
-        lambda match: f"{match.group(1)}{match.group('quote')}{REDACTED_SECRET}{match.group('quote')}",
+        lambda match: (
+            f"{match.group(1)}{match.group('quote')}{REDACTED_SECRET}{match.group('quote')}"
+        ),
         redacted,
     )
     redacted = _HMAC_SECRET.sub(
-        lambda match: f"{match.group(1)}{match.group('quote')}{REDACTED_SECRET}{match.group('quote')}",
+        lambda match: (
+            f"{match.group(1)}{match.group('quote')}{REDACTED_SECRET}{match.group('quote')}"
+        ),
         redacted,
     )
     redacted = _BASIC_AUTH_URL.sub(
@@ -129,8 +142,7 @@ def redact_review_report(report: ReviewReport) -> ReviewReport:
             "analysis_scratchpad": redact_text(report.analysis_scratchpad),
             "issues": [_redact_issue(issue) for issue in report.issues],
             "dispositions": [
-                _redact_disposition(disposition)
-                for disposition in report.dispositions
+                _redact_disposition(disposition) for disposition in report.dispositions
             ],
         }
     )

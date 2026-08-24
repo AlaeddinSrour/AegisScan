@@ -56,52 +56,53 @@ def test_bundled_ssrf_and_toctou_rules_detect_only_vulnerable_fixtures(tmp_path)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     findings = Counter(
-        (Path(item["path"]).name, item["check_id"].split("src.")[-1])
-        for item in payload["results"]
+        (Path(item["path"]).name, item["check_id"].split("src.")[-1]) for item in payload["results"]
     )
 
-    expected_findings = Counter({
-        (
-            "ssrf_toctou_vulnerable.py",
-            "aegisscan.python.user-input-to-network-request",
-        ): 1,
-        (
-            "ssrf_toctou_vulnerable.py",
-            "aegisscan.python.filesystem-check-then-use",
-        ): 2,
-        (
-            "ssrf_toctou_vulnerable.js",
-            "aegisscan.javascript.user-input-to-network-request",
-        ): 1,
-        (
-            "ssrf_toctou_vulnerable.js",
-            "aegisscan.javascript.filesystem-check-then-use",
-        ): 2,
-        (
-            "ssrf_toctou_vulnerable.go",
-            "aegisscan.go.user-input-to-network-request",
-        ): 1,
-        (
-            "ssrf_toctou_vulnerable.go",
-            "aegisscan.go.filesystem-check-then-use",
-        ): 2,
-        (
-            "SsrfToctouVulnerable.java",
-            "aegisscan.java.user-input-to-network-request",
-        ): 1,
-        (
-            "SsrfToctouVulnerable.java",
-            "aegisscan.java.filesystem-check-then-use",
-        ): 2,
-        (
-            "SsrfToctouVulnerable.cs",
-            "aegisscan.csharp.user-input-to-network-request",
-        ): 1,
-        (
-            "SsrfToctouVulnerable.cs",
-            "aegisscan.csharp.filesystem-check-then-use",
-        ): 2,
-    })
+    expected_findings = Counter(
+        {
+            (
+                "ssrf_toctou_vulnerable.py",
+                "aegisscan.python.user-input-to-network-request",
+            ): 1,
+            (
+                "ssrf_toctou_vulnerable.py",
+                "aegisscan.python.filesystem-check-then-use",
+            ): 2,
+            (
+                "ssrf_toctou_vulnerable.js",
+                "aegisscan.javascript.user-input-to-network-request",
+            ): 1,
+            (
+                "ssrf_toctou_vulnerable.js",
+                "aegisscan.javascript.filesystem-check-then-use",
+            ): 2,
+            (
+                "ssrf_toctou_vulnerable.go",
+                "aegisscan.go.user-input-to-network-request",
+            ): 1,
+            (
+                "ssrf_toctou_vulnerable.go",
+                "aegisscan.go.filesystem-check-then-use",
+            ): 2,
+            (
+                "SsrfToctouVulnerable.java",
+                "aegisscan.java.user-input-to-network-request",
+            ): 1,
+            (
+                "SsrfToctouVulnerable.java",
+                "aegisscan.java.filesystem-check-then-use",
+            ): 2,
+            (
+                "SsrfToctouVulnerable.cs",
+                "aegisscan.csharp.user-input-to-network-request",
+            ): 1,
+            (
+                "SsrfToctouVulnerable.cs",
+                "aegisscan.csharp.filesystem-check-then-use",
+            ): 2,
+        }
+    )
     assert findings == expected_findings
     assert len(payload["results"]) == sum(expected_findings.values())
     assert payload["errors"] == []
@@ -175,6 +176,22 @@ def test_juice_shop_regression_floor_covers_high_value_javascript_categories(
             (
                 "juice_shop_regression_vulnerable.ts",
                 "aegisscan.javascript.express-response-xss",
+            ): 1,
+            (
+                "juice_shop_regression_vulnerable.ts",
+                "aegisscan.javascript.express-open-redirect",
+            ): 1,
+            (
+                "juice_shop_regression_vulnerable.ts",
+                "aegisscan.javascript.express-sequelize-taint-sqli",
+            ): 1,
+            (
+                "juice_shop_regression_vulnerable.ts",
+                "aegisscan.javascript.user-input-to-network-request",
+            ): 1,
+            (
+                "juice_shop_regression_vulnerable.ts",
+                "aegisscan.javascript.filesystem-check-then-use",
             ): 1,
         }
     )

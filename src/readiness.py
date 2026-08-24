@@ -66,15 +66,9 @@ def inspect_scanner_readiness(
     gitleaks = _resolve("gitleaks", "GITLEAKS_COMMAND")
     secret_executable = betterleaks or gitleaks
     secret_name = (
-        "Betterleaks"
-        if betterleaks
-        else "Gitleaks fallback"
-        if gitleaks
-        else "Betterleaks"
+        "Betterleaks" if betterleaks else "Gitleaks fallback" if gitleaks else "Betterleaks"
     )
-    secret_version_command = (
-        [secret_executable, "version"] if secret_executable else []
-    )
+    secret_version_command = [secret_executable, "version"] if secret_executable else []
 
     return [
         ScannerStatus(
@@ -83,9 +77,7 @@ def inspect_scanner_readiness(
             available=semgrep is not None,
             required=True,
             executable=semgrep or "",
-            version=_version_text([semgrep, "--version"])
-            if semgrep and include_versions
-            else "",
+            version=_version_text([semgrep, "--version"]) if semgrep and include_versions else "",
             detail=(
                 "Required for repository static analysis."
                 if semgrep
@@ -99,9 +91,7 @@ def inspect_scanner_readiness(
             available=osv is not None,
             required=dependency_enabled,
             executable=osv or "",
-            version=_version_text([osv, "--version"])
-            if osv and include_versions
-            else "",
+            version=_version_text([osv, "--version"]) if osv and include_versions else "",
             detail=(
                 "Enabled dependency advisory scanner."
                 if dependency_enabled

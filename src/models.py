@@ -36,9 +36,7 @@ class ReviewIssue(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    file: str = Field(
-        description="The relative path to the file containing the issue."
-    )
+    file: str = Field(description="The relative path to the file containing the issue.")
     line: int = Field(
         description=(
             "The line number (1-indexed) in the file where the issue is. "
@@ -72,8 +70,8 @@ class ReviewIssue(BaseModel):
     remediation_guidance: str = Field(
         default="",
         description=(
-            "Concrete review and implementation guidance for MANUAL_REQUIRED findings; "
-            "empty for deterministic automatic replacements."
+            "Concrete review, validation, and test guidance. For AUTOMATIC findings, "
+            "describe how to validate the bounded replacement without repeating it."
         ),
     )
     finding_id: str = Field(
@@ -135,9 +133,7 @@ class FindingDisposition(BaseModel):
 
     finding_id: str
     status: FindingStatus
-    reason: str = Field(
-        description="Concise evidence-backed reason for the disposition."
-    )
+    reason: str = Field(description="Concise evidence-backed reason for the disposition.")
     file: str = ""
     line: int = 0
     rule_id: str = ""

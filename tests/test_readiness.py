@@ -14,9 +14,7 @@ def test_readiness_prefers_betterleaks_and_marks_enabled_scanners_required(
         "src.readiness._resolve",
         lambda command, _environment: executables.get(command),
     )
-    monkeypatch.setattr(
-        "src.readiness._version_text", lambda command: f"version:{command[0]}"
-    )
+    monkeypatch.setattr("src.readiness._version_text", lambda command: f"version:{command[0]}")
 
     statuses = inspect_scanner_readiness()
 
@@ -55,9 +53,7 @@ def test_readiness_uses_gitleaks_fallback_and_ignores_disabled_optional_tools(
 
 
 def test_readiness_reports_missing_required_scanners(monkeypatch):
-    monkeypatch.setattr(
-        "src.readiness._resolve", lambda _command, _environment: None
-    )
+    monkeypatch.setattr("src.readiness._resolve", lambda _command, _environment: None)
 
     statuses = inspect_scanner_readiness(include_versions=False)
 

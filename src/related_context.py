@@ -42,9 +42,7 @@ def _imported_symbols(clause: str, source_text: str) -> list[str]:
         alias = namespace.group(1)
         symbols.extend(
             match.group(1)
-            for match in re.finditer(
-                rf"\b{re.escape(alias)}\.([A-Za-z_$][\w$]*)\s*\(", source_text
-            )
+            for match in re.finditer(rf"\b{re.escape(alias)}\.([A-Za-z_$][\w$]*)\s*\(", source_text)
         )
     named = re.search(r"\{([^}]+)\}", clause)
     if named:
