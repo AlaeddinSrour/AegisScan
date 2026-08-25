@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "name": "OWASP IoTGoat firmware detector baseline",
+  "repository": {
+    "url": "https://github.com/OWASP/IoTGoat",
+    "commit": "f67b7f961301d7a56b435fd7cffac73600f0c97b"
+  },
+  "scope": {
+    "include_rule_prefixes": ["aegisscan.firmware.", "aegisscan.openwrt."]
+  },
+  "expected": [
+    {"rule_id": "aegisscan.firmware.insecure-upnp-policy", "path": "OpenWrt/openwrt-18.06.2/files/etc/config/upnpd", "line": 5, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.firmware.open-wireless-network", "path": "OpenWrt/openwrt-18.06.2/files/etc/config/wireless", "line": 10, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.firmware.startup-backdoor", "path": "OpenWrt/openwrt-18.06.2/files/etc/rc.local", "line": 4, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.firmware.insecure-telnet-service", "path": "OpenWrt/openwrt-18.06.2/files/etc/rc.local", "line": 5, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.firmware.weak-md5crypt-password", "path": "OpenWrt/openwrt-18.06.2/files/etc/shadow", "line": 1, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.firmware.weak-md5crypt-password", "path": "OpenWrt/openwrt-18.06.2/files/etc/shadow", "line": 8, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.firmware.lua-command-injection", "path": "OpenWrt/openwrt-18.06.2/files/usr/lib/lua/luci/controller/iotgoat/iotgoat.lua", "line": 14, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.eol-release-18-06", "path": "OpenWrt/openwrt-18.06.2/include/version.mk", "line": 29, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.advisory.cve-2019-5101", "path": "OpenWrt/openwrt-18.06.2/package/libs/ustream-ssl/Makefile", "line": 45, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.advisory.cve-2019-5102", "path": "OpenWrt/openwrt-18.06.2/package/libs/ustream-ssl/Makefile", "line": 45, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.advisory.cve-2019-19945", "path": "OpenWrt/openwrt-18.06.2/package/network/services/uhttpd/Makefile", "line": 35, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.advisory.cve-2020-7248", "path": "OpenWrt/openwrt-18.06.2/package/libs/libubox/Makefile", "line": 26, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.advisory.cve-2020-8597", "path": "OpenWrt/openwrt-18.06.2/package/network/services/ppp/Makefile", "line": 37, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.kernel-advisory.cve-2019-11477", "path": "OpenWrt/openwrt-18.06.2/include/kernel-version.mk", "line": 5, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.kernel-advisory.cve-2019-11478", "path": "OpenWrt/openwrt-18.06.2/include/kernel-version.mk", "line": 5, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.kernel-advisory.cve-2019-11479", "path": "OpenWrt/openwrt-18.06.2/include/kernel-version.mk", "line": 5, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.kernel-advisory.cve-2019-11477", "path": "OpenWrt/openwrt-18.06.2/include/kernel-version.mk", "line": 6, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.kernel-advisory.cve-2019-11478", "path": "OpenWrt/openwrt-18.06.2/include/kernel-version.mk", "line": 6, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.openwrt.kernel-advisory.cve-2019-11479", "path": "OpenWrt/openwrt-18.06.2/include/kernel-version.mk", "line": 6, "status": "CONFIRMED"}
+  ],
+  "gates": {
+    "min_recall": 1.0,
+    "min_precision": 1.0,
+    "max_unexpected": 0,
+    "max_forbidden": 0,
+    "max_unresolved": 0,
+    "max_duplicate_rate": 0.0,
+    "require_complete": true,
+    "require_clean_repository": true,
+    "required_semgrep_rule_mode": "bundled",
+    "max_scanner_diagnostics": 0,
+    "min_inventory_coverage_ratio": 1.0,
+    "expected_kernel_versions": ["4.9.152", "4.14.95"],
+    "min_kernel_advisory_matches": 6
+  }
+}

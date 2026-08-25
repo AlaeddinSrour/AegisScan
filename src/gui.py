@@ -672,6 +672,9 @@ class ScanWorker(QObject):
                 str(self.options["repo_path"]),
                 str(self.options["gemini_api_key"]),
                 openrouter_api_key=str(self.options["openrouter_api_key"]),
+                openrouter_allow_data_collection=bool(
+                    self.options.get("openrouter_allow_data_collection", False)
+                ),
                 ai_provider=str(self.options["ai_provider"]),
                 batch_size=int(self.options["batch_size"]),
                 apply_fixes=bool(self.options["apply_fixes"]),
@@ -1205,8 +1208,18 @@ class NewScanPage(QWidget):
         self.openrouter_api_key_input.setPlaceholderText("Stored only for this app session")
         self.openrouter_api_key_input.textChanged.connect(app.set_openrouter_api_key)
         config_layout.addWidget(self.openrouter_api_key_input)
+        self.openrouter_allow_data_collection = QCheckBox(
+            "Allow OpenRouter providers that may retain prompts"
+        )
+        self.openrouter_allow_data_collection.setChecked(
+            app.openrouter_allow_data_collection
+        )
+        self.openrouter_allow_data_collection.toggled.connect(
+            app.set_openrouter_allow_data_collection
+        )
+        config_layout.addWidget(self.openrouter_allow_data_collection)
         self.ai_privacy_note = label(
-            "Only bounded, locally redacted finding context is sent; credentials remain session-only. OpenRouter requests deny data-collecting routes.",
+            "Only bounded, locally redacted finding context is sent; credentials remain session-only.",
             "Muted",
         )
         config_layout.addWidget(self.ai_privacy_note)
@@ -1364,8 +1377,10 @@ class NewScanPage(QWidget):
         self.api_key_input.setEnabled(enabled)
         self.openrouter_api_key_label.setEnabled(enabled)
         self.openrouter_api_key_input.setEnabled(enabled)
+        self.openrouter_allow_data_collection.setEnabled(enabled)
         self.ai_privacy_note.setText(
-            "Only bounded, locally redacted finding context is sent; credentials remain session-only. OpenRouter requests deny data-collecting routes."
+            "Only bounded, locally redacted finding context is sent; credentials remain "
+            "session-only. Prompt-retaining routes are controlled by the option above."
             if enabled
             else "No repository source or finding context will be sent to an AI provider."
         )
@@ -2217,9 +2232,19 @@ class SettingsPage(QWidget):
         self.openrouter_api_key.setPlaceholderText("Session-only credential")
         self.openrouter_api_key.textChanged.connect(app.set_openrouter_api_key)
         ai_layout.addWidget(self.openrouter_api_key)
+        self.openrouter_allow_data_collection = QCheckBox(
+            "Allow providers that may retain prompts"
+        )
+        self.openrouter_allow_data_collection.setChecked(
+            app.openrouter_allow_data_collection
+        )
+        self.openrouter_allow_data_collection.toggled.connect(
+            app.set_openrouter_allow_data_collection
+        )
+        ai_layout.addWidget(self.openrouter_allow_data_collection)
         ai_layout.addWidget(
             label(
-                "Strict ReviewReport JSON is enforced. OpenRouter routes must deny data collection.",
+                "Strict ReviewReport JSON is enforced. Keep this off for private routing.",
                 "Good",
             )
         )
@@ -2316,6 +2341,7 @@ class SettingsPage(QWidget):
         self.ai_provider.setEnabled(enabled)
         self.api_key.setEnabled(enabled)
         self.openrouter_api_key.setEnabled(enabled)
+        self.openrouter_allow_data_collection.setEnabled(enabled)
         if hasattr(self, "batch"):
             self.batch.setEnabled(enabled)
 
@@ -2327,6 +2353,10 @@ class AegisScanWindow(QMainWindow):
         self.repo_path = str(self.settings.value("repository", os.getcwd()))
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
+        self.openrouter_allow_data_collection = (
+            str(self.settings.value("openrouter_allow_data_collection", "false")).lower()
+            == "true"
+        )
         configured_ai_provider = str(self.settings.value("ai_provider", "auto"))
         self.ai_provider = (
             configured_ai_provider if configured_ai_provider in AI_PROVIDER_MODES else "auto"
@@ -2616,6 +2646,17 @@ class AegisScanWindow(QMainWindow):
         if hasattr(self, "app_settings") and self.sender() is not self.app_settings.ai_provider:
             self.app_settings.sync_ai_provider(value)
 
+    def set_openrouter_allow_data_collection(self, enabled: bool) -> None:
+        self.openrouter_allow_data_collection = enabled
+        self.settings.setValue("openrouter_allow_data_collection", enabled)
+        for page in (
+            getattr(self, "new_scan", None),
+            getattr(self, "app_settings", None),
+        ):
+            checkbox = getattr(page, "openrouter_allow_data_collection", None)
+            if checkbox is not None and checkbox.isChecked() != enabled:
+                checkbox.setChecked(enabled)
+
     def set_ai_triage(self, enabled: bool) -> None:
         self.ai_triage = enabled
         self.settings.setValue("ai_triage", enabled)
@@ -2790,6 +2831,7 @@ class AegisScanWindow(QMainWindow):
             "repo_path": str(repo),
             "gemini_api_key": self.api_key.strip(),
             "openrouter_api_key": self.openrouter_api_key.strip(),
+            "openrouter_allow_data_collection": self.openrouter_allow_data_collection,
             "ai_provider": self.ai_provider,
             "batch_size": self.batch_size,
             "apply_fixes": self.apply_fixes,
@@ -2842,6 +2884,21 @@ class AegisScanWindow(QMainWindow):
             f"{outcome.total_finding_count} detector findings · "
             f"{outcome.batch_count} finding batches"
         )
+        if outcome.secret_scan_enabled:
+            secret_dispositions = sum(
+                item.rule_id.startswith(("betterleaks.", "gitleaks."))
+                for item in outcome.report.dispositions
+            )
+            self.new_scan.append_progress(
+                f"[SECRETS] {outcome.secret_finding_count} raw matches · "
+                f"{secret_dispositions} disposition records · scanner "
+                f"{outcome.secret_scanner or 'unavailable'}"
+            )
+        if outcome.repository_dirty:
+            self.new_scan.append_progress(
+                "[WARNING] The repository had uncommitted or untracked changes; this audit "
+                "cannot be reproduced from the recorded commit alone."
+            )
         if outcome.audit_degraded:
             self.new_scan.append_progress(
                 "[WARNING] Audit coverage was incomplete. Detector failures and untriaged "
@@ -2856,8 +2913,11 @@ class AegisScanWindow(QMainWindow):
             self.global_status.set_status("Audit incomplete", "error")
             history_status = "Needs review"
         else:
+            complete_status = (
+                "Audit complete" if outcome.ai_triage_enabled else "Detector audit complete"
+            )
             self.global_status.set_status(
-                "Audit complete" if outcome.ai_triage_enabled else "Detector audit complete",
+                f"{complete_status} · dirty tree" if outcome.repository_dirty else complete_status,
                 "good",
             )
             history_status = "Completed"

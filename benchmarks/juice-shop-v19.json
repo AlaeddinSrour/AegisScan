@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "name": "OWASP Juice Shop v19 detector and triage baseline",
+  "repository": {
+    "url": "https://github.com/juice-shop/juice-shop",
+    "commit": "5658473cf8814459bf89000ce373b20ed0b4eb37"
+  },
+  "scope": {
+    "include_rule_prefixes": ["aegisscan."]
+  },
+  "expected": [
+    {"rule_id": "aegisscan.javascript.hardcoded-private-key", "path": "lib/insecurity.ts", "line": 21, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.hardcoded-hmac-key", "path": "lib/insecurity.ts", "line": 42, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-id-to-data-access", "path": "routes/basket.ts", "line": 19, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-id-to-data-access", "path": "routes/basketItems.ts", "line": 68, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-sequelize-taint-sqli", "path": "routes/login.ts", "line": 34, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-id-to-data-access", "path": "routes/order.ts", "line": 35, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.user-input-to-network-request", "path": "routes/profileImageUrlUpload.ts", "line": 24, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-open-redirect", "path": "routes/redirect.ts", "line": 18, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-sequelize-taint-sqli", "path": "routes/search.ts", "line": 23, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.filesystem-check-then-use", "path": "routes/vulnCodeFixes.ts", "line": 80, "status": "NEEDS_REVIEW"},
+    {"rule_id": "aegisscan.javascript.express-path-traversal", "path": "routes/vulnCodeFixes.ts", "line": 81, "status": "CONFIRMED"},
+    {"rule_id": "aegisscan.javascript.express-path-traversal", "path": "routes/vulnCodeSnippet.ts", "line": 90, "status": "CONFIRMED"}
+  ],
+  "forbidden": [
+    {"rule_id": "aegisscan.javascript.express-id-to-data-access", "path": "routes/delivery.ts"},
+    {"rule_id": "aegisscan.javascript.express-id-to-data-access", "path": "routes/payment.ts"},
+    {"rule_id": "aegisscan.javascript.express-response-xss", "path": "routes/dataExport.ts"}
+  ],
+  "gates": {
+    "min_recall": 1.0,
+    "min_precision": 1.0,
+    "max_unexpected": 0,
+    "max_forbidden": 0,
+    "max_unresolved": 1,
+    "max_duplicate_rate": 0.0,
+    "require_complete": true
+  }
+}

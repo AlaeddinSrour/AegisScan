@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "name": "OWASP WebGoat Java detector baseline",
+  "repository": {
+    "url": "https://github.com/WebGoat/WebGoat",
+    "commit": "7517acca95d9851da706452454c223dd13545ef4",
+    "target": "src/main/java"
+  },
+  "scope": {
+    "include_rule_prefixes": [
+      "aegisscan.java."
+    ]
+  },
+  "expected": [
+    {
+      "rule_id": "aegisscan.java.user-input-to-network-request",
+      "path": "src/main/java/org/owasp/webgoat/lessons/jwt/claimmisuse/JWTHeaderJKUEndpoint.java",
+      "line": 57
+    }
+  ],
+  "gates": {
+    "min_recall": 1.0,
+    "min_precision": 1.0,
+    "max_unexpected": 0,
+    "max_forbidden": 0,
+    "max_unresolved": 0,
+    "max_duplicate_rate": 0.0,
+    "require_complete": true
+  }
+}

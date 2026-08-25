@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -27,11 +28,17 @@ def test_openrouter_enforces_schema_and_private_provider_routing(post):
     post.return_value = _response(
         {
             "model": "deepseek/deepseek-v4-flash",
+            "provider": "OpenRouter automatic routing",
             "choices": [{"message": {"content": report.model_dump_json()}}],
         }
     )
+    progress = []
 
-    result = call_openrouter_with_failover("sk-or-v1-secret", "audit prompt")
+    result = call_openrouter_with_failover(
+        "sk-or-v1-secret",
+        "audit prompt",
+        progress=progress.append,
+    )
 
     assert result == report
     request = post.call_args
@@ -46,6 +53,23 @@ def test_openrouter_enforces_schema_and_private_provider_routing(post):
     assert body["response_format"]["json_schema"]["strict"] is True
     assert body["temperature"] == 0
     assert body["messages"][0]["content"] == "audit prompt"
+    assert any("via OpenRouter automatic routing" in event for event in progress)
+
+
+@patch("src.openrouter_client.requests.post")
+def test_openrouter_can_explicitly_allow_data_collecting_routes(post):
+    report = ReviewReport(analysis_scratchpad="validated", issues=[])
+    post.return_value = _response(
+        {"choices": [{"message": {"content": report.model_dump_json()}}]}
+    )
+
+    call_openrouter_with_failover(
+        "sk-or-v1-secret",
+        "audit prompt",
+        allow_data_collection=True,
+    )
+
+    assert post.call_args.kwargs["json"]["provider"]["data_collection"] == "allow"
 
 
 @patch("src.openrouter_client.requests.post")
@@ -74,6 +98,30 @@ def test_multi_finding_requests_use_shorter_adaptive_timeout(post):
     assert post.call_args.kwargs["timeout"] == (15, 90)
     assert telemetry["multi_finding_request_attempts"] == 1
     assert "singleton_request_attempts" not in telemetry
+
+
+@patch("src.openrouter_client.requests.post")
+def test_openrouter_records_aggregate_usage_and_cost(post):
+    report = ReviewReport(analysis_scratchpad="validated", issues=[])
+    post.return_value = _response(
+        {
+            "choices": [{"message": {"content": report.model_dump_json()}}],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "cost": 0.0000425,
+            },
+        }
+    )
+    telemetry = {}
+
+    call_openrouter_with_failover("sk-or-v1-secret", "audit prompt", telemetry=telemetry)
+
+    assert telemetry["provider_prompt_tokens"] == 120
+    assert telemetry["provider_completion_tokens"] == 30
+    assert telemetry["provider_total_tokens"] == 150
+    assert telemetry["provider_cost_microusd"] == 42
 
 
 @patch("src.openrouter_client.time.sleep")
@@ -154,6 +202,52 @@ def test_semantically_incomplete_openrouter_report_is_repaired(post, sleep):
     assert telemetry["repaired_responses"] == 1
     assert telemetry["repair_candidates"] == 1
     assert telemetry["semantic_defects_repaired"] == 1
+
+
+@patch("src.openrouter_client.requests.post")
+def test_parseable_deepseek_shape_defects_are_normalized_conservatively(post):
+    candidate_id = "SG-normalized"
+    payload = {
+        "analysis_scratchpad": "validated",
+        "issues": {
+            "file": "app.java",
+            "line": "7",
+            "severity": "high",
+            "issue_name": "Weak hash",
+            "description": "MD5 protects a security value.",
+            "original_code": 'getInstance("MD5")',
+            "suggested_fix": "",
+            "finding_id": candidate_id,
+            "confidence": "high",
+            "code_role": "runtime",
+            "source_evidence": "request password",
+            "sink_evidence": "MD5 digest",
+            "sink_file": "app.java",
+            "sink_line": "7",
+            "reachability_evidence": "direct data flow",
+            "remediation_type": "manual-required",
+            "provider_only_field": "discard me",
+        },
+        "dispositions": {
+            "finding_id": candidate_id,
+            "status": "confirmed",
+            "reason": "Complete evidence.",
+            "confidence": "high",
+        },
+        "provider_only_field": "discard me",
+    }
+    post.return_value = _response(
+        {"choices": [{"message": {"content": f"```json\n{json.dumps(payload)}\n```"}}]}
+    )
+
+    result = call_openrouter_with_failover(
+        "sk-or-v1-secret", f"Candidate ID: {candidate_id}\n"
+    )
+
+    assert result.dispositions[0].status == "CONFIRMED"
+    assert result.issues[0].line == 7
+    assert result.issues[0].remediation_type == "MANUAL_REQUIRED"
+    assert post.call_count == 1
 
 
 @patch("src.openrouter_client.MAX_RETRIES", 1)

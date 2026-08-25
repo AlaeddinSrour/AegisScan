@@ -88,7 +88,7 @@ def test_bundled_ssrf_and_toctou_rules_detect_only_vulnerable_fixtures(tmp_path)
             (
                 "SsrfToctouVulnerable.java",
                 "aegisscan.java.user-input-to-network-request",
-            ): 1,
+            ): 3,
             (
                 "SsrfToctouVulnerable.java",
                 "aegisscan.java.filesystem-check-then-use",

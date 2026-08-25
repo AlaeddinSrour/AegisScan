@@ -45,7 +45,12 @@ from .semgrep_runner import (
     bundled_rules_sha256,
     run_semgrep_scan,
 )
-from .supplemental_scanners import DetectorResult, scan_dependencies, scan_secrets
+from .supplemental_scanners import (
+    DetectorResult,
+    scan_dependencies,
+    scan_firmware,
+    scan_secrets,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -69,6 +74,20 @@ DETERMINISTIC_CREDENTIAL_RULES = {
         "A literal HMAC key is embedded directly in a runtime cryptographic operation.",
         "The embedded key is passed to createHmac at the reported location.",
         "The containing runtime path invokes createHmac with the repository value.",
+    ),
+}
+DETERMINISTIC_MANUAL_REVIEW_RULE_MARKERS = {
+    "java.lang.security.audit.crypto.use-of-md5.use-of-md5": (
+        "A deterministic detector found MD5 usage. Whether it protects security-sensitive "
+        "data requires manual review; AI triage is unnecessary for retaining the evidence."
+    ),
+    "java.lang.security.audit.crypto.weak-random.weak-random": (
+        "A deterministic detector found a non-cryptographic random generator. Its security "
+        "role requires manual review; AI triage is unnecessary for retaining the evidence."
+    ),
+    "java.spring.security.unrestricted-request-mapping.unrestricted-request-mapping": (
+        "A deterministic detector found a Spring request mapping without an explicit HTTP "
+        "method. State-change and CSRF impact require manual review."
     ),
 }
 AI_PROVIDER_MODES = ("auto", "openrouter", "gemini")
@@ -118,6 +137,7 @@ class ScanOutcome:
     ai_attempted_batches: int = 0
     ai_successful_batches: int = 0
     ai_telemetry: dict[str, int] = field(default_factory=dict)
+    firmware_finding_count: int = 0
     dependency_finding_count: int = 0
     secret_finding_count: int = 0
     detector_errors: dict[str, list[str]] = field(default_factory=dict)
@@ -179,7 +199,12 @@ class ScanOutcome:
 
     @property
     def total_finding_count(self) -> int:
-        return self.raw_finding_count + self.dependency_finding_count + self.secret_finding_count
+        return (
+            self.raw_finding_count
+            + self.firmware_finding_count
+            + self.dependency_finding_count
+            + self.secret_finding_count
+        )
 
     @property
     def scanner_diagnostic_count(self) -> int:
@@ -253,6 +278,18 @@ def _git_provenance(root: Path) -> tuple[str, str, bool | None]:
     return commit, branch, bool(status) if status is not None else None
 
 
+def _contains_openwrt_firmware(root: Path) -> bool:
+    """Return whether a versioned OpenWrt tree contains a firmware overlay."""
+    try:
+        return any(
+            files.is_dir()
+            and re.fullmatch(r"openwrt-\d+(?:\.\d+)+(?:[-_][^/]+)?", files.parent.name)
+            for files in root.rglob("files")
+        )
+    except OSError:
+        return False
+
+
 def _pretriage_disposition(candidate: SemgrepCandidate) -> FindingDisposition | None:
     """Resolve candidates that must not depend on model judgment."""
     if not is_runtime_role(candidate.code_role):
@@ -284,6 +321,20 @@ def _pretriage_disposition(candidate: SemgrepCandidate) -> FindingDisposition | 
             message=candidate.message,
             code_role=candidate.code_role,
             confidence="LOW",
+        )
+    deterministic_reason = DETERMINISTIC_MANUAL_REVIEW_RULE_MARKERS.get(candidate.rule_id)
+    if deterministic_reason:
+        return FindingDisposition(
+            finding_id=candidate.finding_id,
+            status="NEEDS_REVIEW",
+            reason=deterministic_reason,
+            file=candidate.file,
+            line=candidate.line,
+            rule_id=candidate.rule_id,
+            message=candidate.message,
+            code_role=candidate.code_role,
+            confidence="MEDIUM",
+            evidence_scope="CURRENT",
         )
     return None
 
@@ -570,6 +621,9 @@ def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
         # An automatic remediation without an actual replacement cannot be
         # applied. Preserve the finding, but represent it honestly as manual.
         remediation_type = "MANUAL_REQUIRED"
+        trusted_manual_guidance = issue.rule_id.startswith(
+            ("aegisscan.firmware.", "aegisscan.openwrt.")
+        ) and bool(issue.remediation_guidance.strip())
         issues.append(
             issue.model_copy(
                 update={
@@ -578,7 +632,11 @@ def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
                     # Manual guidance is also normalized locally. Provider text
                     # may otherwise suggest APIs from the wrong language or an
                     # unsafe boundary check.
-                    "remediation_guidance": _manual_remediation_guidance(issue),
+                    "remediation_guidance": (
+                        issue.remediation_guidance
+                        if trusted_manual_guidance
+                        else _manual_remediation_guidance(issue)
+                    ),
                 }
             )
         )
@@ -591,6 +649,13 @@ def _issue_family(issue: ReviewIssue) -> str:
         # Distinct advisories affecting the same manifest line are independent
         # findings, even when their summaries share a weakness family.
         return f"DEPENDENCY_{issue.rule_id.removeprefix('osv.')}"
+    if issue.rule_id.startswith(
+        ("aegisscan.openwrt.advisory.", "aegisscan.openwrt.kernel-advisory.")
+    ):
+        # Multiple applicable CVEs can point at the same selected package
+        # recipe. They are independent advisories and must not be collapsed
+        # merely because their canonical sink is the same Makefile line.
+        return f"OPENWRT_ADVISORY_{issue.rule_id.rsplit('.', 1)[-1]}"
     evidence = " ".join(
         (issue.issue_name, issue.description, issue.rule_id, issue.sink_evidence)
     ).casefold()
@@ -859,11 +924,43 @@ def _deterministic_credential_issue(
     if not _valid_location(repo_path, candidate.file, candidate.line):
         return None
     severity, issue_name, description, sink_evidence, reachability_evidence = details
+    sink_line = candidate.line
+    if candidate.rule_id == "aegisscan.javascript.hardcoded-private-key":
+        lines, _window = _candidate_source(repo_path, candidate)
+        if lines and candidate.line <= len(lines):
+            declaration = re.search(
+                r"\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)",
+                lines[candidate.line - 1],
+            )
+            if declaration is not None:
+                name = declaration.group("name")
+                usage = re.compile(
+                    rf"\b(?:jwt|jsonwebtoken|jws)\s*\.\s*(?:sign|verify)\s*\("
+                    rf"[^\n]*\b{re.escape(name)}\b",
+                    flags=re.IGNORECASE,
+                )
+                sink_line = next(
+                    (
+                        index
+                        for index, source_line in enumerate(lines, start=1)
+                        if index > candidate.line and usage.search(source_line)
+                    ),
+                    candidate.line,
+                )
+                if sink_line != candidate.line:
+                    sink_evidence = (
+                        f"The embedded private key reaches a JWT signing or verification call "
+                        f"at {candidate.file}:{sink_line}."
+                    )
+                    reachability_evidence = (
+                        "The containing runtime module loads the credential declaration and "
+                        "passes the same variable to the cryptographic operation."
+                    )
     return ReviewIssue(
         file=candidate.file,
         line=candidate.line,
         sink_file=candidate.file,
-        sink_line=candidate.line,
+        sink_line=sink_line,
         severity=severity,
         issue_name=issue_name,
         description=description,
@@ -1103,6 +1200,187 @@ def _deterministic_javascript_ssrf_issue(
     )
 
 
+def _local_javascript_module(
+    repo_path: Path,
+    source_file: str,
+    namespace: str,
+    source: str,
+) -> Path | None:
+    """Resolve a namespace import without searching outside the repository."""
+    match = re.search(
+        rf"\bimport\s+\*\s+as\s+{re.escape(namespace)}\s+from\s+['\"](?P<path>[^'\"]+)['\"]",
+        source,
+    )
+    if match is None or not match.group("path").startswith("."):
+        return None
+    root = repo_path.resolve()
+    base = (root / source_file).parent / match.group("path")
+    for candidate in (
+        base,
+        *(Path(f"{base}{suffix}") for suffix in (".ts", ".js", ".tsx", ".jsx")),
+    ):
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _bypassable_redirect_guard_proven(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+    lines: list[str],
+    target: str,
+) -> tuple[bool, str]:
+    """Prove that a redirect guard uses unsafe substring or prefix matching."""
+    preceding = "\n".join(lines[max(0, candidate.line - 40) : candidate.line - 1])
+    guard = re.search(
+        rf"\bif\s*\(\s*(?:(?P<namespace>[A-Za-z_$][\w$]*)\s*\.\s*)?"
+        rf"(?P<function>[A-Za-z_$][\w$]*)\s*\(\s*{re.escape(target)}\s*\)\s*\)",
+        preceding,
+    )
+    if guard is None:
+        return False, ""
+
+    source_path = repo_path / candidate.file
+    policy_source = "\n".join(lines)
+    namespace = guard.group("namespace")
+    if namespace:
+        imported = _local_javascript_module(
+            repo_path,
+            candidate.file,
+            namespace,
+            policy_source,
+        )
+        if imported is None:
+            return False, ""
+        try:
+            policy_source = imported.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False, ""
+        source_path = imported
+
+    function_name = guard.group("function")
+    definition = re.search(
+        rf"(?:\bfunction\s+{re.escape(function_name)}\s*\((?P<function_params>[^)]*)\)|"
+        rf"\b(?:const|let|var)\s+{re.escape(function_name)}\s*=\s*"
+        rf"\((?P<arrow_params>[^)]*)\)\s*=>)\s*\{{",
+        policy_source,
+    )
+    if definition is None:
+        return False, ""
+    body = policy_source[definition.end() : definition.end() + 2000]
+    params = definition.group("function_params") or definition.group("arrow_params") or ""
+    url_parameter = params.split(",", 1)[0].split(":", 1)[0].strip()
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", url_parameter):
+        return False, ""
+    unsafe_comparison = re.search(
+        rf"\b{re.escape(url_parameter)}\s*\.\s*"
+        r"(?P<comparison>includes|startsWith)\s*\(\s*[A-Za-z_$][\w$]*\s*\)",
+        body,
+    )
+    if unsafe_comparison is None:
+        return False, ""
+    try:
+        policy_file = str(source_path.resolve().relative_to(repo_path.resolve()))
+    except ValueError:
+        return False, ""
+    return (
+        True,
+        f"{policy_file} uses {unsafe_comparison.group('comparison')}() for URL allowlisting",
+    )
+
+
+def _deterministic_javascript_open_redirect_issue(
+    repo_path: Path,
+    candidate: SemgrepCandidate,
+) -> ReviewIssue | None:
+    """Confirm a request-derived Express redirect with no effective URL boundary."""
+    if candidate.rule_id != "aegisscan.javascript.express-open-redirect":
+        return None
+    lines, _window = _candidate_source(repo_path, candidate)
+    if not lines or candidate.line < 1 or candidate.line > len(lines):
+        return None
+    sink_line = lines[candidate.line - 1]
+    sink = re.search(
+        r"\.\s*redirect\s*\(\s*(?P<target>[A-Za-z_$][\w$]*)\s*\)",
+        sink_line,
+        flags=re.IGNORECASE,
+    )
+    if sink is None:
+        return None
+    target = sink.group("target")
+    preceding = "\n".join(lines[max(0, candidate.line - 40) : candidate.line - 1])
+    assignment = re.search(
+        rf"\b(?:const|let|var)\s+{re.escape(target)}(?:\s*:\s*[^=\n]+)?\s*=\s*"
+        r"(?P<object>req(?:uest)?\s*\.\s*)?(?P<source>body|query|params)"
+        r"(?:\s*\.|\s*\[)",
+        preceding,
+        flags=re.IGNORECASE,
+    )
+    if assignment is None:
+        return None
+    # Bare `query.foo`/`body.foo`/`params.foo` is request-controlled only when
+    # the handler destructures that property from an Express Request.
+    if (
+        assignment.group("object") is None
+        and re.search(
+            rf"\{{[^}}]*\b{re.escape(assignment.group('source'))}\b[^}}]*\}}\s*:\s*Request\b",
+            preceding,
+            flags=re.IGNORECASE,
+        )
+        is None
+    ):
+        return None
+
+    guard_calls = re.findall(
+        rf"\bif\s*\(\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)?"
+        rf"[A-Za-z_$][\w$]*\s*\(\s*{re.escape(target)}\s*\)\s*\)",
+        preceding,
+    )
+    bypassable, policy_evidence = _bypassable_redirect_guard_proven(
+        repo_path, candidate, lines, target
+    )
+    if guard_calls and not bypassable:
+        # A real guard exists, but local evidence does not prove that it is
+        # ineffective. Keep the candidate in contextual review.
+        return None
+
+    location = f"{candidate.file}:{candidate.line}"
+    return ReviewIssue(
+        file=candidate.file,
+        line=candidate.line,
+        sink_file=candidate.file,
+        sink_line=candidate.line,
+        severity="HIGH",
+        issue_name="Open Redirect",
+        description=(
+            "Express request data controls an HTTP redirect without a locally proven exact "
+            "destination or repository-owned relative-path boundary."
+        ),
+        original_code="",
+        suggested_fix="",
+        finding_id=candidate.finding_id,
+        rule_id=candidate.rule_id,
+        confidence="HIGH",
+        code_role=candidate.code_role,
+        source_evidence=(
+            f"The bundled taint rule traced Express {assignment.group('source')} data to "
+            f"the redirect target at {location}."
+        ),
+        sink_evidence=f"Express res.redirect consumes the request-derived target at {location}.",
+        reachability_evidence=(
+            f"The route reaches the redirect with no destination guard."
+            if not guard_calls
+            else f"The route guard is bypassable because {policy_evidence}."
+        ),
+        remediation_type="MANUAL_REQUIRED",
+    )
+
+
 def _has_local_ownership_denial(lines: list[str], candidate_line: int) -> bool:
     """Recognize an explicit post-lookup owner check that denies access."""
     following = "\n".join(lines[candidate_line : candidate_line + 24])
@@ -1200,6 +1478,7 @@ def _deterministic_runtime_issue(
     return (
         _deterministic_credential_issue(repo_path, candidate)
         or _deterministic_javascript_ssrf_issue(repo_path, candidate)
+        or _deterministic_javascript_open_redirect_issue(repo_path, candidate)
         or _deterministic_basket_idor_issue(repo_path, candidate)
     )
 
@@ -1638,6 +1917,14 @@ def _reconcile_batch_report(
             matches = by_location.get((issue.file, issue.line), [])
             candidate = matches[0] if len(matches) == 1 else None
         if candidate is None:
+            continue
+        # Purpose-built bundled credential rules establish the declaration
+        # locally and redact its value. Provider prose may enrich the context,
+        # but must not move the primary finding away from that stable source.
+        if (
+            candidate.finding_id in deterministic_issues
+            and candidate.rule_id in DETERMINISTIC_CREDENTIAL_RULES
+        ):
             continue
         remediation_type = (
             "MANUAL_REQUIRED"
@@ -2305,6 +2592,7 @@ def _call_ai_provider_chain(
     *,
     prompt: str,
     openrouter_api_key: str,
+    openrouter_allow_data_collection: bool,
     gemini_client: genai.Client | None,
     progress: Callable[[str], None],
     allow_semantic_repair: bool = True,
@@ -2317,6 +2605,7 @@ def _call_ai_provider_chain(
                 openrouter_api_key,
                 prompt,
                 progress=progress,
+                allow_data_collection=openrouter_allow_data_collection,
                 allow_semantic_repair=allow_semantic_repair,
                 telemetry=telemetry,
             )
@@ -2332,6 +2621,7 @@ def _call_ai_provider_chain(
                     openrouter_api_key,
                     prompt,
                     progress=progress,
+                    allow_data_collection=openrouter_allow_data_collection,
                     allow_semantic_repair=allow_semantic_repair,
                     telemetry=telemetry,
                 )
@@ -2356,6 +2646,7 @@ def run_full_scan(
     gemini_api_key: str,
     *,
     openrouter_api_key: str = "",
+    openrouter_allow_data_collection: bool = False,
     ai_provider: str = "auto",
     batch_size: int = DEFAULT_BATCH_SIZE,
     apply_fixes: bool = False,
@@ -2420,6 +2711,17 @@ def run_full_scan(
         if pattern.strip()
     )
     repository_commit, repository_branch, repository_dirty = _git_provenance(root)
+    if repository_dirty:
+        notify(
+            "[WARNING] Repository has uncommitted or untracked changes; results describe "
+            "the working tree and are not reproducible from the recorded commit alone"
+        )
+    if semgrep_rule_mode == "extended" and _contains_openwrt_firmware(root):
+        semgrep_rule_mode = "bundled"
+        notify(
+            "[SETUP] Versioned OpenWrt firmware detected · using bundled Semgrep rules "
+            "to avoid irrelevant SDK parser diagnostics"
+        )
     notify(
         "[SETUP] Semgrep exclusions: "
         + (", ".join(configured_excludes) if configured_excludes else "none")
@@ -2463,6 +2765,26 @@ def run_full_scan(
         )
 
     supplemental_results: list[DetectorResult] = []
+    notify("[FIRMWARE] Starting OpenWrt firmware overlay security scan")
+    firmware_started = monotonic()
+    try:
+        firmware_result = scan_firmware(str(root), max_target_bytes=max_target_bytes)
+    except Exception as exc:  # Keep an auditable degraded result on detector failure.
+        firmware_result = DetectorResult(
+            detector="firmware",
+            errors=[
+                "Firmware detector failed unexpectedly: "
+                f"{' '.join(str(exc).split())[:500]}"
+            ],
+        )
+    supplemental_results.append(firmware_result)
+    notify(
+        f"[FIRMWARE] Completed in {monotonic() - firmware_started:.1f}s · "
+        f"{firmware_result.finding_count} high-confidence finding(s)"
+    )
+    for error in firmware_result.errors:
+        notify(f"[WARNING] {error}")
+
     if dependency_scan:
         notify("[DEPENDENCIES] Starting OSV dependency vulnerability scan")
         dependency_started = monotonic()
@@ -2607,6 +2929,7 @@ def run_full_scan(
                         provider_order,
                         prompt=strict_prompt,
                         openrouter_api_key=openrouter_api_key,
+                        openrouter_allow_data_collection=openrouter_allow_data_collection,
                         gemini_client=gemini_client,
                         progress=notify,
                         allow_semantic_repair=False,
@@ -2656,7 +2979,7 @@ def run_full_scan(
         if not triage_findings:
             deterministic = ReviewReport(
                 analysis_scratchpad=(
-                    "Deterministic scope and scan-completeness policy resolved this "
+                    "Deterministic scope and manual-review policy resolved this "
                     "batch without sending source context to the AI provider."
                 ),
                 issues=[],
@@ -2665,7 +2988,7 @@ def run_full_scan(
             reports.append((index, deterministic))
             notify(
                 f"[SCOPE] Batch {index}/{len(batches)} contains only deterministic "
-                "non-runtime or incomplete-scan evidence; AI triage was skipped"
+                "scope, scan-gap, or manual-review evidence; AI triage was skipped"
             )
             notify(f"[BATCH {index}/{len(batches)}] Complete in {monotonic() - batch_started:.1f}s")
             continue
@@ -2743,6 +3066,7 @@ def run_full_scan(
                     provider_order,
                     prompt=prompt,
                     openrouter_api_key=openrouter_api_key,
+                    openrouter_allow_data_collection=openrouter_allow_data_collection,
                     gemini_client=gemini_client,
                     progress=notify,
                     telemetry=ai_telemetry,
@@ -2786,6 +3110,7 @@ def run_full_scan(
                             provider_order,
                             prompt=recovery_prompt,
                             openrouter_api_key=openrouter_api_key,
+                            openrouter_allow_data_collection=openrouter_allow_data_collection,
                             gemini_client=gemini_client,
                             progress=notify,
                             telemetry=ai_telemetry,
@@ -2999,6 +3324,10 @@ def run_full_scan(
         ai_attempted_batches=attempted_ai_batches,
         ai_successful_batches=successful_ai_batches,
         ai_telemetry=ai_telemetry,
+        firmware_finding_count=next(
+            (result.finding_count for result in supplemental_results if result.detector == "firmware"),
+            0,
+        ),
         dependency_finding_count=next(
             (result.finding_count for result in supplemental_results if result.detector == "osv"),
             0,
@@ -3128,6 +3457,11 @@ def main() -> None:
         default="auto",
         help="AI provider selection; auto prefers OpenRouter and falls back to Gemini",
     )
+    parser.add_argument(
+        "--openrouter-allow-data-collection",
+        action="store_true",
+        help="Allow OpenRouter providers that may retain or use request data",
+    )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-target-bytes", type=int, default=DEFAULT_MAX_TARGET_BYTES)
     parser.add_argument(
@@ -3173,6 +3507,7 @@ def main() -> None:
             args.repo,
             args.api_key,
             openrouter_api_key=args.openrouter_api_key,
+            openrouter_allow_data_collection=args.openrouter_allow_data_collection,
             ai_provider=args.ai_provider,
             batch_size=args.batch_size,
             dependency_scan=not args.no_dependency_scan,

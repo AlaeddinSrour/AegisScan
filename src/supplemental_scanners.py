@@ -9,12 +9,19 @@ import re
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import FindingDisposition, ReviewIssue
-from .scope import classify_code_role, load_ignore_patterns
+from .openwrt_advisories import (
+    CATALOG_VERSION,
+    OPENWRT_ADVISORIES,
+    OPENWRT_EOL_SERIES,
+    OPENWRT_KERNEL_ADVISORIES,
+)
+from .scope import OPENWRT_RELEASE_DIRECTORY, classify_code_role, load_ignore_patterns
 
 
 OSV_TIMEOUT_SECONDS = int(os.environ.get("AEGISSCAN_OSV_TIMEOUT", "300"))
@@ -57,6 +64,7 @@ _DEPENDENCY_MANIFEST_NAMES = {
     "gemfile.lock",
     "composer.lock",
     "packages.lock.json",
+    "pom.xml",
 }
 _DEPENDENCY_DESCRIPTOR_NAMES = {
     "package.json",
@@ -114,7 +122,10 @@ def _manifest_package_count(path: Path) -> int | None:
                 for section in ("packages", "packages-dev")
                 if isinstance(payload, dict) and isinstance(payload.get(section), list)
             )
-    except (json.JSONDecodeError, TypeError, ValueError):
+        if name == "pom.xml":
+            root = ET.fromstring(text)
+            return sum(element.tag.rsplit("}", 1)[-1] == "dependency" for element in root.iter())
+    except (ET.ParseError, json.JSONDecodeError, TypeError, ValueError):
         return None
     if name in {"poetry.lock", "cargo.lock"}:
         return len(re.findall(r"(?m)^\[\[package\]\]\s*$", text))
@@ -191,6 +202,10 @@ def _dependency_inventory(root: Path) -> DependencyInventory:
         "cargo.toml": {"cargo.lock"},
         "gemfile": {"gemfile.lock"},
         "composer.json": {"composer.lock"},
+        # OSV-Scanner V2 resolves Maven dependency versions directly while
+        # recursively scanning the source tree; no generated build artifact is
+        # required, and project build plugins remain unexecuted.
+        "pom.xml": {"pom.xml"},
     }
     uncovered: list[str] = []
     for relative, normalized, directory in descriptor_entries:
@@ -233,6 +248,814 @@ def _finding_id(prefix: str, *parts: object) -> str:
         "\0".join(str(part) for part in parts).encode("utf-8", errors="replace")
     ).hexdigest()[:12]
     return f"{prefix}-{digest}"
+
+
+def _openwrt_runtime_overlays(root: Path) -> list[Path]:
+    """Locate versioned OpenWrt root-filesystem overlays without walking SDK trees."""
+    overlays: list[Path] = []
+    for directory, child_directories, _files in os.walk(root):
+        directory_path = Path(directory)
+        for child in tuple(child_directories):
+            if not OPENWRT_RELEASE_DIRECTORY.match(child.casefold()):
+                continue
+            release = directory_path / child
+            overlay = release / "files"
+            if overlay.is_dir():
+                overlays.append(overlay)
+                child_directories.remove(child)
+    return sorted(overlays)
+
+
+def _line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, max(0, offset)) + 1
+
+
+def _append_firmware_finding(
+    result: DetectorResult,
+    *,
+    relative_file: str,
+    line: int,
+    rule_id: str,
+    severity: str,
+    issue_name: str,
+    description: str,
+    original_code: str,
+    source_evidence: str,
+    sink_evidence: str,
+    reachability_evidence: str,
+    guidance: str,
+    reason: str = (
+        "A deterministic firmware rule matched a concrete insecure source, sink, "
+        "service, credential format, or deployed configuration."
+    ),
+) -> None:
+    finding_id = _finding_id("FIRMWARE", rule_id, relative_file, line)
+    result.issues.append(
+        ReviewIssue(
+            file=relative_file,
+            line=line,
+            severity=severity,
+            issue_name=issue_name,
+            description=description,
+            original_code=original_code,
+            suggested_fix="",
+            remediation_guidance=guidance,
+            finding_id=finding_id,
+            rule_id=rule_id,
+            confidence="HIGH",
+            code_role="RUNTIME",
+            source_evidence=source_evidence,
+            sink_evidence=sink_evidence,
+            sink_file=relative_file,
+            sink_line=line,
+            reachability_evidence=reachability_evidence,
+            remediation_type="MANUAL_REQUIRED",
+        )
+    )
+    result.dispositions.append(
+        FindingDisposition(
+            finding_id=finding_id,
+            status="CONFIRMED",
+            reason=reason,
+            file=relative_file,
+            line=line,
+            rule_id=rule_id,
+            message=description,
+            code_role="RUNTIME",
+            confidence="HIGH",
+            evidence_scope="CURRENT",
+        )
+    )
+
+
+def _release_version(value: str) -> tuple[int, ...]:
+    match = re.search(r"\d+(?:\.\d+)+", value)
+    return tuple(int(part) for part in match.group(0).split(".")) if match else ()
+
+
+def _openwrt_release_version(release: Path) -> tuple[str, str, int]:
+    version_file = release / "include/version.mk"
+    try:
+        text = version_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    match = re.search(
+        r"(?m)^VERSION_NUMBER.*?,(\d+(?:\.\d+)+)\)\s*$",
+        text,
+    )
+    version = match.group(1).strip() if match else release.name.removeprefix("openwrt-")
+    line = _line_number(text, match.start()) if match else 1
+    return version, version_file.as_posix(), line
+
+
+def _openwrt_selected_packages(release: Path) -> tuple[set[str], list[str]]:
+    selected: set[str] = set()
+    profiles: list[str] = []
+    for config in sorted(release.glob(".config*")):
+        if not config.is_file():
+            continue
+        try:
+            text = config.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        profiles.append(config.name)
+        selected.update(
+            match.group(1)
+            for match in re.finditer(r"(?m)^CONFIG_PACKAGE_([^=]+)=[ym]\s*$", text)
+        )
+    return selected, profiles
+
+
+def _openwrt_kernel_inventory(
+    release: Path, root: Path, profiles: list[str]
+) -> list[dict[str, object]]:
+    patch_series: set[str] = set()
+    for profile in profiles:
+        try:
+            text = (release / profile).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        patch_series.update(
+            f"{match.group(1)}.{match.group(2)}"
+            for match in re.finditer(r"(?m)^CONFIG_LINUX_(\d+)_(\d+)=y\s*$", text)
+        )
+    try:
+        versions_text = (release / "include/kernel-version.mk").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        versions_text = ""
+    version_file = release / "include/kernel-version.mk"
+    versions: list[dict[str, object]] = []
+    for series in sorted(patch_series, key=_release_version):
+        match = re.search(
+            rf"(?m)^LINUX_VERSION-{re.escape(series)}\s*=\s*\.?(\d+(?:\.\d+)*)\s*$",
+            versions_text,
+        )
+        versions.append(
+            {
+                "series": series,
+                "version": f"{series}.{match.group(1)}" if match else series,
+                "file": version_file.relative_to(root).as_posix(),
+                "line": _line_number(versions_text, match.start()) if match else 1,
+            }
+        )
+    return versions
+
+
+def _openwrt_feed_inventory(release: Path) -> list[dict[str, object]]:
+    declarations: list[dict[str, object]] = []
+    config = release / "feeds.conf.default"
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return declarations
+    for match in re.finditer(
+        r"(?m)^src-git(?:-full)?\s+(?P<name>\S+)\s+(?P<url>\S+?)(?:\^(?P<commit>[0-9a-f]{7,40}))?\s*$",
+        text,
+    ):
+        name = match.group("name")
+        declarations.append(
+            {
+                "name": name,
+                "url": match.group("url"),
+                "commit": match.group("commit") or "unpinned",
+                "available": (release / "feeds" / name).is_dir(),
+                "file": config.as_posix(),
+                "line": _line_number(text, match.start()),
+            }
+        )
+    return declarations
+
+
+def _openwrt_feed_package_references(
+    *,
+    root: Path,
+    unresolved: list[str],
+    feeds: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Resolve selected feed packages to immutable feed revisions when source is absent."""
+    by_name = {str(feed["name"]): feed for feed in feeds}
+    references: dict[str, dict[str, object]] = {}
+    for package in unresolved:
+        feed_name = ""
+        if package.startswith(("luci", "libluci")):
+            feed_name = "luci"
+        elif package in {"miniupnpd", "rpcd-mod-rrdns"}:
+            feed_name = "packages"
+        feed = by_name.get(feed_name)
+        if not feed or str(feed.get("commit", "")) == "unpinned":
+            continue
+        feed_file = Path(str(feed["file"]))
+        references[package] = {
+            "package": package,
+            "source_package": package,
+            "version": f"feed-{str(feed['commit'])[:12]}",
+            "version_basis": "pinned-feed-commit",
+            "package_version_resolved": False,
+            "component_type": "feed-reference",
+            "feed": feed_name,
+            "feed_url": str(feed["url"]),
+            "file": feed_file.relative_to(root).as_posix(),
+            "line": int(feed["line"]),
+        }
+    return references
+
+
+def _openwrt_package_inventory(
+    release: Path,
+    root: Path,
+    selected: set[str],
+    max_target_bytes: int,
+    kernel_versions: list[str],
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    inventory: dict[str, dict[str, object]] = {}
+    scan_roots = [path for path in (release / "package", release / "feeds") if path.is_dir()]
+    if not scan_roots:
+        return inventory, sorted(selected)
+    recipe_files: set[Path] = set()
+    for scan_root in scan_roots:
+        recipe_files.update(
+            path
+            for path in scan_root.rglob("*")
+            if path.is_file() and (path.name == "Makefile" or path.suffix == ".mk")
+        )
+    recipe_files.update(
+        path
+        for path in (release / "target/linux").glob("*/modules.mk")
+        if path.is_file()
+    )
+
+    metadata_cache: dict[Path, tuple[str, str]] = {}
+
+    def metadata(recipe: Path, text: str) -> tuple[str, str]:
+        source_name_match = re.search(r"(?m)^PKG_NAME\s*:?=\s*([^\s#]+)", text)
+        version_match = re.search(r"(?m)^PKG_VERSION\s*:?=\s*([^\s#]+)", text)
+        source_date_match = re.search(r"(?m)^PKG_SOURCE_DATE\s*:?=\s*([^\s#]+)", text)
+        source_revision_match = re.search(
+            r"(?m)^PKG_SOURCE_VERSION\s*:?=\s*([^\s#]+)", text
+        )
+        source_name = source_name_match.group(1) if source_name_match else ""
+        raw_version = version_match.group(1) if version_match else ""
+        if not raw_version or "$" in raw_version:
+            date = source_date_match.group(1) if source_date_match else ""
+            revision = source_revision_match.group(1) if source_revision_match else ""
+            raw_version = date or (
+                f"git-{revision[:12]}" if revision and "$" not in revision else ""
+            )
+        if source_name and raw_version:
+            return source_name, raw_version
+        for parent in recipe.parents:
+            if parent == release.parent:
+                break
+            parent_makefile = parent / "Makefile"
+            if parent_makefile == recipe or not parent_makefile.is_file():
+                continue
+            if parent_makefile not in metadata_cache:
+                try:
+                    parent_text = parent_makefile.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    metadata_cache[parent_makefile] = ("", "")
+                else:
+                    metadata_cache[parent_makefile] = metadata(parent_makefile, parent_text)
+            inherited_name, inherited_version = metadata_cache[parent_makefile]
+            return source_name or inherited_name, raw_version or inherited_version
+        return source_name, raw_version
+
+    for recipe in sorted(recipe_files):
+        try:
+            if recipe.stat().st_size > max(1, int(max_target_bytes)):
+                continue
+            text = recipe.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        defined = set(
+            re.findall(r"(?m)^define\s+Package/([^/\s]+)(?:/[^\s]+)?\s*$", text)
+        )
+        kernel_defined = {
+            f"kmod-{name}"
+            for name in re.findall(
+                r"(?m)^define\s+KernelPackage/([^/\s]+)(?:/[^\s]+)?\s*$", text
+            )
+        }
+        defined.update(kernel_defined)
+        matched = sorted(defined & selected)
+        if not matched:
+            continue
+        source_name, raw_version = metadata(recipe, text)
+        relative = recipe.relative_to(root).as_posix()
+        for package in matched:
+            is_kernel = package in kernel_defined
+            definition_name = package.removeprefix("kmod-") if is_kernel else package
+            definition_kind = "KernelPackage" if is_kernel else "Package"
+            definition = re.search(
+                rf"(?m)^define\s+{definition_kind}/{re.escape(definition_name)}\s*$",
+                text,
+            ) or re.search(
+                rf"(?m)^define\s+{definition_kind}/{re.escape(definition_name)}/[^\s]+\s*$",
+                text,
+            )
+            inventory[package] = {
+                "package": package,
+                "source_package": "linux-kernel" if is_kernel else source_name or package,
+                "version": (
+                    ",".join(kernel_versions)
+                    if is_kernel and kernel_versions
+                    else raw_version or "unresolved"
+                ),
+                "component_type": "kernel-module" if is_kernel else "package",
+                "version_basis": "kernel-version" if is_kernel else "package-recipe",
+                "package_version_resolved": bool(raw_version) or is_kernel,
+                "file": relative,
+                "line": _line_number(text, definition.start()) if definition else 1,
+            }
+    return inventory, sorted(selected - inventory.keys())
+
+
+def _append_openwrt_advisories(
+    result: DetectorResult,
+    *,
+    root: Path,
+    release: Path,
+    selected: set[str],
+    inventory: dict[str, dict[str, object]],
+    record: object,
+) -> int:
+    version, absolute_version_file, version_line = _openwrt_release_version(release)
+    version_tuple = _release_version(version)
+    relative_version_file = Path(absolute_version_file).relative_to(root).as_posix()
+    matched = 0
+
+    for eol in OPENWRT_EOL_SERIES:
+        series = str(eol["series"])
+        if version != series and not version.startswith(series + "."):
+            continue
+        record(  # type: ignore[operator]
+            relative_file=relative_version_file,
+            line=version_line,
+            rule_id=f"aegisscan.openwrt.eol-release-{series.replace('.', '-')}",
+            severity="HIGH",
+            issue_name=f"Unsupported OpenWrt {series} firmware base",
+            description=(
+                f"The firmware is based on OpenWrt {version}, an end-of-life release series "
+                "that no longer receives security fixes."
+            ),
+            original_code=f"VERSION_NUMBER={version}",
+            source_evidence=f"include/version.mk resolves the firmware base to {version}.",
+            sink_evidence="The selected firmware packages are built on an unsupported base release.",
+            reachability_evidence=(
+                "The release metadata and root-filesystem overlay belong to the same versioned "
+                "OpenWrt build tree."
+            ),
+            guidance=(
+                "Rebase the firmware onto a currently supported OpenWrt release, rebuild the "
+                "complete image, and rerun device-specific functional and security tests."
+            ),
+            reason=f"Official OpenWrt support guidance marks the {series} release series as EOL.",
+        )
+        matched += 1
+
+    for advisory in OPENWRT_ADVISORIES:
+        lower = _release_version(str(advisory["affected_from"]))
+        upper = _release_version(str(advisory["fixed_in"]))
+        if not version_tuple or not (lower <= version_tuple < upper):
+            continue
+        packages = tuple(str(value) for value in advisory["packages"])
+        deployed = next((package for package in packages if package in selected), "")
+        if not deployed:
+            continue
+        component = inventory.get(deployed, {})
+        relative_file = str(component.get("file") or relative_version_file)
+        line = int(component.get("line") or version_line)
+        component_version = str(component.get("version") or "unresolved")
+        cve = str(advisory["cve"])
+        fixed_in = str(advisory["fixed_in"])
+        record(  # type: ignore[operator]
+            relative_file=relative_file,
+            line=line,
+            rule_id=f"aegisscan.openwrt.advisory.{cve.casefold()}",
+            severity=str(advisory["severity"]),
+            issue_name=f"Selected OpenWrt component affected by {cve}",
+            description=(
+                f"OpenWrt {version} selects {deployed} ({component_version}); the official "
+                f"advisory marks this release range as affected by {cve}. "
+                f"{advisory['summary']}"
+            ),
+            original_code=f"CONFIG_PACKAGE_{deployed}=y",
+            source_evidence=(
+                f"A committed OpenWrt build profile selects {deployed}; its source recipe "
+                f"reports version {component_version}."
+            ),
+            sink_evidence=(
+                f"The official OpenWrt advisory lists releases before {fixed_in} as affected."
+            ),
+            reachability_evidence=(
+                f"The selected component is included in the OpenWrt {version} firmware build."
+            ),
+            guidance=(
+                f"Upgrade the firmware base to OpenWrt {fixed_in} or later with the official "
+                "fix, rebuild the image, and validate the affected network service. Prefer a "
+                "currently supported release rather than the minimum historical fix."
+            ),
+            reason=(
+                f"Selected-package evidence and the official OpenWrt affected release range "
+                f"both match {cve}."
+            ),
+        )
+        matched += 1
+    return matched
+
+
+def _append_openwrt_kernel_advisories(
+    *, kernel_inventory: list[dict[str, object]], record: object
+) -> int:
+    matched = 0
+    for kernel in kernel_inventory:
+        series = str(kernel["series"])
+        version = str(kernel["version"])
+        version_tuple = _release_version(version)
+        if not version_tuple:
+            continue
+        for advisory in OPENWRT_KERNEL_ADVISORIES:
+            fixed_versions = advisory["fixed_versions"]
+            if not isinstance(fixed_versions, dict) or series not in fixed_versions:
+                continue
+            fixed_version = str(fixed_versions[series])
+            if version_tuple >= _release_version(fixed_version):
+                continue
+            cve = str(advisory["cve"])
+            record(  # type: ignore[operator]
+                relative_file=str(kernel["file"]),
+                line=int(kernel["line"]),
+                rule_id=f"aegisscan.openwrt.kernel-advisory.{cve.casefold()}",
+                severity=str(advisory["severity"]),
+                issue_name=f"Selected OpenWrt kernel affected by {cve}",
+                description=(
+                    f"The firmware selects Linux {version}; OpenWrt fixed {cve} for the "
+                    f"{series} series in {fixed_version}. {advisory['summary']}"
+                ),
+                original_code=f"LINUX_VERSION-{series} = {version.removeprefix(series)}",
+                source_evidence=(
+                    f"The committed OpenWrt kernel metadata resolves the selected "
+                    f"{series} series to Linux {version}."
+                ),
+                sink_evidence=(
+                    f"The official OpenWrt security changelog identifies {fixed_version} "
+                    f"as the fixed {series} kernel version."
+                ),
+                reachability_evidence=(
+                    "The affected TCP implementation is part of the selected firmware kernel; "
+                    "the issue is remotely reachable when TCP networking is exposed."
+                ),
+                guidance=(
+                    f"Upgrade this target to Linux {fixed_version} or later through a supported "
+                    "OpenWrt release, rebuild the image, and validate network stability under "
+                    "malformed TCP SACK traffic."
+                ),
+                reason=(
+                    f"The selected Linux {version} version is below OpenWrt's documented "
+                    f"{fixed_version} fix boundary for {cve}."
+                ),
+            )
+            matched += 1
+    return matched
+
+
+def scan_firmware(repo_path: str, max_target_bytes: int = 1_000_000) -> DetectorResult:
+    """Detect high-confidence weaknesses in versioned OpenWrt firmware overlays."""
+    result = DetectorResult(detector="firmware")
+    root = Path(repo_path).resolve()
+    overlays = _openwrt_runtime_overlays(root)
+    rule_counts: dict[str, int] = {}
+
+    def record(**kwargs: object) -> None:
+        rule_id = str(kwargs["rule_id"])
+        _append_firmware_finding(result, **kwargs)  # type: ignore[arg-type]
+        rule_counts[rule_id] = rule_counts.get(rule_id, 0) + 1
+
+    for overlay in overlays:
+        for path in sorted(overlay.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                if path.stat().st_size > max(1, int(max_target_bytes)):
+                    continue
+                relative_file = path.relative_to(root).as_posix()
+                relative_overlay = path.relative_to(overlay).as_posix()
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = text.splitlines()
+
+            if path.suffix.casefold() == ".lua":
+                sources: dict[str, tuple[int, str]] = {}
+                source_pattern = re.compile(
+                    r"^\s*(?:local\s+)?([A-Za-z_]\w*)\s*=\s*"
+                    r"(?:[A-Za-z_]\w*\.)*formvalue\s*\("
+                )
+                sink_pattern = re.compile(r"\b(?:io\.popen|os\.execute)\s*\(")
+                for line_number, source_line in enumerate(lines, start=1):
+                    source_match = source_pattern.search(source_line)
+                    if source_match:
+                        sources[source_match.group(1)] = (line_number, source_line.strip())
+                    if not sink_pattern.search(source_line):
+                        continue
+                    for variable, (source_line_number, source_code) in sources.items():
+                        if line_number - source_line_number > 100:
+                            continue
+                        if not re.search(rf"\b{re.escape(variable)}\b", source_line):
+                            continue
+                        record(
+                            relative_file=relative_file,
+                            line=line_number,
+                            rule_id="aegisscan.firmware.lua-command-injection",
+                            severity="CRITICAL",
+                            issue_name="Firmware web command injection",
+                            description=(
+                                "An HTTP form value reaches a shell-command API without an "
+                                "allowlist, allowing authenticated request data to execute commands."
+                            ),
+                            original_code=source_line.strip(),
+                            source_evidence=(
+                                f"Line {source_line_number} reads request data: {source_code}"
+                            ),
+                            sink_evidence=(
+                                f"Line {line_number} passes that value to io.popen or os.execute."
+                            ),
+                            reachability_evidence=(
+                                f"Variable {variable} flows from formvalue to the command sink "
+                                f"within {line_number - source_line_number} line(s)."
+                            ),
+                            guidance=(
+                                "Remove arbitrary command execution. Map fixed action identifiers "
+                                "to argument-safe process calls and enforce authorization server-side."
+                            ),
+                        )
+                        break
+
+            if relative_overlay == "etc/shadow":
+                for line_number, shadow_line in enumerate(lines, start=1):
+                    if not shadow_line or shadow_line.startswith("#"):
+                        continue
+                    fields = shadow_line.split(":")
+                    if len(fields) < 2:
+                        continue
+                    account, password_field = fields[0], fields[1]
+                    if password_field.startswith("$1$"):
+                        record(
+                            relative_file=relative_file,
+                            line=line_number,
+                            rule_id="aegisscan.firmware.weak-md5crypt-password",
+                            severity="HIGH",
+                            issue_name="Weak password hash embedded in firmware",
+                            description=(
+                                f"Account {account} uses the obsolete MD5-crypt password format "
+                                "in the shipped firmware image, enabling efficient offline cracking."
+                            ),
+                            original_code=f"{account}:<redacted MD5-crypt hash>:...",
+                            source_evidence=(
+                                f"The shipped shadow entry for {account} begins with the $1$ "
+                                "MD5-crypt identifier."
+                            ),
+                            sink_evidence="The credential verifier is embedded in etc/shadow.",
+                            reachability_evidence=(
+                                "Firmware extraction exposes the hash directly to an offline attacker."
+                            ),
+                            guidance=(
+                                "Remove preset credentials. Provision a unique initial secret per "
+                                "device and use a modern supported password-hashing scheme."
+                            ),
+                        )
+                    elif password_field == "":
+                        record(
+                            relative_file=relative_file,
+                            line=line_number,
+                            rule_id="aegisscan.firmware.empty-password",
+                            severity="CRITICAL",
+                            issue_name="Firmware account has an empty password",
+                            description=(
+                                f"Account {account} has an empty password field in the shipped "
+                                "shadow database and may permit passwordless authentication."
+                            ),
+                            original_code=f"{account}::<redacted shadow fields>",
+                            source_evidence=f"The shadow password field for {account} is empty.",
+                            sink_evidence="The empty verifier is deployed in etc/shadow.",
+                            reachability_evidence=(
+                                "Any enabled login service that accepts this account can reach the "
+                                "empty credential boundary."
+                            ),
+                            guidance=(
+                                "Lock the account or provision a unique strong credential and verify "
+                                "that remote login services reject empty passwords."
+                            ),
+                        )
+
+            if relative_overlay == "etc/rc.local":
+                for line_number, startup_line in enumerate(lines, start=1):
+                    stripped = startup_line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if re.search(r"(?:^|/)shellback(?:\s|$)", stripped):
+                        record(
+                            relative_file=relative_file,
+                            line=line_number,
+                            rule_id="aegisscan.firmware.startup-backdoor",
+                            severity="CRITICAL",
+                            issue_name="Backdoor service launched at firmware startup",
+                            description=(
+                                "The firmware starts a shellback executable during boot, creating "
+                                "an undocumented remote-command path."
+                            ),
+                            original_code=stripped,
+                            source_evidence="The command is persisted in the boot-time rc.local file.",
+                            sink_evidence="The shellback process is launched automatically.",
+                            reachability_evidence=(
+                                "Every normal firmware boot executes this startup command."
+                            ),
+                            guidance=(
+                                "Remove the backdoor binary and startup entry, rotate exposed "
+                                "credentials, and verify the final image and listening services."
+                            ),
+                        )
+                    if re.search(r"(?:^|\s)telnetd(?:\s|$)", stripped):
+                        record(
+                            relative_file=relative_file,
+                            line=line_number,
+                            rule_id="aegisscan.firmware.insecure-telnet-service",
+                            severity="HIGH",
+                            issue_name="Cleartext Telnet service enabled at startup",
+                            description=(
+                                "The firmware launches telnetd during boot, exposing credentials "
+                                "and administrative traffic without transport encryption."
+                            ),
+                            original_code=stripped,
+                            source_evidence="The telnet daemon is enabled in the boot-time configuration.",
+                            sink_evidence="telnetd opens a cleartext remote-login service.",
+                            reachability_evidence=(
+                                "Every normal firmware boot launches the configured daemon."
+                            ),
+                            guidance=(
+                                "Remove Telnet, use a hardened SSH service only when required, and "
+                                "restrict management access to trusted networks."
+                            ),
+                        )
+
+            if relative_overlay == "etc/config/upnpd":
+                insecure_match = re.search(
+                    r"(?m)^\s*option\s+secure_mode\s+['\"]?0['\"]?\s*$", text
+                )
+                broad_address = re.search(
+                    r"(?m)^\s*option\s+int_addr\s+['\"]?0\.0\.0\.0/0['\"]?", text
+                )
+                if insecure_match and broad_address:
+                    line_number = _line_number(text, insecure_match.start())
+                    record(
+                        relative_file=relative_file,
+                        line=line_number,
+                        rule_id="aegisscan.firmware.insecure-upnp-policy",
+                        severity="HIGH",
+                        issue_name="Unrestricted insecure UPnP policy",
+                        description=(
+                            "UPnP secure mode is disabled while the permission rule accepts every "
+                            "internal IPv4 address, allowing untrusted clients to create mappings."
+                        ),
+                        original_code=lines[line_number - 1].strip(),
+                        source_evidence="Any internal address matches the 0.0.0.0/0 permission rule.",
+                        sink_evidence="secure_mode is explicitly disabled in the deployed UPnP service.",
+                        reachability_evidence=(
+                            "The shipped configuration loads both settings into the enabled UPnP daemon."
+                        ),
+                        guidance=(
+                            "Enable secure mode, restrict allowed clients and ports, or disable UPnP "
+                            "when automatic port mapping is unnecessary."
+                        ),
+                    )
+
+            if relative_overlay == "etc/config/wireless":
+                open_wifi = re.search(
+                    r"(?m)^\s*option\s+encryption\s+['\"]?none['\"]?\s*$", text
+                )
+                if open_wifi:
+                    line_number = _line_number(text, open_wifi.start())
+                    record(
+                        relative_file=relative_file,
+                        line=line_number,
+                        rule_id="aegisscan.firmware.open-wireless-network",
+                        severity="HIGH",
+                        issue_name="Wireless network encryption disabled",
+                        description=(
+                            "The shipped wireless access point explicitly disables encryption, "
+                            "allowing nearby attackers to observe and inject network traffic."
+                        ),
+                        original_code=lines[line_number - 1].strip(),
+                        source_evidence="The deployed wireless interface is configured as an access point.",
+                        sink_evidence="Its encryption option is set to none.",
+                        reachability_evidence=(
+                            "The setting is part of the root-filesystem overlay loaded by the firmware."
+                        ),
+                        guidance=(
+                            "Require WPA2 or WPA3 with a unique strong credential and disable legacy "
+                            "open-network fallback."
+                        ),
+                    )
+
+    inventory_telemetry: list[dict[str, object]] = []
+    advisory_matches = 0
+    kernel_advisory_matches = 0
+    for release in sorted({overlay.parent for overlay in overlays}):
+        version, _version_file, _version_line = _openwrt_release_version(release)
+        selected, profiles = _openwrt_selected_packages(release)
+        kernel_inventory = _openwrt_kernel_inventory(release, root, profiles)
+        kernel_versions = [str(item["version"]) for item in kernel_inventory]
+        inventory, unresolved = _openwrt_package_inventory(
+            release, root, selected, max_target_bytes, kernel_versions
+        )
+        advisory_matches += _append_openwrt_advisories(
+            result,
+            root=root,
+            release=release,
+            selected=selected,
+            inventory=inventory,
+            record=record,
+        )
+        kernel_advisory_matches += _append_openwrt_kernel_advisories(
+            kernel_inventory=kernel_inventory,
+            record=record,
+        )
+        feeds = _openwrt_feed_inventory(release)
+        feed_references = _openwrt_feed_package_references(
+            root=root,
+            unresolved=unresolved,
+            feeds=feeds,
+        )
+        inventory.update(feed_references)
+        unresolved = sorted(set(unresolved) - feed_references.keys())
+        selected_count = len(selected)
+        resolved_count = len(inventory)
+        inventory_telemetry.append(
+            {
+                "release": version,
+                "path": release.relative_to(root).as_posix(),
+                "build_profiles": profiles,
+                "kernel_versions": kernel_versions,
+                "kernel_inventory": kernel_inventory,
+                "declared_feeds": feeds,
+                "missing_feed_sources": [
+                    str(feed["name"]) for feed in feeds if not feed["available"]
+                ],
+                "selected_packages": selected_count,
+                "resolved_package_recipes": resolved_count,
+                "inventory_coverage_ratio": (
+                    round(resolved_count / selected_count, 4) if selected_count else 1.0
+                ),
+                "versioned_package_recipes": sum(
+                    bool(item.get("package_version_resolved"))
+                    for item in inventory.values()
+                ),
+                "feed_package_references": len(feed_references),
+                "unresolved_selected_packages": len(unresolved),
+                "unresolved_selected_package_names": unresolved[:100],
+                "inventory_complete": bool(profiles) and not unresolved,
+                "components": sorted(
+                    inventory.values(), key=lambda item: str(item.get("package"))
+                )[:200],
+            }
+        )
+
+    catalog_payload = json.dumps(
+        {
+            "version": CATALOG_VERSION,
+            "advisories": OPENWRT_ADVISORIES,
+            "kernel_advisories": OPENWRT_KERNEL_ADVISORIES,
+            "eol": OPENWRT_EOL_SERIES,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    result.finding_count = len(result.dispositions)
+    result.telemetry = {
+        "status": (
+            "not_applicable"
+            if not overlays
+            else (
+                "completed"
+                if all(item["inventory_complete"] for item in inventory_telemetry)
+                else "partial_inventory"
+            )
+        ),
+        "overlays_discovered": len(overlays),
+        "findings_by_rule": dict(sorted(rule_counts.items())),
+        "coverage_complete": bool(overlays)
+        and all(item["inventory_complete"] for item in inventory_telemetry),
+        "openwrt_inventory": inventory_telemetry,
+        "advisory_catalog_version": CATALOG_VERSION,
+        "advisory_catalog_sha256": hashlib.sha256(catalog_payload.encode()).hexdigest(),
+        "official_advisories_matched": advisory_matches,
+        "official_kernel_advisories_matched": kernel_advisory_matches,
+    }
+    return result
 
 
 def _relative_file(repo_root: Path, raw_path: object) -> tuple[str, Path | None]:
@@ -765,7 +1588,8 @@ def _is_localization_password_noise(rule_id: str, relative_file: str) -> bool:
     localization_directories = {"i18n", "l10n", "locale", "locales", "translations"}
     return (
         normalized_rule == "generic-password"
-        and path.suffix.casefold() in {".json", ".json5", ".yaml", ".yml"}
+        and path.suffix.casefold()
+        in {".json", ".json5", ".po", ".pot", ".properties", ".yaml", ".yml"}
         and any(part in localization_directories for part in parts[:-1])
     )
 

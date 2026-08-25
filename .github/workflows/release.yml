@@ -9,8 +9,12 @@ permissions:
   contents: write
 
 jobs:
+  security-benchmarks:
+    uses: ./.github/workflows/security-benchmarks.yml
+
   build:
     name: Build macOS ${{ matrix.arch }}
+    needs: security-benchmarks
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -122,11 +126,12 @@ jobs:
         Native Intel and Apple Silicon beta builds of AegisScan.
 
         Highlights:
-        - OpenRouter triage with Gemini fallback and adaptive batch recovery
-        - Deterministic confirmation for locally proven credentials, SSRF, and basket IDOR
-        - Consolidated current and Git-history secret evidence with redacted metadata
-        - Temporary npm inventory resolution and expanded OSV package telemetry
-        - More precise SARIF diagnostics, canonical sinks, and duplicate handling
+        - OpenRouter and Gemini triage with adaptive batch recovery and opt-in data-collecting routes
+        - Deterministic multi-language coverage for SSRF, TOCTOU, open redirect, IDOR, and common injection paths
+        - Betterleaks current-tree and Git-history scanning with redacted, consolidated evidence
+        - OSV dependency inventory plus dedicated OpenWrt firmware and advisory analysis
+        - Stable SARIF candidate ledger with false positives and duplicates preserved as suppressed evidence
+        - Pinned WebGoat and IoTGoat regression gates before release publication, plus a Juice Shop triage baseline
 
         Requirements:
         - macOS 12 or newer

@@ -360,6 +360,90 @@ def test_runtime_syntax_error_still_fails_completeness():
             run_semgrep_scan("/repo")
 
 
+def test_bundled_openwrt_parser_error_is_recorded_as_non_runtime_diagnostic():
+    with patch("subprocess.run") as mock_run:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps(
+            {
+                "results": [],
+                "errors": [
+                    {
+                        "type": "Syntax error",
+                        "path": (
+                            "/repo/OpenWrt/openwrt-18.06.2/package/boot/"
+                            "uboot-oxnas/src/common/spl/spl_block.c"
+                        ),
+                        "message": "Syntax error at line spl_block.c:1",
+                    }
+                ],
+            }
+        )
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        result = run_semgrep_scan("/repo")
+
+    assert str(result) == ""
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0]["code_role"] == "DEPENDENCY"
+
+
+def test_bundled_static_plugin_timeout_does_not_create_runtime_coverage_gap():
+    with patch("subprocess.run") as mock_run:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps(
+            {
+                "results": [],
+                "errors": [
+                    {
+                        "type": "Timeout",
+                        "path": (
+                            "/repo/src/main/resources/webgoat/static/plugins/"
+                            "bootstrap-wysihtml5/js/wysihtml5-0.3.0.js"
+                        ),
+                        "message": "Timeout while scanning bundled frontend plugin",
+                    }
+                ],
+            }
+        )
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        result = run_semgrep_scan("/repo")
+
+    assert str(result) == ""
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0]["kind"] == "Timeout"
+    assert result.diagnostics[0]["code_role"] == "DEPENDENCY"
+    assert "runtime-scan-incomplete" not in str(result)
+
+
+def test_partial_parsing_diagnostic_type_does_not_embed_parser_payload():
+    with patch("subprocess.run") as mock_run:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps(
+            {
+                "results": [],
+                "errors": [
+                    {
+                        "type": ["PartialParsing", [{"path": "sensitive-value"}]],
+                        "path": "/repo/vendor/parser.c",
+                    }
+                ],
+            }
+        )
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        result = run_semgrep_scan("/repo")
+
+    assert result.diagnostics[0]["kind"] == "Partial parsing"
+    assert "sensitive-value" not in json.dumps(result.diagnostics)
+
+
 def test_file_context_limited_to_window():
     with patch("subprocess.run") as mock_run:
         mock_result = MagicMock()

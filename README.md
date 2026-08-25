@@ -1,120 +1,103 @@
-# AegisScan
+<p align="center">
+  <img src="assets/AegisScan.png" width="112" alt="AegisScan application icon">
+</p>
 
-[![CI](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/ci.yml/badge.svg)](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/ci.yml)
-[![AegisScan](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/aegisscan.yml/badge.svg)](https://github.com/AlaeddinSrour/AegisScan/actions/workflows/aegisscan.yml)
+<h1 align="center">AegisScan</h1>
 
-Local-first macOS security auditing with repository-wide Semgrep discovery,
-OSV dependency checks, redacted current/history secret detection, bounded
-Gemini or OpenRouter triage, an explicit evidence ledger, and guarded remediation.
+<p align="center">
+  Local-first repository security auditing with deterministic scanners,<br>
+  evidence-gated AI triage, and reviewable JSON/SARIF reports.
+</p>
 
-> **Project status:** Version 0.3.2 beta. AegisScan is suitable for evaluation and
-> development workflows, but findings and generated fixes still require human
-> review before production use.
+<p align="center">
+  <a href="https://github.com/AlaeddinSrour/AegisScan/actions/workflows/ci.yml"><img src="https://github.com/AlaeddinSrour/AegisScan/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/AlaeddinSrour/AegisScan/actions/workflows/security-benchmarks.yml"><img src="https://github.com/AlaeddinSrour/AegisScan/actions/workflows/security-benchmarks.yml/badge.svg" alt="Security benchmarks"></a>
+  <a href="https://github.com/AlaeddinSrour/AegisScan/releases"><img src="https://img.shields.io/github/v/release/AlaeddinSrour/AegisScan?include_prereleases" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/macOS-12%2B-111111" alt="macOS 12 or newer">
+</p>
 
-Version 0.3.2 adds OpenRouter triage with Gemini fallback, resilient adaptive
-batch recovery, deterministic confirmation for locally proven credentials, SSRF,
-and basket IDOR findings, improved secret and dependency consolidation, temporary
-npm inventory resolution, Express open-redirect discovery, and more precise
-SARIF diagnostics. Provider failures retain conservative review findings without
-silently degrading runtime coverage.
+> **v0.4.0 beta** — suitable for evaluation and controlled security review. It is
+> not a replacement for penetration testing or human verification.
 
-The desktop workspace also supports credential-free detector-only audits,
-scanner readiness diagnostics, and persistent local audit comparisons that show
-new, resolved, and unchanged actionable findings.
+## See the audit, not just an alert list
 
-The current bundled JavaScript/TypeScript coverage floor also discovers Express
-flows for command injection, path traversal, dynamic code evaluation, unsafe
-deserialization, object-level authorization review, and reflected/DOM XSS.
+```mermaid
+flowchart LR
+    A[Choose repository] --> B[Discover]
+    B --> B1[Semgrep SAST]
+    B --> B2[OSV dependencies]
+    B --> B3[Betterleaks secrets]
+    B --> B4[OpenWrt firmware]
+    B1 --> C[Classify & deduplicate]
+    B2 --> C
+    B3 --> C
+    B4 --> C
+    C --> D{AI triage enabled?}
+    D -- No --> E[Needs review]
+    D -- Gemini / OpenRouter --> F[Evidence gate]
+    F --> G[Confirmed]
+    F --> E
+    F --> H[Suppressed evidence]
+    G --> I[Dashboard + JSON + SARIF]
+    E --> I
+    H --> I
+```
 
-## Why AegisScan
+AegisScan keeps discovery deterministic and local. AI can add repository context,
+but it cannot silently invent or delete detector candidates. Every candidate gets
+a stable fingerprint and a final disposition.
 
-Static analyzers are good at finding suspicious syntax, but a raw alert is not
-the same thing as a reachable vulnerability. AegisScan adds repository context
-and preserves the complete decision trail:
-
-- Scans the selected repository with Semgrep instead of silently limiting the
-  audit to changed lines.
-- Matches resolved packages from supported manifests and lockfiles against the
-  OSV vulnerability database. For npm descriptor-only projects, it can resolve
-  temporary lockfiles with scripts disabled without changing the repository.
-- Scans both current files and Git history with Betterleaks while discarding
-  matched secret values before results enter the report. Gitleaks remains a
-  compatibility fallback during the transition.
-- Consolidates the same secret location across current files and Git history,
-  canonicalizes identical copied files for specific secret formats, and filters
-  narrowly defined localization-password and public blockchain-address noise.
-  Repeated generic passwords in structured account collections become one review
-  item with an occurrence count instead of flooding the queue.
-- Reports dependency occurrences across manifests separately from unique advisory
-  identifiers, affected package versions, and package-inventory coverage. Raw OSV
-  detector counts and final exported counts are labeled separately, with affected
-  packages grouped in report telemetry and summarized in the dashboard tooltip.
-- Applies centralized credential redaction to repository context before AI
-  requests and again before JSON, SARIF, or UI retention.
-- Assigns every candidate a stable ID and a final disposition: confirmed,
-  needs review, duplicate, false positive, or non-runtime. Consolidated evidence
-  points to its canonical finding instead of being mislabeled as a false alarm.
-- Separates runtime code from tests, fixtures, generated files, dependencies,
-  documentation, and project-defined ignored paths.
-- Optionally sends findings to Gemini or OpenRouter in bounded batches and
-  requires structured, schema-validated responses; detector-only audits keep
-  runtime candidates in Needs review without contacting an AI provider.
-- Requires source, sink, reachability, and confidence evidence before promoting
-  an issue to Confirmed.
-- Includes bundled Python, JavaScript/TypeScript, Go, Java, and C# discovery for
-  user-controlled URLs reaching common HTTP clients (SSRF) and filesystem
-  check-then-use sequences (TOCTOU).
-- Detects user-controlled Express redirects so substring-based or otherwise
-  non-canonical redirect allowlists receive explicit open-redirect review.
-- Applies only deterministic safety-approved patches and validates modified
-  syntax before committing an atomic file update.
-- Can optionally publish AegisScan-created fixes on a dedicated GitHub branch
-  and pull request.
-
-## Privacy and trust boundary
-
-Semgrep and secret scanning, scope classification, patch validation, finding
-comparison, and file modification happen locally. Betterleaks network validation
-is deliberately not enabled, so candidate credentials are not sent to provider
-APIs. OSV-Scanner may query vulnerability/package metadata services using
-dependency names and versions. The default bundled Semgrep mode is offline and
-content-fingerprinted; the optional extended mode downloads mutable community
-registry packs from Semgrep. When AI triage is enabled, AegisScan sends the
-selected provider the Semgrep finding, a bounded source excerpt around it, and
-locally generated structural context, including bounded definitions of imported
-JavaScript and TypeScript helpers used by a finding. OpenRouter requests pass
-through OpenRouter to an eligible model host and enforce strict structured-output
-support plus `data_collection: deny`; they do not enforce ZDR routing.
-Dependency and secret findings bypass AI triage. Detector-only mode sends no
-repository source or finding context to an AI provider. Do not enable AI triage
-for a repository whose source is not permitted to be sent to Gemini, OpenRouter,
-or the routed model provider.
-
-Gemini, OpenRouter, and GitHub credentials are held in memory by the desktop app
-and are not saved in application preferences. Exported reports and local environment files
-are ignored by Git. Repository text is treated as untrusted prompt input, and
-the model cannot write files directly. Secret-shaped values found through any
-detector are replaced with `[REDACTED SECRET]` before AI triage and report
-serialization. Audit history stores at most 100 local
-summary records and opaque finding fingerprints—not source excerpts or raw
-finding IDs—and can be cleared from the Activity page.
-
-## Requirements
-
-| Component | Requirement |
+| What you see | What it means |
 | --- | --- |
-| Operating system | macOS 12 or newer for the desktop app |
-| Python | 3.11 or newer when running from source |
-| Semgrep | 1.172 or newer; must be available on `PATH` or via `SEMGREP_COMMAND` |
-| OSV-Scanner | Version 2; must be available on `PATH` or via `OSV_SCANNER_COMMAND` |
-| Betterleaks | Current release; must be available on `PATH` or via `BETTERLEAKS_COMMAND` |
-| Gitleaks | Optional compatibility fallback when Betterleaks is unavailable |
-| AI provider | Gemini or OpenRouter API key with model access; optional in detector-only mode |
+| **Confirmed** | Source, sink, reachability, location, and confidence passed validation |
+| **Needs review** | A real detector candidate lacks enough evidence for a safe verdict |
+| **Suppressed** | A false positive or duplicate remains auditable without becoming an active alert |
+| **Non-runtime** | Tests, fixtures, generated files, dependencies, or ignored paths are separated from production risk |
+| **Incomplete** | A runtime scanner or AI coverage gap prevents the audit from being treated as clean |
 
-The prebuilt app is architecture-specific. Build on Apple Silicon for an arm64
-bundle or on an Intel Mac for an x86_64 bundle.
+### Example result
 
-## Quick start from source
+```text
+HIGH · Server-Side Request Forgery
+routes/profileImageUrlUpload.ts:24
+
+Source       req.body.imageUrl
+Sink         request.get(imageUrl)
+Reachability Express route passes request data to the network client
+Disposition  CONFIRMED · HIGH confidence
+Remediation  Manual destination-policy review required
+```
+
+The report also records the repository commit, dirty state, ruleset SHA-256,
+scanner diagnostics, provider/model chain, aggregate token usage, and cost.
+
+## What it finds
+
+| Layer | Coverage |
+| --- | --- |
+| Application code | SQL injection, command injection, path traversal, SSRF, open redirect, IDOR candidates, XSS patterns, unsafe deserialization, dynamic execution, weak crypto, and TOCTOU patterns |
+| Languages | Python, JavaScript/TypeScript, Java, Go, and C# coverage-floor rules |
+| Dependencies | OSV version matches from supported manifests and lockfiles, with package inventory and reachability clearly separated |
+| Secrets | Betterleaks current-tree and Git-history scanning with redaction and Gitleaks fallback |
+| Firmware | OpenWrt overlay checks for Lua command injection, weak credentials, startup backdoors, Telnet, UPnP, open Wi-Fi, EOL releases, and bounded advisory matches |
+
+Purpose-built deterministic checks can confirm locally provable credentials,
+JavaScript SSRF, open redirects, and basket-style IDOR without trusting model
+prose. Findings such as TOCTOU and dependency advisories remain conservative when
+runtime exploitability is not established.
+
+## Quick start
+
+### Download the macOS app
+
+Download the native Intel or Apple Silicon ZIP from
+[GitHub Releases](https://github.com/AlaeddinSrour/AegisScan/releases), verify the
+adjacent SHA-256 checksum, and move `AegisScan.app` to Applications.
+
+The beta builds are ad-hoc signed and are not Apple-notarized. macOS may require
+**Control-click → Open** on first launch.
+
+### Run from source
 
 ```bash
 git clone https://github.com/AlaeddinSrour/AegisScan.git
@@ -122,214 +105,28 @@ cd AegisScan
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-export GEMINI_API_KEY="your-key"
-# Or: export OPENROUTER_API_KEY="your-key"
+brew install osv-scanner betterleaks
 python -m src
 ```
 
-Installing `requirements.txt` provides Semgrep for source-based runs. Install the
-supplemental command-line scanners separately:
+Semgrep is installed by `requirements.txt`. The desktop Scanner Readiness page
+checks Semgrep, OSV-Scanner, Betterleaks, and the Gitleaks fallback before an
+audit.
 
-```bash
-brew install osv-scanner betterleaks
-```
-
-The desktop app checks `PATH`, `/opt/homebrew/bin`, and `/usr/local/bin` for all
-three scanners. If an enabled supplemental scanner is unavailable, AegisScan
-preserves the other results and marks the audit incomplete instead of reporting
-the repository as clean.
-
-In the app:
+### Run your first audit
 
 1. Choose a repository.
-2. Open **Scanner Readiness** to verify the enabled local tools.
-3. Enable AI triage, select Gemini, OpenRouter, or automatic fallback, and enter
-   the corresponding API key under **New Audit** or **Settings**. Alternatively,
-   disable AI for a local detector-only audit.
-4. Keep automatic fixes disabled for the first review.
-5. Choose **Reproducible** bundled rules, or explicitly select **Extended** if
-   live Semgrep Registry augmentation is desired.
-6. Run the audit and inspect **Confirmed**, **Needs review**, and
-   **Non-runtime** separately.
-7. Review the **Activity** comparison, then export JSON for archival or SARIF
-   for GitHub/CI integration.
+2. Check **Scanner Readiness**.
+3. Select **Reproducible** bundled rules.
+4. Choose detector-only mode, Gemini, OpenRouter, or automatic fallback.
+5. Leave automatic fixes off for the first pass.
+6. Review Confirmed, Needs review, and Non-runtime separately.
+7. Export JSON for archival or SARIF for GitHub Code Scanning.
 
-## How an audit works
+## AI is optional
 
-1. Semgrep runs the versioned bundled coverage-floor rules against the configured
-   repository scope and records their SHA-256 fingerprint. Extended mode also
-   downloads the mutable `security-audit` and Python registry packs. The bundled
-   floor includes SSRF taint flows and common TOCTOU sequences for Python,
-   JavaScript/TypeScript, Go, Java, and C#, plus Express open-redirect flows.
-2. OSV-Scanner checks supported dependency manifests and lockfiles and records
-   discovered/scanned manifest and package inventory telemetry. For an uncovered
-   `package.json`, AegisScan asks npm to create a lockfile in an isolated temporary
-   directory with lifecycle scripts disabled. Failed resolution remains an explicit
-   coverage gap instead of a zero-vulnerability result. Betterleaks scans current
-   files and Git history with 100% match redaction; repeated secret evidence is
-   consolidated by repository location while preserving current/history scope,
-   occurrence count, and redacted commit provenance. Gitleaks is used only when
-   Betterleaks is unavailable.
-3. Every raw result receives a stable detector-specific identifier and a
-   deterministic code role.
-4. Exact duplicate Semgrep records are removed. Secret matches in tests,
-   fixtures, generated files, documentation, dependencies, and ignored paths
-   are retained as Non-runtime instead of inflating the review queue.
-5. Semgrep findings are grouped by directory and packed into batches of at most 15.
-   Python files receive local import, definition, and call-edge context;
-   JavaScript and TypeScript findings receive bounded imported-helper context.
-6. Deterministic and non-runtime findings bypass AI triage. Automatic mode uses
-   OpenRouter first when its key is configured, with the reproducible
-   `deepseek/deepseek-v4-flash` model, then falls back to the stable
-   `gemini-3.7-flash` → `gemini-3.6-flash` → `gemini-3.5-flash` chain when a
-   Gemini key is also configured. With AI disabled, runtime candidates remain
-   explicitly visible under Needs review.
-7. The returned JSON is validated as a strict `ReviewReport`. Missing or invalid
-   candidate decisions become Needs review instead of disappearing. Parseable
-   responses are repaired conservatively without promoting incomplete evidence;
-   repaired candidates receive a strict, single-finding second pass with semantic
-   repair disabled. Structurally invalid batches are recursively split into
-   smaller requests, and configured OpenRouter or Gemini fallbacks remain available.
-   Multi-finding OpenRouter requests use a shorter deadline than singleton recovery.
-8. Confirmed findings are reconciled against real repository paths, lines, code
-   roles, and canonical sensitive sinks. Overlapping Semgrep and secret-scanner
-   findings at the same sink are consolidated into one issue. Unsupported secondary
-   vulnerability claims are removed from model-generated descriptions.
-9. Bundled rule IDs are normalized independently of local installation paths,
-   and report provenance records the AegisScan version, timestamps, target Git
-   commit/branch/dirty state, AI model chain, ruleset hash, and scan settings.
-10. Optional fixes pass secret, control-flow, ambiguity, and syntax checks before
-   an atomic write.
-
-Semgrep parser errors in known non-runtime files remain visible as scanner
-diagnostics, separate from vulnerability totals. Runtime resource-limit failures
-become Needs review and mark the audit
-degraded. Global or runtime parser failures stop the audit because completeness
-is unknown. Known vendored browser assets and generated bundles are scoped out
-deterministically unless a repository override forces them into runtime scope.
-
-If some or all AI-provider batches fail, the desktop app finishes in visibly degraded
-mode, suppresses the posture score, and preserves every untriaged runtime
-candidate under Needs review. The CLI still writes the report and exits with
-status `2`, preventing automation from treating incomplete triage as success.
-
-## Desktop workspace
-
-- **Dashboard** — posture, confirmed-risk metrics, review backlog, and scan state.
-- **New audit** — repository, optional AI triage, scanner, remediation, and
-  publishing controls.
-- **Activity** — persistent local summaries with new/resolved/unchanged
-  comparisons.
-- **Confirmed** — runtime findings that passed the evidence gate.
-- **Critical & high** — focused priority queue.
-- **Needs review** — incomplete evidence, omitted candidates, and failed batches.
-- **Non-runtime** — scoped-out evidence retained for auditability.
-- **Reports** — JSON and SARIF 2.1.0 export plus the retained analysis summary.
-- **Integrations** — optional GitHub pull-request publishing.
-- **Scanner Readiness** — tool availability, versions, executable paths, and
-  setup guidance.
-- **Settings** — AI and audit defaults.
-
-## Scope overrides
-
-Add repository-relative glob patterns to `.aegisscanignore` in the repository
-being scanned:
-
-```gitignore
-# Served as examples, not executed by the application
-data/static/codefixes/**
-custom/generated/**
-```
-
-Ignored candidates remain visible under Non-runtime. Prefix a pattern with `!`
-to force a normally excluded path back into runtime scope:
-
-```gitignore
-generated/**
-!generated/runtime/**
-```
-
-This scope file controls how findings are classified in the evidence ledger. To
-skip files during Semgrep discovery, edit the comma-separated exclusions in **New
-Audit** or **Settings**. The maximum Semgrep/secret-scanner target size is configurable
-from 1–100 MB; increasing it can materially increase scan time and memory use.
-
-## Configuration
-
-| Environment variable | Purpose | Default |
-| --- | --- | --- |
-| `GEMINI_API_KEY` | Gemini credential used by the desktop app or CLI | none |
-| `OPENROUTER_API_KEY` | OpenRouter credential used by the desktop app or CLI | none |
-| `AEGISSCAN_OPENROUTER_MODELS` | Comma-separated OpenRouter model failover order | `deepseek/deepseek-v4-flash` |
-| `AEGISSCAN_OPENROUTER_MAX_FINDINGS_PER_BATCH` | Maximum findings sent in one OpenRouter request; failed batches split recursively | `3` |
-| `AEGISSCAN_OPENROUTER_MAX_RETRIES` | Attempts per retryable OpenRouter model failure | `3` |
-| `AEGISSCAN_OPENROUTER_TIMEOUT` | Hard wall-clock deadline for one OpenRouter request, in seconds | `180` |
-| `AEGISSCAN_OPENROUTER_MULTI_TIMEOUT` | Shorter deadline for OpenRouter requests containing multiple findings | `90` |
-| `AEGISSCAN_OPENROUTER_INITIAL_BACKOFF` | Initial OpenRouter retry delay, in seconds | `15` |
-| `AEGISSCAN_OPENROUTER_MAX_OUTPUT_TOKENS` | Maximum OpenRouter structured-response tokens | `16384` |
-| `AEGISSCAN_AI_RETRIAGE_LIMIT` | Maximum repaired candidates strictly re-triaged per audit | `6` |
-| `AEGISSCAN_GEMINI_MODELS` | Comma-separated model failover order | `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash` |
-| `AEGISSCAN_MAX_RETRIES` | Attempts per retryable model failure | `3` |
-| `AEGISSCAN_API_TIMEOUT` | Timeout for one Gemini request, in seconds | `180` |
-| `AEGISSCAN_INITIAL_BACKOFF` | Initial retry delay, in seconds | `15` |
-| `AEGISSCAN_MAX_OUTPUT_TOKENS` | Maximum structured-response tokens | `16384` |
-| `AEGISSCAN_SEMGREP_TIMEOUT` | Full Semgrep process timeout, in seconds | `300` |
-| `SEMGREP_COMMAND` | Explicit Semgrep executable path | auto-detected |
-| `AEGISSCAN_OSV_TIMEOUT` | OSV-Scanner process timeout, in seconds | `300` |
-| `AEGISSCAN_DEPENDENCY_RESOLVE_TIMEOUT` | Per-manifest temporary npm resolution timeout, in seconds | `120` |
-| `OSV_SCANNER_COMMAND` | Explicit OSV-Scanner executable path | auto-detected |
-| `AEGISSCAN_BETTERLEAKS_TIMEOUT` | Secret-scanner timeout per mode, in seconds | `300` |
-| `BETTERLEAKS_COMMAND` | Explicit Betterleaks executable path | auto-detected |
-| `AEGISSCAN_GITLEAKS_TIMEOUT` | Legacy fallback timeout when the Betterleaks value is unset | `300` |
-| `GITLEAKS_COMMAND` | Explicit Gitleaks fallback executable path | auto-detected |
-| `GITHUB_TOKEN` | Optional credential for publishing fixes | none |
-| `GITHUB_REPOSITORY` | Optional `owner/repository` publishing target | none |
-
-The default model identifiers are explicit rather than moving `-latest` aliases,
-so audit behavior does not silently change between releases.
-
-The Semgrep rule mode is selected in **New audit** or **Settings**, or with
-`--semgrep-rule-mode` in the CLI:
-
-- `bundled` (default) uses only version-controlled AegisScan rules, works offline,
-  and records the exact rules file SHA-256 in JSON and SARIF reports.
-- `extended` adds the live `p/security-audit` and `p/python` registry packs. It
-  provides broader community coverage, but requires network access and is not
-  reproducible because registry contents can change independently of AegisScan.
-
-## CLI
-
-The CLI writes a report but does not modify or publish anything unless requested:
-
-```bash
-python -m src.full_scan \
-  --repo /path/to/repository \
-  --openrouter-api-key "$OPENROUTER_API_KEY" \
-  --ai-provider openrouter \
-  --batch-size 12 \
-  --max-target-bytes 1000000 \
-  --semgrep-rule-mode bundled \
-  --exclude .git --exclude .venv --exclude node_modules \
-  --report aegisscan-report.json \
-  --sarif aegisscan-results.sarif
-```
-
-The JSON report includes detector and AI response-quality telemetry, scanner
-diagnostics, explicit coverage gaps, dependency package groups, duplicate links,
-and the complete secret current/history ledger.
-Default SARIF is current-tree focused: it contains Confirmed and Needs review
-results while excluding history-only secrets and deterministically Non-runtime,
-Duplicate, and False positive evidence. Scanner and coverage diagnostics are
-included as SARIF notifications. It can be uploaded to GitHub Code Scanning or
-consumed by SARIF-compatible CI and editor tooling.
-
-Use `--ai-provider auto` with both `--openrouter-api-key` and `--api-key` to try
-OpenRouter first and fall back to Gemini if OpenRouter is unavailable. Provider
-order and model IDs are retained in report provenance.
-
-For a local or CI audit that does not send code context to an AI provider and
-needs no API key, use detector-only mode. Runtime candidates remain visible as Needs
-review instead of being promoted to Confirmed:
+Detector-only mode keeps all runtime candidates under Needs review and sends no
+repository context to an AI provider:
 
 ```bash
 python -m src.full_scan \
@@ -340,55 +137,150 @@ python -m src.full_scan \
   --sarif aegisscan-results.sarif
 ```
 
-The included `aegisscan.yml` workflow runs this reproducible mode on pushes and
-pull requests, retains both reports as artifacts, and uploads SARIF to GitHub
-Code Scanning. Dependency and secret scanning are disabled in that workflow
-because those external binaries are not installed on its runner; full local
-audits keep both detectors enabled by default.
-
-Dependency and secret scanning are enabled by default. Use
-`--no-dependency-scan` or `--no-secret-scan` only when intentionally running a
-reduced-coverage audit; the chosen configuration is recorded by the live log.
-
-Apply safety-validated fixes:
+For contextual triage, configure Gemini or OpenRouter:
 
 ```bash
+export OPENROUTER_API_KEY="your-key"
+
 python -m src.full_scan \
   --repo /path/to/repository \
   --openrouter-api-key "$OPENROUTER_API_KEY" \
   --ai-provider openrouter \
+  --semgrep-rule-mode bundled \
+  --report aegisscan-report.json \
+  --sarif aegisscan-results.sarif
+```
+
+Automatic mode tries OpenRouter first when configured, then the Gemini fallback
+chain. OpenRouter uses eligible-provider routing by default. Data-collecting
+routes are excluded unless you explicitly enable **Allow OpenRouter providers
+that may retain prompts** or pass `--openrouter-allow-data-collection`.
+
+## Privacy model
+
+| Stays local | May use a network service |
+| --- | --- |
+| Semgrep scanning and scope classification | OSV package and advisory metadata queries |
+| Secret matching and value redaction | Optional Gemini/OpenRouter triage |
+| OpenWrt firmware analysis | Optional GitHub pull-request publishing |
+| Fix validation and file modification | Extended Semgrep Registry mode |
+| Audit history fingerprints |  |
+
+- Betterleaks live credential validation is deliberately disabled.
+- Secret-shaped values are redacted before AI requests and report serialization.
+- API keys are held in memory and are not saved in application preferences.
+- OpenRouter prompt-retaining providers are opt-in; AegisScan does not claim ZDR.
+- Repository content is treated as untrusted prompt input, and the model cannot
+  write files directly.
+
+## Reproducible security baselines
+
+Security changes are measured against pinned benchmark manifests, not changing
+live projects or mutable advisory counts. WebGoat and IoTGoat are deterministic
+release gates; the Juice Shop manifest is used to evaluate full triage reports.
+
+| Target | Pinned scope | Required baseline |
+| --- | --- | ---: |
+| OWASP Juice Shop v19 | Application rules | 12 expected findings, 3 forbidden false positives |
+| OWASP WebGoat | Bundled Java rules against production sources | 1 pinned SSRF finding |
+| OWASP IoTGoat | Firmware and OpenWrt advisories | 19 expected findings, complete package/kernel provenance |
+
+The gates require complete audits, exact scoped precision/recall, no duplicate
+inflation, and bounded unresolved findings. Run one locally with:
+
+```bash
+python scripts/evaluate_security_benchmark.py \
+  --results /path/to/aegisscan-report.sarif \
+  --manifest benchmarks/juice-shop-v19.json \
+  --output benchmark-metrics.json
+```
+
+These are regression baselines for versioned detector behavior—not claims that
+AegisScan discovers every vulnerability in each training application.
+
+## Reports designed for auditability
+
+JSON contains the complete candidate ledger and detector telemetry. SARIF 2.1.0
+contains active Confirmed and Needs review results plus false positives and
+duplicates as suppressed informational evidence. Non-runtime findings remain in
+the disposition counts, while scanner and coverage problems appear as SARIF
+notifications.
+
+This means repeated scans can change a verdict without making the underlying
+candidate disappear.
+
+## Scope controls
+
+Use `.aegisscanignore` in the scanned repository to classify project-specific
+paths as non-runtime:
+
+```gitignore
+data/static/codefixes/**
+custom/generated/**
+```
+
+Prefix a pattern with `!` to force it back into runtime scope:
+
+```gitignore
+generated/**
+!generated/runtime/**
+```
+
+Semgrep discovery exclusions are configured separately in New Audit, Settings,
+or with repeated `--exclude` arguments. Known generated bundles, vendored browser
+libraries, Maven wrappers, versioned OpenWrt SDK sources, and bundled static
+plugins are classified without turning their parser/resource diagnostics into
+runtime coverage failures.
+
+<details>
+<summary><strong>Advanced configuration</strong></summary>
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | Gemini credential | none |
+| `OPENROUTER_API_KEY` | OpenRouter credential | none |
+| `AEGISSCAN_OPENROUTER_MODELS` | OpenRouter failover order | `deepseek/deepseek-v4-flash` |
+| `AEGISSCAN_OPENROUTER_TIMEOUT` | Singleton request deadline | `180` seconds |
+| `AEGISSCAN_OPENROUTER_MULTI_TIMEOUT` | Multi-finding request deadline | `90` seconds |
+| `AEGISSCAN_OPENROUTER_MAX_FINDINGS_PER_BATCH` | Provider request size before adaptive splitting | `3` |
+| `AEGISSCAN_GEMINI_MODELS` | Gemini failover order | `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash` |
+| `AEGISSCAN_AI_RETRIAGE_LIMIT` | Strict singleton recovery cap | `6` |
+| `AEGISSCAN_SEMGREP_TIMEOUT` | Semgrep process timeout | `300` seconds |
+| `AEGISSCAN_OSV_TIMEOUT` | OSV-Scanner timeout | `300` seconds |
+| `AEGISSCAN_BETTERLEAKS_TIMEOUT` | Betterleaks timeout per mode | `300` seconds |
+| `SEMGREP_COMMAND` | Explicit Semgrep path | auto-detected |
+| `OSV_SCANNER_COMMAND` | Explicit OSV-Scanner path | auto-detected |
+| `BETTERLEAKS_COMMAND` | Explicit Betterleaks path | auto-detected |
+| `GITLEAKS_COMMAND` | Gitleaks fallback path | auto-detected |
+| `GITHUB_TOKEN` | Optional PR publishing credential | none |
+| `GITHUB_REPOSITORY` | Optional `owner/repository` target | none |
+
+`bundled` Semgrep mode is offline, version-controlled, and content-fingerprinted.
+`extended` adds mutable `p/security-audit` and `p/python` registry packs and
+therefore requires network access.
+
+</details>
+
+<details>
+<summary><strong>Safe fixes and pull requests</strong></summary>
+
+AegisScan only applies deterministic fixes that pass secret, ambiguity,
+control-flow, and syntax checks:
+
+```bash
+python -m src.full_scan \
+  --repo /path/to/repository \
+  --detector-only \
   --apply-fixes \
   --report aegisscan-report.json
 ```
 
-To publish changed files, also provide `--create-pull-request` and configure
-`GITHUB_TOKEN` plus `GITHUB_REPOSITORY`. Use a fine-grained token limited to the
-target repository with repository contents and pull-request write access. Keep
-tokens in environment variables instead of shell-history arguments.
+Add `--create-pull-request` with `GITHUB_TOKEN` and `GITHUB_REPOSITORY` to publish
+only files changed by the current audit. Review and test every generated change.
 
-## Build the macOS app
+</details>
 
-```bash
-PYTHON_BOOTSTRAP=python3.13 ./scripts/build_macos_app.sh
-dist/AegisScan.app/Contents/MacOS/AegisScan --self-test
-codesign --verify --deep --strict dist/AegisScan.app
-open dist/AegisScan.app
-```
-
-The build script installs development dependencies and creates
-`dist/AegisScan.app` from `AegisScan.spec`. Local bundles use ad-hoc signing;
-public binary distribution requires the maintainer's Apple Developer ID signing
-and notarization workflow.
-
-### GitHub prereleases
-
-Pushing a semantic version tag such as `v0.3.0` runs
-`.github/workflows/release.yml`. GitHub builds separate native bundles on
-`macos-15-intel` and `macos-15`, verifies their actual `x86_64` and `arm64`
-architectures, and publishes both ZIP files plus SHA-256 checksums as a GitHub
-prerelease. The automated bundles are ad-hoc signed and not Apple-notarized.
-
-## Development
+## Build and contribute
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -398,66 +290,32 @@ QT_QPA_PLATFORM=offscreen python -m pytest \
   --cov=src --cov-report=term-missing --cov-fail-under=70
 ```
 
-GitHub Actions runs the tests on Python 3.11 and 3.13 and performs a macOS app
-build, self-test, and signature verification. Dependabot checks Python and
-workflow dependencies weekly. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
-pull-request checklist and [`SECURITY.md`](SECURITY.md) for private vulnerability
-reporting guidance.
+Build the macOS app:
 
-## Security boundaries and limitations
+```bash
+PYTHON_BOOTSTRAP=python3.13 ./scripts/build_macos_app.sh
+dist/AegisScan.app/Contents/MacOS/AegisScan --self-test
+codesign --verify --deep --strict dist/AegisScan.app
+```
 
-- AegisScan is not a replacement for manual review, dynamic testing, penetration
-  testing, or production monitoring.
-- The bundled rules are a coverage floor, not a complete vulnerability taxonomy.
-- The JavaScript/TypeScript regression floor covers representative SQL injection,
-  SSRF, TOCTOU, command injection, path traversal, dynamic code evaluation,
-  unsafe deserialization, object-level authorization candidates, hardcoded
-  cryptographic material, and response/DOM XSS patterns. Business-logic findings
-  still require contextual or dynamic testing.
-- SSRF coverage follows recognized web-request sources into common Python,
-  JavaScript/TypeScript, Go, Java, and C# HTTP clients. Custom frameworks,
-  wrapper clients, dynamically constructed call paths, DNS rebinding, and
-  redirect behavior can still require manual review or dynamic testing.
-- Open-redirect coverage follows common Express request fields into
-  `response.redirect`. Custom frameworks, indirect response wrappers, and
-  application-specific URL normalization can still require manual review.
-- TOCTOU coverage finds common filesystem existence/access checks followed by
-  path operations, including Python `pathlib`, Node promise APIs, Go early
-  guards, Java `File`/`Files`, and C# synchronous or asynchronous reads. It does
-  not prove exploitability, model operating-system permissions, or detect every
-  cross-function and asynchronous race.
-- Confirmed SSRF and TOCTOU findings always require manual remediation because
-  safe destination policies and atomic filesystem semantics are application-specific.
-- Dependency matches are version-based; they do not prove that vulnerable code is
-  reachable at runtime. Exact dependency coverage requires a supported lockfile or
-  resolved package inventory. npm descriptors can be resolved into temporary
-  lockfiles without lifecycle scripts or repository changes; failed or unsupported
-  descriptor resolution is marked as incomplete coverage rather than clean.
-- Secret matches identify credential-shaped values but do not test whether a
-  credential is valid. Generic patterns remain Needs review, while specific
-  credential formats in current runtime source may be confirmed. Detected
-  credentials should still be reviewed and rotated.
-- Betterleaks live validation is intentionally disabled because it can make
-  outbound requests containing candidate credentials. AegisScan does not enable
-  it implicitly.
-- Historical secret remediation is manual; AegisScan does not rewrite Git history.
-- Large files or unusual languages can exceed Semgrep resource or parser limits;
-  those gaps must not be interpreted as clean results.
-- Suggested fixes can change behavior and must be reviewed and tested before use.
-- Pull-request publishing requires a clean starting branch and stages only files
-  changed by AegisScan during the current audit.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
-## Publishing this repository
+## Limitations
 
-Generated application bundles, build directories, caches, credentials, and
-exported reports are excluded by `.gitignore`. Before making the repository
-public:
+- Static analysis cannot prove complete runtime exploitability or replace manual
+  review, dynamic testing, penetration testing, and production monitoring.
+- Custom frameworks, indirect wrappers, dynamically assembled flows, DNS
+  rebinding, redirect chains, authorization business logic, and cross-function
+  races may require dedicated testing.
+- Dependency advisories prove an affected version match, not runtime reachability.
+- Secret findings identify credential-shaped data; they do not test validity.
+- Parser errors, resource limits, unsupported manifests, and provider failures are
+  reported as coverage gaps rather than clean results.
+- Safe fixes can still change behavior and must be reviewed.
 
-1. Choose and add a `LICENSE` appropriate for the intended use.
-2. Enable **Private vulnerability reporting** in the repository security settings.
-3. Require the CI workflow on the default branch.
-4. Create notarized release artifacts separately; do not commit `dist/`.
+## License
 
 No license is currently included. Until one is added, copyright law reserves all
-rights and others do not receive permission to copy, modify, or distribute the
+rights and others do not receive permission to copy, modify, or distribute this
 project.

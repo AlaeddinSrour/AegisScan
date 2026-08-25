@@ -1,0 +1,137 @@
+name: Security benchmarks
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  iotgoat:
+    name: Pinned IoTGoat firmware baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out AegisScan
+        uses: actions/checkout@v7
+
+      - name: Read benchmark pin
+        id: benchmark
+        run: |
+          python -c 'import json; print("commit=" + json.load(open("benchmarks/iotgoat.json"))["repository"]["commit"])' >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned OWASP IoTGoat
+        uses: actions/checkout@v7
+        with:
+          repository: OWASP/IoTGoat
+          ref: ${{ steps.benchmark.outputs.commit }}
+          path: benchmark-target
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install detector runtime
+        run: python -m pip install -r requirements.txt
+
+      - name: Run deterministic IoTGoat audit
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          python -m src.full_scan \
+            --repo benchmark-target \
+            --detector-only \
+            --no-dependency-scan \
+            --no-secret-scan \
+            --max-target-bytes 28000000 \
+            --report iotgoat-report.json \
+            --sarif iotgoat.sarif
+
+      - name: Enforce benchmark quality gates
+        run: |
+          python scripts/evaluate_security_benchmark.py \
+            --results iotgoat.sarif \
+            --manifest benchmarks/iotgoat.json \
+            --output iotgoat-benchmark-metrics.json
+
+      - name: Retain benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: iotgoat-security-benchmark
+          path: |
+            iotgoat.sarif
+            iotgoat-report.json
+            iotgoat-benchmark-metrics.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  webgoat:
+    name: Pinned WebGoat Java baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out AegisScan
+        uses: actions/checkout@v7
+
+      - name: Read benchmark pin
+        id: benchmark
+        run: |
+          python -c 'import json; print("commit=" + json.load(open("benchmarks/webgoat.json"))["repository"]["commit"])' >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned OWASP WebGoat
+        uses: actions/checkout@v7
+        with:
+          repository: WebGoat/WebGoat
+          ref: ${{ steps.benchmark.outputs.commit }}
+          path: benchmark-target
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install detector runtime
+        run: python -m pip install -r requirements.txt
+
+      - name: Run bundled rules against WebGoat
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          semgrep scan \
+            --disable-version-check \
+            --metrics off \
+            --config src/aegisscan_rules.yml \
+            --json \
+            --json-output webgoat-semgrep.json \
+            --quiet \
+            --exclude '**/test/**' \
+            --exclude '**/.mvn/**' \
+            --timeout 30 \
+            benchmark-target/src/main/java >/dev/null
+
+      - name: Enforce benchmark quality gates
+        run: |
+          python scripts/evaluate_security_benchmark.py \
+            --results webgoat-semgrep.json \
+            --manifest benchmarks/webgoat.json \
+            --output webgoat-benchmark-metrics.json
+
+      - name: Retain benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: webgoat-security-benchmark
+          path: |
+            webgoat-semgrep.json
+            webgoat-benchmark-metrics.json
+          if-no-files-found: warn
+          retention-days: 30

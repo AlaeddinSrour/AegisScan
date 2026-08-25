@@ -23,6 +23,9 @@ from src.supplemental_scanners import DetectorResult
 @pytest.fixture(autouse=True)
 def completed_supplemental_scanners(monkeypatch):
     monkeypatch.setattr(
+        "src.full_scan.scan_firmware", lambda _path, **_kwargs: DetectorResult(detector="firmware")
+    )
+    monkeypatch.setattr(
         "src.full_scan.scan_dependencies", lambda _path: DetectorResult(detector="osv")
     )
     monkeypatch.setattr(
@@ -181,6 +184,31 @@ def test_run_full_scan_disables_diff_filter_and_merges_report(tmp_path):
         assert any(event.startswith(phase) for event in progress_events)
 
 
+def test_openwrt_tree_forces_bundled_rules_and_warns_for_dirty_worktree(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "OpenWrt/openwrt-18.06.2/files/etc").mkdir(parents=True)
+    progress_events: list[str] = []
+    monkeypatch.setattr(
+        "src.full_scan._git_provenance", lambda _root: ("a" * 40, "main", True)
+    )
+
+    with patch("src.full_scan.run_semgrep_scan", return_value="") as scan:
+        outcome = run_full_scan(
+            str(tmp_path),
+            "",
+            client=MagicMock(),
+            semgrep_rule_mode="extended",
+            progress=progress_events.append,
+        )
+
+    assert scan.call_args.kwargs["rule_mode"] == "bundled"
+    assert outcome.semgrep_rule_mode == "bundled"
+    assert outcome.repository_dirty is True
+    assert any("uncommitted or untracked" in event for event in progress_events)
+    assert any("using bundled Semgrep rules" in event for event in progress_events)
+
+
 def test_reconciliation_removes_unsupported_secondary_description_claim(tmp_path):
     source = tmp_path / "login.ts"
     source.write_text("database.query(userInput)\n", encoding="utf-8")
@@ -274,6 +302,82 @@ def test_clean_semgrep_still_runs_supplemental_detectors(tmp_path, monkeypatch):
     assert outcome.report.issues[0].suggested_fix == ""
     assert outcome.report.issues[0].remediation_guidance
     assert not outcome.audit_degraded
+
+
+def test_firmware_findings_are_counted_in_detector_total(tmp_path, monkeypatch):
+    issue = ReviewIssue(
+        file="OpenWrt/openwrt-1.2.3/files/etc/rc.local",
+        line=1,
+        severity="CRITICAL",
+        issue_name="Startup backdoor",
+        description="A backdoor service is launched at startup.",
+        original_code="/usr/bin/shellback &",
+        suggested_fix="",
+        finding_id="FIRMWARE-test",
+        rule_id="aegisscan.firmware.startup-backdoor",
+        confidence="HIGH",
+        code_role="RUNTIME",
+        source_evidence="The entry is persisted in rc.local.",
+        sink_evidence="The service is launched at boot.",
+        sink_file="OpenWrt/openwrt-1.2.3/files/etc/rc.local",
+        sink_line=1,
+        reachability_evidence="Normal boot executes rc.local.",
+        remediation_type="MANUAL_REQUIRED",
+    )
+    disposition = FindingDisposition(
+        finding_id=issue.finding_id,
+        status="CONFIRMED",
+        reason="Deterministic firmware match.",
+        file=issue.file,
+        line=issue.line,
+        rule_id=issue.rule_id,
+        code_role="RUNTIME",
+        confidence="HIGH",
+    )
+    monkeypatch.setattr(
+        "src.full_scan.scan_firmware",
+        lambda _path, **_kwargs: DetectorResult(
+            detector="firmware",
+            finding_count=1,
+            issues=[issue],
+            dispositions=[disposition],
+        ),
+    )
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=""):
+        outcome = run_full_scan(str(tmp_path), "", ai_triage=False)
+
+    assert outcome.firmware_finding_count == 1
+    assert outcome.total_finding_count == 1
+    assert outcome.report.issues[0].finding_id == "FIRMWARE-test"
+
+
+def test_firmware_specific_manual_guidance_is_preserved():
+    issue = ReviewIssue(
+        file="firmware/files/etc/rc.local",
+        line=4,
+        severity="HIGH",
+        issue_name="Cleartext Telnet service",
+        description="The firmware launches telnetd at boot.",
+        original_code="telnetd &",
+        suggested_fix="",
+        remediation_guidance="Remove Telnet and restrict SSH to trusted management networks.",
+        finding_id="FIRMWARE-guidance",
+        rule_id="aegisscan.firmware.insecure-telnet-service",
+        confidence="HIGH",
+        code_role="RUNTIME",
+        source_evidence="rc.local enables the daemon.",
+        sink_evidence="telnetd opens a cleartext service.",
+        sink_file="firmware/files/etc/rc.local",
+        sink_line=4,
+        reachability_evidence="Normal boot executes rc.local.",
+        remediation_type="MANUAL_REQUIRED",
+    )
+    report = ReviewReport(analysis_scratchpad="", issues=[issue], dispositions=[])
+
+    normalized = _normalize_manual_remediations(report)
+
+    assert normalized.issues[0].remediation_guidance == issue.remediation_guidance
 
 
 def test_dependency_metrics_are_reconciled_after_final_report_merge(tmp_path, monkeypatch):
@@ -769,6 +873,34 @@ def test_runtime_scan_incomplete_candidate_bypasses_ai_and_needs_review(tmp_path
     assert "resource limit" in outcome.report.dispositions[0].reason
     assert outcome.runtime_scan_gap_count == 1
     assert outcome.audit_degraded
+
+
+@pytest.mark.parametrize(
+    "rule_id",
+    [
+        "java.lang.security.audit.crypto.use-of-md5.use-of-md5",
+        "java.lang.security.audit.crypto.weak-random.weak-random",
+        "java.spring.security.unrestricted-request-mapping.unrestricted-request-mapping",
+    ],
+)
+def test_deterministic_java_review_rules_bypass_ai_without_degrading_audit(tmp_path, rule_id):
+    (tmp_path / "HashingAssignment.java").write_text("unsafe();\n", encoding="utf-8")
+    finding = (
+        "Finding #1:\n"
+        f"Rule ID: {rule_id}\n"
+        "File: HashingAssignment.java:1\n"
+        "Message: security-sensitive Java construct\n"
+        "Code Snippet: unsafe();\n"
+    )
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=finding):
+        with patch("src.full_scan.call_gemini_with_failover") as ai_call:
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    ai_call.assert_not_called()
+    assert outcome.disposition_count("NEEDS_REVIEW") == 1
+    assert outcome.ai_attempted_batches == 0
+    assert outcome.audit_degraded is False
 
 
 def test_hardcoded_private_key_requires_manual_remediation(tmp_path):
@@ -1307,7 +1439,7 @@ def test_private_key_declaration_and_signing_use_share_one_canonical_issue(tmp_p
     )
     contextual = detector.model_copy(
         update={
-            "line": 54,
+            "line": 21,
             "sink_line": 54,
             "description": "The embedded private key reaches JWT signing.",
             "original_code": "jwt.sign(user, privateKey)",
@@ -1750,6 +1882,109 @@ def test_destination_policy_prevents_deterministic_ssrf_confirmation(tmp_path):
     assert outcome.report.dispositions[0].status == "NEEDS_REVIEW"
 
 
+def test_bypassable_redirect_guard_overrides_invalid_model_duplicate(tmp_path):
+    route = tmp_path / "routes" / "redirect.ts"
+    policy = tmp_path / "lib" / "insecurity.ts"
+    route.parent.mkdir(parents=True)
+    policy.parent.mkdir(parents=True)
+    route.write_text(
+        "import * as security from '../lib/insecurity'\n"
+        "export function performRedirect () {\n"
+        "  return ({ query }: Request, res: Response) => {\n"
+        "    const toUrl: string = query.to as string\n"
+        "    if (security.isRedirectAllowed(toUrl)) {\n"
+        "      res.redirect(toUrl)\n"
+        "    }\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    policy.write_text(
+        "export const redirectAllowlist = new Set(['https://example.test'])\n"
+        "export const isRedirectAllowed = (url: string) => {\n"
+        "  let allowed = false\n"
+        "  for (const allowedUrl of redirectAllowlist) {\n"
+        "    allowed = allowed || url.includes(allowedUrl)\n"
+        "  }\n"
+        "  return allowed\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    finding = (
+        "Finding #1:\n"
+        "Rule ID: aegisscan.javascript.express-open-redirect\n"
+        "File: routes/redirect.ts:6\n"
+        "Message: user-controlled URL reaches res.redirect\n"
+        "Code Snippet: res.redirect(toUrl)\n"
+    )
+    finding_id = batch_findings([finding])[0].findings[0].finding_id
+    invalid_duplicate = ReviewReport(
+        analysis_scratchpad="invalid duplicate reference",
+        issues=[],
+        dispositions=[
+            FindingDisposition(
+                finding_id=finding_id,
+                status="DUPLICATE",
+                reason="Same redirect as an omitted candidate.",
+                canonical_finding_id="SG-missing",
+            )
+        ],
+    )
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=finding):
+        with patch(
+            "src.full_scan.call_gemini_with_failover",
+            return_value=invalid_duplicate,
+        ):
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    assert len(outcome.report.issues) == 1
+    issue = outcome.report.issues[0]
+    assert issue.issue_name == "Open Redirect"
+    assert "includes()" in issue.reachability_evidence
+    assert outcome.report.dispositions[0].status == "CONFIRMED"
+    assert outcome.report.dispositions[0].confidence == "HIGH"
+
+
+def test_exact_redirect_allowlist_is_not_deterministically_downgraded(tmp_path):
+    route = tmp_path / "routes" / "redirect.ts"
+    route.parent.mkdir(parents=True)
+    route.write_text(
+        "const allowedUrls = new Set(['https://example.test/path'])\n"
+        "function isRedirectAllowed (url: string) {\n"
+        "  return allowedUrls.has(url)\n"
+        "}\n"
+        "export function performRedirect () {\n"
+        "  return ({ query }: Request, res: Response) => {\n"
+        "    const toUrl: string = query.to as string\n"
+        "    if (isRedirectAllowed(toUrl)) {\n"
+        "      res.redirect(toUrl)\n"
+        "    }\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    finding = (
+        "Finding #1:\n"
+        "Rule ID: aegisscan.javascript.express-open-redirect\n"
+        "File: routes/redirect.ts:9\n"
+        "Message: user-controlled URL reaches res.redirect\n"
+        "Code Snippet: res.redirect(toUrl)\n"
+    )
+    incomplete = ReviewReport(
+        analysis_scratchpad="exact allowlist requires no deterministic finding",
+        issues=[],
+        dispositions=[],
+    )
+
+    with patch("src.full_scan.run_semgrep_scan", return_value=finding):
+        with patch("src.full_scan.call_gemini_with_failover", return_value=incomplete):
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+
+    assert outcome.report.issues == []
+    assert outcome.report.dispositions[0].status == "NEEDS_REVIEW"
+
+
 def test_configured_local_file_xss_requires_attacker_write_evidence(tmp_path):
     source = tmp_path / "routes" / "videoHandler.ts"
     source.parent.mkdir(parents=True)
@@ -2014,7 +2249,7 @@ def test_non_english_open_redirect_is_normalized_and_anchored_to_real_sink(tmp_p
     assert not re.search(r"[\u3400-\u9fff]", outcome.report.dispositions[0].reason)
 
 
-def test_private_key_sink_is_anchored_to_jwt_sign_call(tmp_path):
+def test_private_key_declaration_remains_primary_and_signing_use_is_related_sink(tmp_path):
     source = tmp_path / "security.ts"
     source.write_text(
         "const privateKey = embeddedKey\n"
@@ -2051,9 +2286,10 @@ def test_private_key_sink_is_anchored_to_jwt_sign_call(tmp_path):
             outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
 
     anchored = outcome.report.issues[0]
-    assert anchored.line == 10
+    assert anchored.line == 1
     assert anchored.sink_line == 10
     assert "security.ts:10" in anchored.sink_evidence
+    assert anchored.original_code == ""
 
 
 def test_path_traversal_is_anchored_to_file_operation_not_preceding_check(tmp_path):
@@ -2212,3 +2448,69 @@ def test_unconfirmed_toctou_candidate_is_retained_for_review(tmp_path):
     assert outcome.report.issues == []
     assert outcome.disposition_count("NEEDS_REVIEW") == 1
     assert "check-then-use" in outcome.report.dispositions[0].reason
+
+
+def test_distinct_openwrt_advisories_at_same_recipe_line_remain_separate(tmp_path):
+    recipe = tmp_path / "package/libs/ustream-ssl/Makefile"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("define Package/libustream-mbedtls\n", encoding="utf-8")
+    first = ReviewIssue(
+        file="package/libs/ustream-ssl/Makefile",
+        line=1,
+        sink_file="package/libs/ustream-ssl/Makefile",
+        sink_line=1,
+        severity="HIGH",
+        issue_name="Selected OpenWrt component affected by CVE-2019-5101",
+        description="The selected release is affected by CVE-2019-5101.",
+        original_code="CONFIG_PACKAGE_libustream-mbedtls=y",
+        suggested_fix="",
+        finding_id="FW-cve-2019-5101",
+        rule_id="aegisscan.openwrt.advisory.cve-2019-5101",
+        confidence="HIGH",
+        source_evidence="The build profile selects libustream-mbedtls.",
+        sink_evidence="The official affected release range matches.",
+        reachability_evidence="The component is included in the firmware image.",
+        remediation_type="MANUAL_REQUIRED",
+    )
+    second = first.model_copy(
+        update={
+            "issue_name": "Selected OpenWrt component affected by CVE-2019-5102",
+            "description": "The selected release is affected by CVE-2019-5102.",
+            "finding_id": "FW-cve-2019-5102",
+            "rule_id": "aegisscan.openwrt.advisory.cve-2019-5102",
+        }
+    )
+    dispositions = [
+        FindingDisposition(
+            finding_id=issue.finding_id,
+            status="CONFIRMED",
+            reason="The selected package and release range match the advisory.",
+            file=issue.file,
+            line=issue.line,
+            rule_id=issue.rule_id,
+            message=issue.issue_name,
+            code_role="RUNTIME",
+            confidence="HIGH",
+        )
+        for issue in (first, second)
+    ]
+
+    merged = _merge_reports(
+        [
+            (
+                1,
+                ReviewReport(
+                    analysis_scratchpad="matched official advisories",
+                    issues=[first, second],
+                    dispositions=dispositions,
+                ),
+            )
+        ],
+        tmp_path,
+    )
+
+    assert {issue.finding_id for issue in merged.issues} == {
+        "FW-cve-2019-5101",
+        "FW-cve-2019-5102",
+    }
+    assert all(item.status == "CONFIRMED" for item in merged.dispositions)

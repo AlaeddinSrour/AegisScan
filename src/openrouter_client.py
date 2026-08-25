@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import queue
 import re
@@ -12,7 +13,7 @@ from typing import Callable
 
 import requests
 
-from .models import FindingDisposition, ReviewReport
+from .models import FindingDisposition, ReviewIssue, ReviewReport
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,84 @@ def _is_retryable(error: Exception) -> bool:
     return status_code in {408, 409, 429} or status_code >= 500
 
 
+def _structured_content(message: dict[str, object]) -> object:
+    parsed = message.get("parsed")
+    if isinstance(parsed, dict):
+        return parsed
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {None, "text"}
+        )
+    if not isinstance(content, str) or not content.strip():
+        return content
+    cleaned = content.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.I)
+    if fence:
+        cleaned = fence.group(1)
+    return json.loads(cleaned)
+
+
+def _normalized_model_item(model: type[ReviewIssue] | type[FindingDisposition], item: object):
+    """Conservatively normalize common provider transport defects."""
+    if not isinstance(item, dict):
+        return None
+    cleaned = {key: value for key, value in item.items() if key in model.model_fields}
+    for key in (
+        "severity",
+        "status",
+        "confidence",
+        "code_role",
+        "evidence_scope",
+        "remediation_type",
+    ):
+        value = cleaned.get(key)
+        if isinstance(value, str):
+            cleaned[key] = re.sub(r"[\s-]+", "_", value.strip()).upper()
+    for key in ("line", "sink_line", "occurrence_count"):
+        value = cleaned.get(key)
+        if isinstance(value, str) and value.strip().isdigit():
+            cleaned[key] = int(value)
+    for key in ("related_weaknesses", "commits"):
+        if key in model.model_fields and cleaned.get(key) is None:
+            cleaned[key] = []
+    try:
+        return model.model_validate(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_review_report(content: object) -> ReviewReport:
+    if not isinstance(content, dict):
+        raise ValueError("OpenRouter returned a non-object structured response.")
+    raw_issues = content.get("issues", [])
+    raw_dispositions = content.get("dispositions", [])
+    if isinstance(raw_issues, dict):
+        raw_issues = [raw_issues]
+    if isinstance(raw_dispositions, dict):
+        raw_dispositions = [raw_dispositions]
+    issues = [
+        normalized
+        for item in raw_issues if isinstance(raw_issues, list)
+        if (normalized := _normalized_model_item(ReviewIssue, item)) is not None
+    ]
+    dispositions = [
+        normalized
+        for item in raw_dispositions if isinstance(raw_dispositions, list)
+        if (normalized := _normalized_model_item(FindingDisposition, item)) is not None
+    ]
+    scratchpad = content.get("analysis_scratchpad", "Provider response normalized locally.")
+    if not isinstance(scratchpad, str):
+        scratchpad = "Provider response normalized locally."
+    return ReviewReport(
+        analysis_scratchpad=scratchpad,
+        issues=issues,
+        dispositions=dispositions,
+    )
+
+
 def _parse_review_report(payload: object) -> ReviewReport:
     if not isinstance(payload, dict):
         raise ValueError("OpenRouter returned a non-object response.")
@@ -133,12 +212,10 @@ def _parse_review_report(payload: object) -> ReviewReport:
         raise ValueError("OpenRouter returned no completion choices.")
     choice = choices[0]
     message = choice.get("message", {}) if isinstance(choice, dict) else {}
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, dict):
-        return ReviewReport.model_validate(content)
-    if not isinstance(content, str) or not content.strip():
+    content = _structured_content(message) if isinstance(message, dict) else None
+    if content is None or content == "":
         raise ValueError("OpenRouter returned an empty structured response.")
-    return ReviewReport.model_validate_json(content)
+    return _coerce_review_report(content)
 
 
 def _report_completeness_error(report: ReviewReport, prompt: str) -> str:
@@ -340,11 +417,32 @@ def _increment_telemetry(telemetry: dict[str, int] | None, key: str, amount: int
         telemetry[key] = telemetry.get(key, 0) + amount
 
 
+def _record_usage(telemetry: dict[str, int] | None, payload: object) -> None:
+    """Retain aggregate token/cost metadata without retaining provider content."""
+    if telemetry is None or not isinstance(payload, dict):
+        return
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return
+    for provider_key, telemetry_key in (
+        ("prompt_tokens", "provider_prompt_tokens"),
+        ("completion_tokens", "provider_completion_tokens"),
+        ("total_tokens", "provider_total_tokens"),
+    ):
+        value = usage.get(provider_key)
+        if isinstance(value, int) and value >= 0:
+            _increment_telemetry(telemetry, telemetry_key, value)
+    cost = usage.get("cost")
+    if isinstance(cost, (int, float)) and cost >= 0:
+        _increment_telemetry(telemetry, "provider_cost_microusd", round(cost * 1_000_000))
+
+
 def call_openrouter_with_failover(
     api_key: str,
     prompt: str,
     progress: Callable[[str], None] | None = None,
     *,
+    allow_data_collection: bool = False,
     allow_semantic_repair: bool = True,
     telemetry: dict[str, int] | None = None,
 ) -> ReviewReport:
@@ -403,7 +501,9 @@ def call_openrouter_with_failover(
                         },
                         "provider": {
                             "require_parameters": True,
-                            "data_collection": "deny",
+                            "data_collection": (
+                                "allow" if allow_data_collection else "deny"
+                            ),
                         },
                     },
                     timeout=(15, request_timeout),
@@ -412,6 +512,7 @@ def call_openrouter_with_failover(
                     raise OpenRouterRequestError(_response_error(response), response.status_code)
                 try:
                     response_payload = response.json()
+                    _record_usage(telemetry, response_payload)
                     report = _parse_review_report(response_payload)
                     repair_count = 0
                     if allow_semantic_repair:
@@ -424,6 +525,7 @@ def call_openrouter_with_failover(
                         "Structured ReviewReport validation failed."
                     ) from None
                 routed_model = str(response_payload.get("model") or model_name)
+                routed_provider = str(response_payload.get("provider") or "").strip()
                 if repair_count:
                     repaired_candidates = semantic_repair_candidate_ids(report)
                     _increment_telemetry(telemetry, "repaired_responses")
@@ -444,6 +546,7 @@ def call_openrouter_with_failover(
                 notify(
                     f"[AI] OpenRouter model {routed_model} returned a schema-valid "
                     f"ReviewReport with {len(report.issues)} candidate issues"
+                    + (f" via {routed_provider}" if routed_provider else "")
                 )
                 return report
             except Exception as exc:
