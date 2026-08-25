@@ -2,7 +2,176 @@ import json
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from src.supplemental_scanners import scan_dependencies, scan_secrets
+from src.supplemental_scanners import scan_dependencies, scan_firmware, scan_secrets
+
+
+def test_openwrt_firmware_overlay_detects_iotgoat_weaknesses(tmp_path):
+    overlay = tmp_path / "OpenWrt" / "openwrt-18.06.2" / "files"
+    controller = overlay / "usr/lib/lua/luci/controller/iotgoat/iotgoat.lua"
+    controller.parent.mkdir(parents=True)
+    controller.write_text(
+        """local http = require("luci.http")
+function webcmd()
+    local cmd = http.formvalue("cmd")
+    local fp = io.popen(tostring(cmd).." 2>&1")
+end
+""",
+        encoding="utf-8",
+    )
+    etc = overlay / "etc"
+    (etc / "config").mkdir(parents=True)
+    (etc / "shadow").write_text(
+        "root:$1$redacted$hash:1:0:99999:7:::\n"
+        "iotgoatuser:$1$redacted$hash:1:0:99999:7:::\n",
+        encoding="utf-8",
+    )
+    (etc / "rc.local").write_text(
+        "/usr/bin/shellback &\ntelnetd -p 65534 &\n",
+        encoding="utf-8",
+    )
+    (etc / "config/upnpd").write_text(
+        "option secure_mode 0\noption int_addr 0.0.0.0/0\n",
+        encoding="utf-8",
+    )
+    (etc / "config/wireless").write_text(
+        "config wifi-iface\noption mode ap\noption encryption none\n",
+        encoding="utf-8",
+    )
+    vendor_helper = (
+        tmp_path
+        / "OpenWrt/openwrt-18.06.2/package/boot/device/files/upload.sh"
+    )
+    vendor_helper.parent.mkdir(parents=True)
+    vendor_helper.write_text("PASSWD=vendor-default\n", encoding="utf-8")
+
+    result = scan_firmware(str(tmp_path))
+
+    assert result.finding_count == 8
+    assert {item.rule_id for item in result.dispositions} == {
+        "aegisscan.firmware.lua-command-injection",
+        "aegisscan.firmware.weak-md5crypt-password",
+        "aegisscan.firmware.startup-backdoor",
+        "aegisscan.firmware.insecure-telnet-service",
+        "aegisscan.firmware.insecure-upnp-policy",
+        "aegisscan.firmware.open-wireless-network",
+        "aegisscan.openwrt.eol-release-18-06",
+    }
+    assert all(item.status == "CONFIRMED" for item in result.dispositions)
+    assert all(item.code_role == "RUNTIME" for item in result.dispositions)
+    assert all("package/boot" not in item.file for item in result.dispositions)
+    assert result.telemetry["overlays_discovered"] == 1
+    assert result.telemetry["status"] == "partial_inventory"
+
+
+def test_openwrt_selected_package_inventory_matches_official_release_advisories(tmp_path):
+    release = tmp_path / "OpenWrt/openwrt-18.06.2"
+    (release / "files/etc").mkdir(parents=True)
+    (release / "include").mkdir()
+    (release / "include/version.mk").write_text(
+        "VERSION_NUMBER:=$(if $(VERSION_NUMBER),$(VERSION_NUMBER),18.06.2)\n",
+        encoding="utf-8",
+    )
+    selected = ("libustream-mbedtls", "uhttpd", "libubox", "ppp")
+    (release / ".config-test").write_text(
+        "CONFIG_LINUX_4_14=y\n"
+        + "".join(f"CONFIG_PACKAGE_{package}=y\n" for package in selected),
+        encoding="utf-8",
+    )
+    (release / "include/kernel-version.mk").write_text(
+        "LINUX_VERSION-4.14 = .95\n", encoding="utf-8"
+    )
+    recipes = {
+        "libs/ustream-ssl": ("ustream-ssl", "2018-07-30", "libustream-mbedtls"),
+        "network/services/uhttpd": ("uhttpd", "2018-11-28", "uhttpd"),
+        "libs/libubox": ("libubox", "2018-11-28", "libubox"),
+        "network/services/ppp": ("ppp", "2.4.7", "ppp"),
+    }
+    for directory, (source_name, version, package) in recipes.items():
+        makefile = release / "package" / directory / "Makefile"
+        makefile.parent.mkdir(parents=True)
+        makefile.write_text(
+            f"PKG_NAME:={source_name}\nPKG_VERSION:={version}\n"
+            f"define Package/{package}\nendef\n",
+            encoding="utf-8",
+        )
+
+    result = scan_firmware(str(tmp_path))
+
+    advisory_rules = {
+        item.rule_id
+        for item in result.dispositions
+        if item.rule_id.startswith("aegisscan.openwrt.")
+    }
+    assert advisory_rules == {
+        "aegisscan.openwrt.eol-release-18-06",
+        "aegisscan.openwrt.advisory.cve-2019-5101",
+        "aegisscan.openwrt.advisory.cve-2019-5102",
+        "aegisscan.openwrt.advisory.cve-2019-19945",
+        "aegisscan.openwrt.advisory.cve-2020-7248",
+        "aegisscan.openwrt.advisory.cve-2020-8597",
+        "aegisscan.openwrt.kernel-advisory.cve-2019-11477",
+        "aegisscan.openwrt.kernel-advisory.cve-2019-11478",
+        "aegisscan.openwrt.kernel-advisory.cve-2019-11479",
+    }
+    assert result.telemetry["official_advisories_matched"] == 6
+    assert result.telemetry["official_kernel_advisories_matched"] == 3
+    inventory = result.telemetry["openwrt_inventory"][0]
+    assert inventory["selected_packages"] == 4
+    assert inventory["resolved_package_recipes"] == 4
+    assert inventory["inventory_complete"] is True
+    assert inventory["kernel_versions"] == ["4.14.95"]
+
+
+def test_openwrt_inventory_resolves_kernel_modules_and_pinned_feed_references(tmp_path):
+    release = tmp_path / "OpenWrt/openwrt-18.06.2"
+    (release / "files/etc").mkdir(parents=True)
+    (release / "include").mkdir()
+    (release / "include/version.mk").write_text(
+        "VERSION_NUMBER:=$(if $(VERSION_NUMBER),$(VERSION_NUMBER),18.06.2)\n",
+        encoding="utf-8",
+    )
+    (release / "include/kernel-version.mk").write_text(
+        "LINUX_VERSION-4.14 = .95\n", encoding="utf-8"
+    )
+    (release / ".config-test").write_text(
+        "CONFIG_LINUX_4_14=y\n"
+        "CONFIG_PACKAGE_kmod-usb-core=y\n"
+        "CONFIG_PACKAGE_luci-base=y\n",
+        encoding="utf-8",
+    )
+    modules = release / "package/kernel/linux/modules/usb.mk"
+    modules.parent.mkdir(parents=True)
+    modules.write_text("define KernelPackage/usb-core\nendef\n", encoding="utf-8")
+    (release / "feeds.conf.default").write_text(
+        "src-git luci https://git.openwrt.org/project/luci.git^"
+        "6f6641d97de2c85ee5d87beda92ae8437d1dbdf5\n",
+        encoding="utf-8",
+    )
+
+    result = scan_firmware(str(tmp_path))
+    inventory = result.telemetry["openwrt_inventory"][0]
+
+    assert inventory["selected_packages"] == 2
+    assert inventory["resolved_package_recipes"] == 2
+    assert inventory["inventory_coverage_ratio"] == 1.0
+    assert inventory["feed_package_references"] == 1
+    assert inventory["unresolved_selected_packages"] == 0
+    components = {item["package"]: item for item in inventory["components"]}
+    assert components["kmod-usb-core"]["version"] == "4.14.95"
+    assert components["luci-base"]["version_basis"] == "pinned-feed-commit"
+
+
+def test_firmware_detector_is_not_activated_for_an_unversioned_application_tree(tmp_path):
+    controller = tmp_path / "src/controller.lua"
+    controller.parent.mkdir()
+    controller.write_text(
+        'local cmd = http.formvalue("cmd")\nio.popen(cmd)\n', encoding="utf-8"
+    )
+
+    result = scan_firmware(str(tmp_path))
+
+    assert result.finding_count == 0
+    assert result.telemetry["overlays_discovered"] == 0
 
 
 def test_osv_findings_are_normalized_and_alias_groups_are_deduplicated(tmp_path):
@@ -165,6 +334,44 @@ def test_osv_uses_ephemeral_npm_lock_without_modifying_repository(tmp_path):
     assert not (tmp_path / "package-lock.json").exists()
 
 
+def test_osv_treats_maven_pom_as_native_version_inventory(tmp_path):
+    pom = tmp_path / "pom.xml"
+    pom.write_text(
+        """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>demo</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+""",
+        encoding="utf-8",
+    )
+    payload = {
+        "results": [
+            {
+                "source": {"path": str(pom), "type": "lockfile"},
+                "packages": [],
+            }
+        ]
+    }
+    completed = CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+
+    with patch("src.supplemental_scanners._executable", return_value="/bin/osv"):
+        with patch("src.supplemental_scanners.subprocess.run", return_value=completed):
+            result = scan_dependencies(str(tmp_path))
+
+    assert result.coverage_gaps == []
+    assert result.telemetry["coverage_complete"] is True
+    assert result.telemetry["manifest_inventory_complete"] is True
+    assert result.telemetry["supported_manifest_files"] == ["pom.xml"]
+    assert result.telemetry["uncovered_manifest_files"] == []
+    assert result.telemetry["packages_in_local_inventory"] == 1
+    assert result.telemetry["packages_queried"] == 1
+
+
 def test_betterleaks_redacts_values_scopes_tests_and_deduplicates_history(tmp_path):
     source = tmp_path / "app.py"
     source.write_text("private_key = get_secret()\n", encoding="utf-8")
@@ -286,6 +493,37 @@ def test_betterleaks_suppresses_generic_password_localization_noise(tmp_path):
 
     assert result.finding_count == 0
     assert result.dispositions == []
+    assert result.telemetry["suppressed_localization_findings"] == 2
+
+
+def test_betterleaks_suppresses_java_properties_localization_noise(tmp_path):
+    translation = tmp_path / "src" / "main" / "resources" / "i18n" / "messages.properties"
+    translation.parent.mkdir(parents=True)
+    translation.write_text("password.label=Password\n", encoding="utf-8")
+    finding = {
+        "RuleID": "generic-password",
+        "Description": "Generic password",
+        "File": str(translation),
+        "StartLine": 1,
+        "Secret": "REDACTED",
+    }
+
+    def fake_run(command, **_kwargs):
+        report_path = command[command.index("--report-path") + 1]
+        with open(report_path, "w", encoding="utf-8") as report:
+            json.dump([finding], report)
+        return CompletedProcess(args=command, returncode=1, stdout="", stderr="")
+
+    with patch(
+        "src.supplemental_scanners._executable",
+        side_effect=lambda command, _environment: (
+            "/bin/betterleaks" if command == "betterleaks" else None
+        ),
+    ):
+        with patch("src.supplemental_scanners.subprocess.run", side_effect=fake_run):
+            result = scan_secrets(str(tmp_path))
+
+    assert result.finding_count == 0
     assert result.telemetry["suppressed_localization_findings"] == 2
 
 

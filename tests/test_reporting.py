@@ -88,9 +88,10 @@ def test_json_report_records_reproducible_rule_identity():
     assert payload["summary"]["semgrep_rules_sha256"] == "a" * 64
     assert payload["summary"]["ai_triage_enabled"] is True
     assert payload["summary"]["confirmed_issues"] == 1
+    assert payload["summary"]["firmware_findings"] == 0
     assert payload["summary"]["needs_review"] == 1
     assert payload["summary"]["provenance"] == {
-            "aegisscan_version": "0.3.2",
+            "aegisscan_version": "0.4.0",
         "scan_started_at": "2026-08-20T10:00:00+00:00",
         "scan_completed_at": "2026-08-20T10:01:00+00:00",
         "repository_name": "juice-shop",
@@ -149,6 +150,34 @@ def test_json_report_separates_scanner_diagnostics_and_detector_telemetry():
     assert payload["summary"]["audit_degraded"] is True
 
 
+def test_sarif_summarizes_repeated_scanner_diagnostics_without_hiding_total():
+    outcome = _outcome()
+    outcome.scanner_diagnostics = {
+        "semgrep": [
+            {
+                "kind": "Partial parsing",
+                "file": f"vendor/source-{index}.c",
+                "line": 1,
+                "code_role": "DEPENDENCY",
+                "message": "Dependency parser diagnostic.",
+            }
+            for index in range(40)
+        ]
+    }
+
+    invocation = build_sarif_payload(outcome)["runs"][0]["invocations"][0]
+    notifications = invocation["toolExecutionNotifications"]
+    summary = notifications[-1]
+
+    assert invocation["properties"]["scannerDiagnosticCount"] == 40
+    assert len(notifications) == 26
+    assert summary["descriptor"]["id"] == "semgrep.diagnostics-summarized"
+    assert summary["properties"]["omittedDiagnosticDetails"] == 15
+    assert summary["properties"]["countsByKindAndRole"] == {
+        "Partial parsing [DEPENDENCY]": 40
+    }
+
+
 def test_sarif_contains_confirmed_and_needs_review_but_not_non_runtime():
     payload = build_sarif_payload(_outcome())
     run = payload["runs"][0]
@@ -170,6 +199,31 @@ def test_sarif_contains_confirmed_and_needs_review_but_not_non_runtime():
     assert run["invocations"][0]["properties"]["semgrepRulesSha256"] == "a" * 64
     assert run["invocations"][0]["properties"]["aiTriageEnabled"] is True
     assert run["invocations"][0]["properties"]["repositoryCommit"] == "b" * 40
+
+
+def test_sarif_exposes_secret_scanner_counts_and_dispositions():
+    outcome = _outcome()
+    outcome.secret_finding_count = 4
+    outcome.secret_scanner = "betterleaks"
+    outcome.report.dispositions.append(
+        FindingDisposition(
+            finding_id="SECRET-dependency",
+            status="NON_RUNTIME",
+            reason="The pattern is in vendored dependency source.",
+            file="vendor/example.txt",
+            line=1,
+            rule_id="betterleaks.generic-password",
+            code_role="DEPENDENCY",
+            evidence_scope="CURRENT",
+        )
+    )
+
+    properties = build_sarif_payload(outcome)["runs"][0]["invocations"][0]["properties"]
+
+    assert properties["rawSecretFindingOccurrences"] == 4
+    assert properties["secretScanner"] == "betterleaks"
+    assert properties["secretDispositionCounts"] == {"NON_RUNTIME": 1}
+    assert properties["exportedConfirmedSecretFindings"] == 0
 
 
 def test_sarif_omits_history_only_secrets_by_default_but_can_include_them():
@@ -267,6 +321,58 @@ def test_sarif_explains_incomplete_ai_triage():
     assert failure["properties"]["batch"] == 2
 
 
+def test_sarif_preserves_rejected_candidates_as_suppressed_evidence():
+    outcome = _outcome()
+    outcome.report.dispositions.extend(
+        [
+            FindingDisposition(
+                finding_id="SG-rejected",
+                status="FALSE_POSITIVE",
+                reason="A destination allowlist prevents attacker-controlled requests.",
+                file="src/client.py",
+                line=14,
+                rule_id="aegisscan.python.user-input-to-network-request",
+                message="Potential SSRF.",
+                code_role="RUNTIME",
+                confidence="HIGH",
+            ),
+            FindingDisposition(
+                finding_id="SG-duplicate",
+                status="DUPLICATE",
+                reason="This candidate resolves to the confirmed canonical sink.",
+                file="src/proxy.py",
+                line=9,
+                rule_id="python.requests.security.audit.requests-use",
+                message="Potential outbound request.",
+                code_role="RUNTIME",
+                confidence="HIGH",
+                canonical_finding_id="SG-confirmed",
+            ),
+        ]
+    )
+
+    run = build_sarif_payload(outcome)["runs"][0]
+    suppressed = [result for result in run["results"] if result.get("suppressions")]
+
+    assert {result["properties"]["status"] for result in suppressed} == {
+        "FALSE_POSITIVE",
+        "DUPLICATE",
+    }
+    assert all(result["level"] == "note" for result in suppressed)
+    assert all(result["suppressions"][0]["status"] == "accepted" for result in suppressed)
+    assert run["invocations"][0]["properties"]["dispositionCounts"] == {
+        "CONFIRMED": 1,
+        "DUPLICATE": 1,
+        "FALSE_POSITIVE": 1,
+        "NEEDS_REVIEW": 1,
+        "NON_RUNTIME": 1,
+    }
+    assert (
+        run["invocations"][0]["properties"]["exportedSuppressedDispositionCount"]
+        == 2
+    )
+
+
 def test_json_and_sarif_include_ai_response_quality_telemetry():
     outcome = _outcome()
     outcome.ai_telemetry = {
@@ -320,6 +426,18 @@ def test_sarif_marks_dependency_version_match_separately_from_runtime_reachabili
     assert result["properties"]["affectedVersionStatus"] == "CONFIRMED"
     assert result["properties"]["runtimeReachability"] == "NOT_ESTABLISHED"
     assert "separate validation" in result["properties"]["riskInterpretation"]
+
+
+def test_sarif_marks_openwrt_advisories_as_dependency_version_matches():
+    outcome = _outcome()
+    outcome.report.issues[0] = outcome.report.issues[0].model_copy(
+        update={"rule_id": "aegisscan.openwrt.advisory.cve-2020-7248"}
+    )
+
+    result = build_sarif_payload(outcome)["runs"][0]["results"][0]
+
+    assert result["properties"]["findingType"] == "DEPENDENCY_ADVISORY"
+    assert result["properties"]["affectedVersionStatus"] == "CONFIRMED"
 
 
 def test_write_sarif_report_outputs_valid_json(tmp_path):

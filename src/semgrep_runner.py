@@ -100,6 +100,29 @@ def _is_resource_limit_error(error: object) -> bool:
     )
 
 
+def _diagnostic_kind(error: object) -> str:
+    """Return a stable, non-sensitive label for a Semgrep diagnostic type."""
+    if not isinstance(error, dict):
+        return "Syntax error"
+    raw_type = error.get("type") or "Syntax error"
+    if isinstance(raw_type, list) and raw_type:
+        raw_type = raw_type[0]
+    normalized = re.sub(r"[^a-z]", "", str(raw_type).casefold())
+    if "partialparsing" in normalized:
+        return "Partial parsing"
+    if "lexicalerror" in normalized:
+        return "Lexical error"
+    if "syntaxerror" in normalized:
+        return "Syntax error"
+    if "timeout" in normalized:
+        return "Timeout"
+    if "outofmemory" in normalized:
+        return "Out of memory"
+    if "stackoverflow" in normalized:
+        return "Stack overflow"
+    return "Scanner error"
+
+
 def _partition_scan_errors(
     repo_path: str,
     scan_errors: list[object],
@@ -288,11 +311,7 @@ def run_semgrep_scan(
         results = data.get("results", [])
         diagnostic_records = [
             {
-                "kind": (
-                    redact_text(str(error.get("type") or "Syntax error"))
-                    if isinstance(error, dict)
-                    else "Syntax error"
-                ),
+                "kind": _diagnostic_kind(error),
                 "file": path,
                 "line": line,
                 "code_role": role,

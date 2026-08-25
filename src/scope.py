@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
+import re
 
 from .models import CodeRole
 
 
 DEPENDENCY_SEGMENTS = {
+    ".mvn",
     "node_modules",
     "vendor",
     "vendors",
@@ -47,6 +49,37 @@ KNOWN_VENDORED_ASSETS = {
     "vue.js",
 }
 
+OPENWRT_RELEASE_DIRECTORY = re.compile(r"^openwrt-\d+(?:\.\d+)+(?:[-_].*)?$")
+
+
+def _normalized_path(path: str) -> str:
+    normalized = PurePosixPath(path.replace("\\", "/")).as_posix()
+    return normalized.removeprefix("./")
+
+
+def _is_bundled_openwrt_source(parts: tuple[str, ...]) -> bool:
+    """Identify an imported OpenWrt SDK while retaining shipped overlay files.
+
+    Firmware projects commonly keep a complete versioned OpenWrt source tree in
+    their repository. Its package, toolchain, and build-system sources are
+    third-party inputs, but the release-root ``files`` directory is a project
+    root-filesystem overlay that becomes part of the produced firmware and must
+    remain runtime-scoped.
+    """
+    release_index = next(
+        (index for index, part in enumerate(parts) if OPENWRT_RELEASE_DIRECTORY.match(part)),
+        None,
+    )
+    if release_index is None:
+        return False
+
+    relative_parts = parts[release_index + 1 :]
+    if not relative_parts:
+        return False
+    if relative_parts[0] == "files":
+        return False
+    return True
+
 
 def load_ignore_patterns(repo_root: Path) -> list[str]:
     """Load optional repository-relative patterns from ``.aegisscanignore``."""
@@ -62,7 +95,7 @@ def load_ignore_patterns(repo_root: Path) -> list[str]:
 
 
 def is_ignored(path: str, patterns: list[str]) -> bool:
-    normalized = PurePosixPath(path.replace("\\", "/")).as_posix().lstrip("./")
+    normalized = _normalized_path(path)
     ignored = False
     for raw_pattern in patterns:
         forced_runtime = raw_pattern.startswith("!")
@@ -74,7 +107,7 @@ def is_ignored(path: str, patterns: list[str]) -> bool:
 
 def is_forced_runtime(path: str, patterns: list[str]) -> bool:
     """Return whether the last matching negated scope pattern forces runtime."""
-    normalized = PurePosixPath(path.replace("\\", "/")).as_posix().lstrip("./")
+    normalized = _normalized_path(path)
     forced = False
     for raw_pattern in patterns:
         pattern = raw_pattern[1:] if raw_pattern.startswith("!") else raw_pattern
@@ -85,7 +118,7 @@ def is_forced_runtime(path: str, patterns: list[str]) -> bool:
 
 def classify_code_role(path: str, ignore_patterns: list[str] | None = None) -> CodeRole:
     """Classify a path without relying on model judgment or repository content."""
-    normalized = PurePosixPath(path.replace("\\", "/")).as_posix().lstrip("./")
+    normalized = _normalized_path(path)
     if ignore_patterns and is_forced_runtime(normalized, ignore_patterns):
         return "RUNTIME"
     if ignore_patterns and is_ignored(normalized, ignore_patterns):
@@ -95,18 +128,30 @@ def classify_code_role(path: str, ignore_patterns: list[str] | None = None) -> C
     part_set = set(lowered_parts)
     filename = lowered_parts[-1] if lowered_parts else ""
 
-    if part_set & DEPENDENCY_SEGMENTS or (
-        "assets" in part_set and filename in KNOWN_VENDORED_ASSETS
+    is_static_library = (
+        "static" in part_set
+        and bool(part_set & {"lib", "libs", "plugins", "vendor", "vendors"})
+        and filename.endswith((".js", ".css", ".map"))
+    )
+    if (
+        part_set & DEPENDENCY_SEGMENTS
+        or ("assets" in part_set and filename in KNOWN_VENDORED_ASSETS)
+        or is_static_library
+        or _is_bundled_openwrt_source(lowered_parts)
     ):
         return "DEPENDENCY"
     if part_set & GENERATED_SEGMENTS or filename.endswith(
         (".min.js", ".min.css", ".generated.ts", ".bundle.js", ".chunk.js", ".map")
     ):
         return "GENERATED"
+    if (
+        part_set & TEST_SEGMENTS
+        or normalized.casefold().startswith("src/it/")
+        or any(token in filename for token in (".test.", ".spec."))
+    ):
+        return "TEST"
     if part_set & FIXTURE_SEGMENTS:
         return "FIXTURE"
-    if part_set & TEST_SEGMENTS or any(token in filename for token in (".test.", ".spec.")):
-        return "TEST"
     if part_set & DOCUMENTATION_SEGMENTS or filename.endswith((".md", ".rst", ".adoc")):
         return "DOCUMENTATION"
     if normalized:

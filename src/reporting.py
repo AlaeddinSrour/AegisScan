@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from .redaction import redact_review_report
 
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 SARIF_VERSION = "2.1.0"
+SARIF_DIAGNOSTIC_DETAIL_LIMIT = 25
 
 
 def build_report_payload(outcome: Any) -> dict[str, Any]:
@@ -29,6 +31,7 @@ def build_report_payload(outcome: Any) -> dict[str, Any]:
     return {
         "summary": {
             "raw_semgrep_findings": outcome.raw_finding_count,
+            "firmware_findings": outcome.firmware_finding_count,
             "dependency_findings": outcome.dependency_finding_count,
             "raw_dependency_finding_occurrences": outcome.dependency_finding_count,
             "exported_dependency_findings": outcome.exported_dependency_finding_count,
@@ -167,7 +170,8 @@ def _sarif_notifications(
             }
         )
     for detector, diagnostics in outcome.scanner_diagnostics.items():
-        for diagnostic in diagnostics:
+        detailed_diagnostics = diagnostics[:SARIF_DIAGNOSTIC_DETAIL_LIMIT]
+        for diagnostic in detailed_diagnostics:
             kind = str(diagnostic.get("kind") or "diagnostic")
             message = str(diagnostic.get("message") or kind)
             notification: dict[str, Any] = {
@@ -197,6 +201,39 @@ def _sarif_notifications(
             if locations:
                 notification["locations"] = locations
             execution.append(notification)
+        omitted = len(diagnostics) - len(detailed_diagnostics)
+        if omitted > 0:
+            grouped = Counter(
+                (
+                    str(item.get("kind") or "diagnostic"),
+                    str(item.get("code_role") or "UNKNOWN").upper(),
+                )
+                for item in diagnostics
+            )
+            grouped_counts = {
+                f"{kind} [{role}]": count
+                for (kind, role), count in sorted(grouped.items())
+            }
+            execution.append(
+                {
+                    "descriptor": {"id": f"{detector}.diagnostics-summarized"},
+                    "level": "note",
+                    "message": {
+                        "text": (
+                            f"{len(diagnostics)} {detector} diagnostics were recorded; "
+                            f"{len(detailed_diagnostics)} representative locations are included "
+                            f"and {omitted} repeated details are summarized."
+                        )
+                    },
+                    "properties": {
+                        "detector": detector,
+                        "totalDiagnostics": len(diagnostics),
+                        "detailedDiagnostics": len(detailed_diagnostics),
+                        "omittedDiagnosticDetails": omitted,
+                        "countsByKindAndRole": grouped_counts,
+                    },
+                }
+            )
     for detector, errors in outcome.detector_errors.items():
         for error in errors:
             execution.append(
@@ -270,7 +307,14 @@ def build_sarif_payload(
                 },
             },
         )
-        is_dependency = issue.rule_id.startswith("osv.")
+        is_dependency = issue.rule_id.startswith(
+            (
+                "osv.",
+                "aegisscan.openwrt.advisory.",
+                "aegisscan.openwrt.kernel-advisory.",
+            )
+        )
+        is_platform_eol = issue.rule_id.startswith("aegisscan.openwrt.eol-release-")
         result: dict[str, Any] = {
             "ruleId": rule_id,
             "level": level,
@@ -287,7 +331,11 @@ def build_sarif_payload(
                 "sinkEvidence": issue.sink_evidence,
                 "reachabilityEvidence": issue.reachability_evidence,
                 "relatedWeaknesses": issue.related_weaknesses,
-                "findingType": "DEPENDENCY_ADVISORY" if is_dependency else "CODE_SECURITY",
+                "findingType": (
+                    "DEPENDENCY_ADVISORY"
+                    if is_dependency
+                    else "PLATFORM_ADVISORY" if is_platform_eol else "CODE_SECURITY"
+                ),
             },
         }
         if is_dependency:
@@ -347,10 +395,72 @@ def build_sarif_payload(
             }
         )
 
+    # Keep the candidate ledger inspectable across repeated scans. Explicitly
+    # rejected and consolidated candidates are emitted as suppressed notes so
+    # they do not become active code-scanning alerts, but they also cannot
+    # silently disappear when a provider returns a different verdict.
+    for disposition in safe_report.dispositions:
+        if disposition.status not in {"FALSE_POSITIVE", "DUPLICATE"}:
+            continue
+        rule_id = _rule_id(disposition.rule_id, "Scoped-out detector candidate")
+        rules.setdefault(
+            rule_id,
+            {
+                "id": rule_id,
+                "name": "AegisScan detector candidate",
+                "shortDescription": {"text": "Security detector candidate"},
+                "defaultConfiguration": {"level": "note"},
+                "properties": {
+                    "tags": ["security", "audit", *_cwe_tags(rule_id, disposition.message)],
+                    "security-severity": "0.0",
+                },
+            },
+        )
+        disposition_label = disposition.status.casefold().replace("_", " ")
+        result = {
+            "ruleId": rule_id,
+            "level": "note",
+            "message": {
+                "text": f"Scoped out as {disposition_label}: {disposition.reason}"
+            },
+            "locations": _location(disposition.file, disposition.line),
+            "partialFingerprints": {
+                "aegisscanFindingId": disposition.finding_id or rule_id
+            },
+            "suppressions": [
+                {
+                    "kind": "external",
+                    "status": "accepted",
+                    "justification": disposition.reason,
+                }
+            ],
+            "properties": {
+                "status": disposition.status,
+                "confidence": disposition.confidence,
+                "codeRole": disposition.code_role,
+                "detectorMessage": disposition.message,
+                "evidenceScope": disposition.evidence_scope,
+                "canonicalFindingId": disposition.canonical_finding_id,
+                "findingType": "DETECTOR_DISPOSITION",
+            },
+        }
+        results.append(result)
+
     execution_notifications, configuration_notifications = _sarif_notifications(
         outcome,
         omitted_historical_secrets=omitted_historical_secrets,
         include_historical_secrets=include_historical_secrets,
+    )
+    secret_dispositions = [
+        item
+        for item in safe_report.dispositions
+        if item.rule_id.startswith(("betterleaks.", "gitleaks."))
+    ]
+    secret_disposition_counts = dict(
+        sorted(Counter(item.status for item in secret_dispositions).items())
+    )
+    disposition_counts = dict(
+        sorted(Counter(item.status for item in safe_report.dispositions).items())
     )
     invocation: dict[str, Any] = {
         "executionSuccessful": not outcome.audit_degraded,
@@ -370,6 +480,19 @@ def build_sarif_payload(
             "scannerDiagnosticCountsByRole": outcome.scanner_diagnostic_counts_by_role,
             "runtimeScannerDiagnosticCount": outcome.runtime_scanner_diagnostic_count,
             "nonRuntimeScannerDiagnosticCount": outcome.non_runtime_scanner_diagnostic_count,
+            "firmwareFindingCount": outcome.firmware_finding_count,
+            "rawSecretFindingOccurrences": outcome.secret_finding_count,
+            "secretScanner": outcome.secret_scanner,
+            "secretDispositionCounts": secret_disposition_counts,
+            "dispositionCounts": disposition_counts,
+            "exportedSuppressedDispositionCount": sum(
+                status in {"FALSE_POSITIVE", "DUPLICATE"}
+                for status in (item.status for item in safe_report.dispositions)
+            ),
+            "exportedConfirmedSecretFindings": sum(
+                issue.rule_id.startswith(("betterleaks.", "gitleaks."))
+                for issue in safe_report.issues
+            ),
             "rawDependencyFindingOccurrences": outcome.dependency_finding_count,
             "dependencyFindingOccurrences": outcome.exported_dependency_finding_count,
             "uniqueDependencyAdvisories": outcome.unique_dependency_advisory_count,

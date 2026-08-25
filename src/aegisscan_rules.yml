@@ -344,16 +344,44 @@ rules:
           - pattern: $REQ.getParameter(...)
           - pattern: $REQ.getHeader(...)
           - pattern: $REQ.getQueryString()
+          - patterns:
+              - pattern: $PARAM
+              - pattern-inside: |
+                  $RET $METHOD(..., @RequestParam $TYPE $PARAM, ...) {
+                    ...
+                  }
+          - patterns:
+              - pattern: $PARAM
+              - pattern-inside: |
+                  $RET $METHOD(..., @RequestParam(...) $TYPE $PARAM, ...) {
+                    ...
+                  }
+          - patterns:
+              - pattern: $PARAM
+              - pattern-inside: |
+                  $RET $METHOD(..., @PathVariable $TYPE $PARAM, ...) {
+                    ...
+                  }
+          - patterns:
+              - pattern: $PARAM
+              - pattern-inside: |
+                  $RET $METHOD(..., @PathVariable(...) $TYPE $PARAM, ...) {
+                    ...
+                  }
     pattern-sinks:
       - patterns:
           - pattern-either:
               - pattern: new URL($URL).openConnection(...)
+              - pattern: new URL($URL).openStream()
               - pattern: URI.create($URL).toURL().openConnection(...)
+              - pattern: URI.create($URL).toURL().openStream()
               - pattern: HttpRequest.newBuilder(URI.create($URL))
               - pattern: $REST.getForObject($URL, ...)
               - pattern: $REST.getForEntity($URL, ...)
               - pattern: $REST.postForObject($URL, ...)
+              - pattern: $REST.postForEntity($URL, ...)
               - pattern: $REST.exchange($URL, ...)
+              - pattern: new JwkProviderBuilder(new URL($URL))
           - focus-metavariable: $URL
     metadata:
       confidence: MEDIUM

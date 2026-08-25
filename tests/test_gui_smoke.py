@@ -202,6 +202,24 @@ def test_detector_only_result_is_saved_and_opens_review_queue(tmp_path):
     application.processEvents()
 
 
+def test_completed_dirty_repository_is_prominently_marked(tmp_path):
+    application = QApplication.instance() or QApplication([])
+    window = AegisScanWindow(_test_settings(tmp_path))
+    outcome = ScanOutcome(
+        report=ReviewReport(analysis_scratchpad="complete", issues=[]),
+        raw_finding_count=0,
+        batch_count=0,
+        repository_dirty=True,
+    )
+
+    window._scan_completed(outcome)
+
+    assert "dirty tree" in window.global_status.text.text().casefold()
+    assert "cannot be reproduced" in window.new_scan.console.toPlainText()
+    window.close()
+    application.processEvents()
+
+
 def test_degraded_scan_opens_manual_review_without_failure_dialog(tmp_path):
     application = QApplication.instance() or QApplication([])
     window = AegisScanWindow(_test_settings(tmp_path))
