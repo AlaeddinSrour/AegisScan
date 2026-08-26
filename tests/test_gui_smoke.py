@@ -1,5 +1,6 @@
 import os
 import json
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +15,13 @@ from src.models import FindingDisposition, ReviewReport
 
 def _test_settings(tmp_path):
     return QSettings(str(tmp_path / "aegisscan-test.ini"), QSettings.Format.IniFormat)
+
+
+def _wait_until(predicate, timeout_ms=2_000):
+    deadline = time.monotonic() + timeout_ms / 1_000
+    while not predicate() and time.monotonic() < deadline:
+        QTest.qWait(10)
+    assert predicate(), f"condition was not met within {timeout_ms} ms"
 
 
 def test_main_window_builds_with_isolated_settings(tmp_path):
@@ -160,14 +168,14 @@ def test_page_transitions_slide_in_both_directions_and_clean_up(tmp_path):
     assert window.stack.currentWidget() is window.new_scan
     assert window.new_scan.graphicsEffect() is not None
     assert window.new_scan.pos().x() > 0
-    QTest.qWait(300)
+    _wait_until(lambda: window.new_scan.graphicsEffect() is None)
     assert window.new_scan.graphicsEffect() is None
     assert window.new_scan.pos().x() == 0
 
     window.navigate("dashboard")
     assert window.dashboard.graphicsEffect() is not None
     assert window.dashboard.pos().x() < 0
-    QTest.qWait(300)
+    _wait_until(lambda: window.dashboard.graphicsEffect() is None)
     assert window.dashboard.graphicsEffect() is None
     assert window.dashboard.pos().x() == 0
 
