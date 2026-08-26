@@ -16,8 +16,12 @@
   <img src="https://img.shields.io/badge/macOS-12%2B-111111" alt="macOS 12 or newer">
 </p>
 
-> **v0.4.0 beta** — suitable for evaluation and controlled security review. It is
+> **v0.4.1 beta** — suitable for evaluation and controlled security review. It is
 > not a replacement for penetration testing or human verification.
+
+<p align="center">
+  <img src="assets/aegisscan-workspace.png" width="1100" alt="AegisScan security workspace dashboard">
+</p>
 
 ## See the audit, not just an alert list
 

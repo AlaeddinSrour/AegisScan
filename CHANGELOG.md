@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.1 — 2026-08-26
+
+### Changed
+
+- Refined the complete desktop visual system with consistent surfaces, spacing,
+  typography, controls, navigation states, and severity-aware dashboard cards.
+- Added directional slide-and-fade transitions between workspace pages with
+  safe cleanup during rapid navigation.
+- Integrated the native macOS traffic-light controls into AegisScan's own
+  surfaces, removing the detached title bar while preserving native behavior.
+- Reorganized Settings into a compact responsive form and made dense pages
+  scroll safely at the minimum supported window size.
+
+### Quality
+
+- Added GUI regression coverage for minimum-size layouts and bidirectional page
+  transitions.
+- Refreshed the README with a current native workspace screenshot.
+
 ## 0.4.0 — 2026-08-25
 
 ### Added

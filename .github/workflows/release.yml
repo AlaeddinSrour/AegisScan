@@ -126,6 +126,8 @@ jobs:
         Native Intel and Apple Silicon beta builds of AegisScan.
 
         Highlights:
+        - Refined native macOS interface with integrated traffic-light controls and directional page transitions
+        - Consistent responsive layouts, interaction states, and severity-aware dashboard cards
         - OpenRouter and Gemini triage with adaptive batch recovery and opt-in data-collecting routes
         - Deterministic multi-language coverage for SSRF, TOCTOU, open redirect, IDOR, and common injection paths
         - Betterleaks current-tree and Git-history scanning with redacted, consolidated evidence

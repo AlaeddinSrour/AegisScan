@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import (
     QObject,
+    QPoint,
     Property,
     QEasingCurve,
+    QParallelAnimationGroup,
     QPropertyAnimation,
     QRect,
     QSettings,
@@ -83,32 +86,36 @@ APP_STYLE = """
     font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     color: #3d3d3a;
 }
-QMainWindow, QWidget#AppRoot, QWidget#Canvas { background: #faf9f5; }
+QMainWindow, QWidget#AppRoot, QWidget#Canvas { background: #f9f8f4; }
 QFrame#Sidebar {
-    background: #f5f0e8;
+    background: #f3eee6;
     border: 0;
-    border-right: 1px solid #e6dfd8;
-}
-QFrame#Topbar {
-    background: #faf9f5;
-    border: 0;
-    border-bottom: 1px solid #e6dfd8;
+    border-right: 1px solid #e2dbd2;
 }
 QFrame[card="true"] {
-    background: #faf9f5;
-    border: 1px solid #e6dfd8;
-    border-radius: 12px;
+    background: #fdfcf9;
+    border: 1px solid #e2dbd2;
+    border-radius: 14px;
 }
 QFrame[softCard="true"] {
-    background: #efe9de;
-    border: 0;
-    border-radius: 12px;
+    background: #f0eadf;
+    border: 1px solid transparent;
+    border-radius: 14px;
+}
+QFrame[metricCard="true"] {
+    background: #f0eadf;
+    border: 1px solid transparent;
+    border-radius: 14px;
+}
+QFrame[metricCard="true"]:hover {
+    background: #f5efe6;
+    border-color: #d8cfc3;
 }
 QLabel#Brand {
     color: #141413;
     font-family: Inter, -apple-system, sans-serif;
     font-size: 20px;
-    font-weight: 600;
+    font-weight: 700;
 }
 QLabel#BrandMark {
     background: transparent;
@@ -119,25 +126,26 @@ QLabel#BrandMark {
     font-weight: 400;
 }
 QLabel#Eyebrow {
-    color: #6c6a64;
+    color: #767169;
     font-family: Inter, -apple-system, sans-serif;
     font-size: 11px;
-    font-weight: 500;
+    font-weight: 600;
+    letter-spacing: 0.6px;
 }
 QLabel#PageTitle {
     color: #141413;
     font-family: "Iowan Old Style", Georgia, "Times New Roman", serif;
-    font-size: 34px;
+    font-size: 35px;
     font-weight: 400;
 }
 QLabel#PageSubtitle {
-    color: #6c6a64;
+    color: #706c65;
     font-size: 14px;
 }
 QLabel#SectionTitle {
     color: #252523;
     font-size: 16px;
-    font-weight: 500;
+    font-weight: 600;
 }
 QLabel#HeroTitle {
     color: #141413;
@@ -150,7 +158,12 @@ QLabel#HeroKicker {
     font-size: 11px;
     font-weight: 500;
 }
-QLabel#Muted, QLabel#MetricLabel { color: #6c6a64; font-size: 12px; }
+QLabel#Muted, QLabel#MetricLabel { color: #706c65; font-size: 12px; }
+QWidget[statusPill="true"] {
+    background: #edf5ec;
+    border: 1px solid #d7e8d6;
+    border-radius: 10px;
+}
 QLabel#MetricValue {
     color: #141413;
     font-family: "Iowan Old Style", Georgia, "Times New Roman", serif;
@@ -162,22 +175,23 @@ QLabel#Warning { color: #d4a017; font-weight: 500; }
 QLabel#Danger { color: #c64545; font-weight: 500; }
 QLabel#Accent { color: #8b4651; font-weight: 500; }
 QLabel[pill="true"] {
-    background: #faf9f5;
-    border: 1px solid #e6dfd8;
-    border-radius: 8px;
+    background: #fffefa;
+    border: 1px solid #ded6cc;
+    border-radius: 10px;
     color: #3d3d3a;
-    padding: 8px 12px;
+    padding: 9px 13px;
 }
 QPushButton {
-    background: #faf9f5;
-    border: 1px solid #e6dfd8;
-    border-radius: 8px;
+    background: #fffefa;
+    border: 1px solid #ddd5ca;
+    border-radius: 10px;
     padding: 10px 16px;
     color: #141413;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
 }
-QPushButton:pressed { background: #efe9de; }
+QPushButton:hover { background: #f4eee5; border-color: #cfc4b7; }
+QPushButton:pressed { background: #e9e1d6; }
 QPushButton:disabled { color: #8e8b82; background: #e6dfd8; border-color: #e6dfd8; }
 QPushButton[primary="true"] {
     background: #8b4651;
@@ -185,18 +199,25 @@ QPushButton[primary="true"] {
     color: #ffffff;
     padding: 11px 18px;
 }
+QPushButton[primary="true"]:hover { background: #984f5b; border-color: #984f5b; }
 QPushButton[primary="true"]:pressed { background: #6f3540; border-color: #6f3540; }
 QPushButton[nav="true"] {
     background: transparent;
-    border: 0;
-    border-radius: 8px;
+    border: 0 solid transparent;
+    border-left-width: 3px;
+    border-radius: 9px;
     color: #6c6a64;
     text-align: left;
-    padding: 9px 11px;
+    padding: 9px 11px 9px 10px;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
 }
-QPushButton[nav="true"][active="true"] { background: #e8e0d2; color: #141413; }
+QPushButton[nav="true"]:hover { background: #ece5da; color: #282725; }
+QPushButton[nav="true"][active="true"] {
+    background: #e6ddd0;
+    border-left-color: #8b4651;
+    color: #141413;
+}
 QToolButton[section="true"] {
     background: transparent;
     border: 0;
@@ -204,18 +225,23 @@ QToolButton[section="true"] {
     text-align: left;
     padding: 11px 7px 6px 7px;
     font-size: 10px;
-    font-weight: 500;
+    font-weight: 600;
 }
+QToolButton[section="true"]:hover { color: #8b4651; }
 QLineEdit, QSpinBox, QComboBox {
-    background: #faf9f5;
-    border: 1px solid #e6dfd8;
-    border-radius: 8px;
+    background: #fffefa;
+    border: 1px solid #ddd5ca;
+    border-radius: 10px;
     padding: 9px 12px;
     color: #141413;
     selection-background-color: #8b4651;
     min-height: 20px;
 }
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 2px solid #8b4651; }
+QLineEdit:hover, QSpinBox:hover, QComboBox:hover { border-color: #c9bdb0; }
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #8b4651; }
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+    background: #eeeae3; color: #99948b; border-color: #e3ddd5;
+}
 QComboBox::drop-down { border: 0; width: 28px; }
 QComboBox QAbstractItemView {
     background: #faf9f5;
@@ -223,41 +249,50 @@ QComboBox QAbstractItemView {
     selection-background-color: #efe9de;
     selection-color: #141413;
 }
-QCheckBox { color: #3d3d3a; spacing: 8px; }
-QCheckBox::indicator {
-    width: 17px; height: 17px; border-radius: 4px;
-    border: 1px solid #e6dfd8; background: #faf9f5;
+QCheckBox {
+    color: #3d3d3a;
+    spacing: 9px;
+    padding: 7px 6px;
+    border-radius: 8px;
 }
+QCheckBox:hover { background: #f2ece3; }
+QCheckBox:disabled { color: #99948b; }
+QCheckBox::indicator {
+    width: 18px; height: 18px; border-radius: 5px;
+    border: 1px solid #d5ccc0; background: #fffefa;
+}
+QCheckBox::indicator:hover { border-color: #8b4651; }
 QCheckBox::indicator:checked { background: #8b4651; border-color: #8b4651; }
 QProgressBar {
-    background: #e6dfd8; border: 0; border-radius: 3px; height: 6px; text-align: center;
+    background: #e2dbd2; border: 0; border-radius: 4px; height: 8px; text-align: center;
 }
-QProgressBar::chunk { background: #8b4651; border-radius: 3px; }
+QProgressBar::chunk { background: #8b4651; border-radius: 4px; }
 QTableWidget {
-    background: #faf9f5;
-    alternate-background-color: #f5f0e8;
-    border: 1px solid #e6dfd8;
-    border-radius: 12px;
+    background: #fdfcf9;
+    alternate-background-color: #f6f2eb;
+    border: 1px solid #e2dbd2;
+    border-radius: 14px;
     gridline-color: transparent;
     selection-background-color: #efe9de;
     selection-color: #141413;
     outline: 0;
 }
 QHeaderView::section {
-    background: #f5f0e8;
+    background: #f1ece4;
     color: #6c6a64;
     border: 0;
     border-bottom: 1px solid #e6dfd8;
-    padding: 10px;
+    padding: 11px 10px;
     font-size: 11px;
-    font-weight: 500;
+    font-weight: 600;
 }
 QTableWidget::item { padding: 9px; border-bottom: 1px solid #ebe6df; }
+QTableWidget::item:hover { background: #f3ece3; }
 QPlainTextEdit, QTextEdit {
-    background: #181715;
-    border: 0;
-    border-radius: 12px;
-    padding: 14px;
+    background: #1c1b19;
+    border: 1px solid #302e2a;
+    border-radius: 14px;
+    padding: 15px;
     color: #faf9f5;
     selection-background-color: #6f3540;
     font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
@@ -267,12 +302,22 @@ QScrollArea { border: 0; background: transparent; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #d8d0c4; min-height: 30px; border-radius: 5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #d8d0c4; min-width: 30px; border-radius: 5px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QSplitter::handle { background: #e6dfd8; width: 1px; }
 QMenuBar { background: #faf9f5; color: #3d3d3a; border-bottom: 1px solid #e6dfd8; }
 QMenuBar::item:selected { background: #efe9de; border-radius: 6px; }
 QMenu { background: #faf9f5; border: 1px solid #e6dfd8; padding: 6px; }
 QMenu::item { padding: 7px 28px 7px 12px; border-radius: 6px; }
 QMenu::item:selected { background: #efe9de; color: #141413; }
+QToolTip {
+    background: #252421;
+    color: #faf9f5;
+    border: 1px solid #3b3935;
+    border-radius: 7px;
+    padding: 7px 9px;
+}
 QMessageBox {
     background-color: #faf9f5;
 }
@@ -298,6 +343,10 @@ QMessageBox QTextEdit {
 """
 
 EVIDENCE_ROWS_PER_PAGE = 250
+MACOS_TITLEBAR_INSET = 28 if sys.platform == "darwin" else 0
+PAGE_MARGINS = (32, 25 + MACOS_TITLEBAR_INSET, 32, 30)
+PAGE_SPACING = 16
+CARD_MARGINS = (22, 20, 22, 20)
 
 
 SEVERITY_COLORS = {
@@ -327,6 +376,48 @@ def primary_button(text: str, callback: Callable[[], None]) -> QPushButton:
     button.setProperty("primary", True)
     button.clicked.connect(callback)
     return button
+
+
+def configure_page(layout: QVBoxLayout) -> None:
+    """Apply the shared rhythm used by every workspace page."""
+    layout.setContentsMargins(*PAGE_MARGINS)
+    layout.setSpacing(PAGE_SPACING)
+
+
+def configure_card(layout: QLayout, spacing: int = 12) -> None:
+    """Apply consistent inner spacing to standard cards."""
+    layout.setContentsMargins(*CARD_MARGINS)
+    layout.setSpacing(spacing)
+
+
+def hide_macos_visual_window_title(window: QMainWindow) -> None:
+    """Hide the native title text while retaining its accessible window name."""
+    if sys.platform != "darwin" or QApplication.platformName() != "cocoa":
+        return
+    try:
+        import ctypes
+
+        # Objective-C is already loaded by Qt's Cocoa platform plugin. Using
+        # the process namespace also avoids bundling a system-library path.
+        objc = ctypes.CDLL(None)
+        selector = objc.sel_registerName
+        selector.restype = ctypes.c_void_p
+        selector.argtypes = [ctypes.c_char_p]
+        send_id = ctypes.CFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+        )(("objc_msgSend", objc))
+        send_integer = ctypes.CFUNCTYPE(
+            None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long
+        )(("objc_msgSend", objc))
+        native_view = ctypes.c_void_p(int(window.winId()))
+        native_window = send_id(native_view, selector(b"window"))
+        if native_window:
+            # NSWindowTitleHidden = 1. This changes only presentation; the
+            # QWindow title remains available to macOS and assistive tools.
+            send_integer(native_window, selector(b"setTitleVisibility:"), 1)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # The Qt title-bar hints still provide the integrated fallback.
+        return
 
 
 def pipeline_step(number: str, title: str, description: str) -> QFrame:
@@ -391,7 +482,7 @@ class HeroPanel(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect().adjusted(0, 0, -1, -1)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#efe9de"))
+        painter.setBrush(QColor("#f0eadf"))
         painter.drawRoundedRect(rect, 16, 16)
         painter.end()
         super().paintEvent(event)  # type: ignore[arg-type]
@@ -531,9 +622,11 @@ class PulseDot(QWidget):
 class StatusIndicator(QWidget):
     def __init__(self) -> None:
         super().__init__()
+        self.setProperty("statusPill", True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setContentsMargins(7, 2, 10, 2)
+        layout.setSpacing(2)
         self.dot = PulseDot()
         self.text = label("Ready", "Good")
         layout.addWidget(self.dot)
@@ -547,40 +640,65 @@ class StatusIndicator(QWidget):
 
 
 class FadeStackedWidget(QStackedWidget):
+    """Stacked workspace pages with a fast, directional entrance transition."""
+
     def __init__(self) -> None:
         super().__init__()
-        self._fade_animation: QPropertyAnimation | None = None
-        self._fade_page: QWidget | None = None
+        self._transition: QParallelAnimationGroup | None = None
+        self._transition_page: QWidget | None = None
+        self._transition_effect: QGraphicsOpacityEffect | None = None
+        self._transition_end = QPoint()
 
     def fade_to(self, index: int) -> None:
-        if index == self.currentIndex():
+        previous_index = self.currentIndex()
+        if index == previous_index:
             return
-        if self._fade_animation is not None:
-            self._fade_animation.stop()
-        if self._fade_page is not None:
-            self._fade_page.setGraphicsEffect(None)
+        self._finish_transition()
+
+        moving_forward = index > previous_index
         self.setCurrentIndex(index)
         page = self.currentWidget()
+        end_position = page.pos()
+        offset = max(20, min(30, self.width() // 38))
+        start_position = end_position + QPoint(offset if moving_forward else -offset, 0)
+
         effect = QGraphicsOpacityEffect(page)
         effect.setOpacity(0.0)
         page.setGraphicsEffect(effect)
-        animation = QPropertyAnimation(effect, b"opacity", self)
-        animation.setDuration(210)
-        animation.setStartValue(0.0)
-        animation.setEndValue(1.0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.finished.connect(lambda: self._finish_fade(page, effect))
-        self._fade_page = page
-        self._fade_animation = animation
-        animation.start()
+        page.move(start_position)
 
-    def _finish_fade(self, page: QWidget, effect: QGraphicsOpacityEffect) -> None:
-        effect.setOpacity(1.0)
-        if page.graphicsEffect() is effect:
-            page.setGraphicsEffect(None)
-        if self._fade_page is page:
-            self._fade_page = None
-            self._fade_animation = None
+        group = QParallelAnimationGroup(self)
+        slide = QPropertyAnimation(page, b"pos", group)
+        slide.setDuration(260)
+        slide.setStartValue(start_position)
+        slide.setEndValue(end_position)
+        slide.setEasingCurve(QEasingCurve.Type.OutQuart)
+        fade = QPropertyAnimation(effect, b"opacity", group)
+        fade.setDuration(220)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        group.addAnimation(slide)
+        group.addAnimation(fade)
+        group.finished.connect(self._finish_transition)
+
+        self._transition = group
+        self._transition_page = page
+        self._transition_effect = effect
+        self._transition_end = end_position
+        group.start()
+
+    def _finish_transition(self) -> None:
+        if self._transition is not None:
+            self._transition.stop()
+            self._transition.deleteLater()
+        if self._transition_page is not None:
+            self._transition_page.move(self._transition_end)
+            if self._transition_page.graphicsEffect() is self._transition_effect:
+                self._transition_page.setGraphicsEffect(None)
+        self._transition = None
+        self._transition_page = None
+        self._transition_effect = None
 
 
 class SeverityDistribution(QWidget):
@@ -649,7 +767,7 @@ class SeverityBadge(QFrame):
         layout.addWidget(label(severity.title(), "Muted"))
         layout.addStretch()
         self.value = QLabel("0")
-        self.value.setStyleSheet(f"color: {accent}; font-size: 16px; font-weight: 750;")
+        self.value.setStyleSheet(f"color: {accent}; font-size: 16px; font-weight: 700;")
         layout.addWidget(self.value)
 
     def set_count(self, count: int) -> None:
@@ -763,30 +881,31 @@ class NavSection(QWidget):
 class MetricCard(QFrame):
     def __init__(self, title: str, value: str, accent: str, icon: str, context: str) -> None:
         super().__init__()
-        self.setProperty("card", True)
-        object_name = "Metric" + title.replace(" ", "").replace("&", "")
-        self.setObjectName(object_name)
-        self.setStyleSheet(
-            f"QFrame#{object_name} {{ background: #efe9de; border: 0; border-radius: 12px; }}"
-            f"QFrame#{object_name} QLabel {{ color: #3d3d3a; }}"
-        )
+        self.setProperty("metricCard", True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.accent = accent
         self.current_number = int(value)
         self.target_number = int(value)
         self.value_timer = QTimer(self)
         self.value_timer.timeout.connect(self._animate_value)
-        self.setMinimumHeight(132)
-        elevate(self, 22, 62)
+        self.setMinimumHeight(140)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setContentsMargins(18, 0, 18, 16)
         layout.setSpacing(5)
+        accent_bar = QFrame()
+        accent_bar.setFixedHeight(4)
+        accent_bar.setStyleSheet(
+            f"background: {accent}; border: 0; border-radius: 2px;"
+        )
+        layout.addWidget(accent_bar)
+        layout.addSpacing(8)
         top = QHBoxLayout()
         top.addStretch()
         icon_label = QLabel(icon)
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_label.setFixedSize(30, 30)
         icon_label.setStyleSheet(
-            "background: #181715; color: #faf9f5; border: 0; "
+            f"background: {accent}; color: #ffffff; border: 0; "
             "border-radius: 15px; font-family: Inter; font-size: 13px; font-weight: 500;"
         )
         top.addWidget(icon_label)
@@ -822,20 +941,12 @@ class MetricCard(QFrame):
             self.current_number = self.target_number
         self.value.setText(str(self.current_number))
 
-    def enterEvent(self, event: object) -> None:
-        super().enterEvent(event)  # type: ignore[arg-type]
-
-    def leaveEvent(self, event: object) -> None:
-        super().leaveEvent(event)  # type: ignore[arg-type]
-
-
 class DashboardPage(QWidget):
     def __init__(self, app: "AegisScanWindow") -> None:
         super().__init__()
         self.app = app
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 22, 30, 26)
-        layout.setSpacing(14)
+        configure_page(layout)
         context_row = QHBoxLayout()
         command_center = label("SECURITY WORKSPACE", "Eyebrow")
         command_center.setWordWrap(False)
@@ -848,7 +959,7 @@ class DashboardPage(QWidget):
 
         hero = HeroPanel()
         hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(30, 24, 30, 24)
+        hero_layout.setContentsMargins(32, 26, 32, 26)
         hero_layout.setSpacing(24)
         hero_copy = QVBoxLayout()
         hero_copy.setSpacing(7)
@@ -903,7 +1014,7 @@ class DashboardPage(QWidget):
         severity = card()
         severity.setObjectName("DarkCard")
         severity.setStyleSheet(
-            "QFrame#DarkCard { background: #181715; border: 0; border-radius: 12px; }"
+            "QFrame#DarkCard { background: #181715; border: 0; border-radius: 14px; }"
             "QFrame#DarkCard QLabel { color: #faf9f5; }"
             "QFrame#DarkCard QLabel#Muted, QFrame#DarkCard QLabel#Eyebrow { color: #a09d96; }"
         )
@@ -922,7 +1033,7 @@ class DashboardPage(QWidget):
         posture = card()
         posture.setObjectName("CreamCard")
         posture.setStyleSheet(
-            "QFrame#CreamCard { background: #efe9de; border: 0; border-radius: 12px; }"
+            "QFrame#CreamCard { background: #f0eadf; border: 0; border-radius: 14px; }"
         )
         posture_layout = QVBoxLayout(posture)
         posture_layout.setContentsMargins(20, 17, 20, 17)
@@ -1136,8 +1247,8 @@ class NewScanPage(QWidget):
         page_layout.addWidget(self.scroll_area)
 
         outer = QVBoxLayout(self.scroll_content)
-        outer.setContentsMargins(28, 24, 28, 28)
-        outer.setSpacing(16)
+        outer.setContentsMargins(*PAGE_MARGINS)
+        outer.setSpacing(PAGE_SPACING)
         outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.addWidget(label("SCANS / NEW AUDIT", "Eyebrow"))
         outer.addWidget(label("Configure a full-repository audit", "PageTitle"))
@@ -1164,8 +1275,7 @@ class NewScanPage(QWidget):
         self.config_card = config
         config.setMinimumHeight(820)
         config_layout = QVBoxLayout(config)
-        config_layout.setContentsMargins(22, 20, 22, 20)
-        config_layout.setSpacing(12)
+        configure_card(config_layout)
         config_layout.addWidget(label("Audit configuration", "SectionTitle"))
         config_layout.addWidget(label("Repository", "Muted"))
         repo_row = QHBoxLayout()
@@ -1322,13 +1432,14 @@ class NewScanPage(QWidget):
         self.live_card = live
         live.setMinimumHeight(680)
         live_layout = QVBoxLayout(live)
-        live_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(live_layout)
         live_layout.addWidget(label("Live audit", "SectionTitle"))
         self.live_status = label("Waiting for configuration", "Muted")
         live_layout.addWidget(self.live_status)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
+        self.progress.setTextVisible(False)
         live_layout.addWidget(self.progress)
         self.idle_panel = card(soft=True)
         self.idle_panel.setMinimumHeight(158)
@@ -1476,8 +1587,7 @@ class ActivityPage(QWidget):
         super().__init__()
         self.app = app
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(16)
+        configure_page(layout)
         layout.addWidget(label("SCANS / ACTIVITY", "Eyebrow"))
         title_row = QHBoxLayout()
         title_column = QVBoxLayout()
@@ -1574,8 +1684,7 @@ class FindingsPage(QWidget):
         self.filtered_issues: list[ReviewIssue] = []
         self.selected_issue: ReviewIssue | None = None
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(15)
+        configure_page(layout)
         layout.addWidget(label("FINDINGS / PRIORITIZED", "Eyebrow"))
         layout.addWidget(
             label("Critical & high risk" if high_only else "Confirmed findings", "PageTitle")
@@ -1806,8 +1915,7 @@ class DispositionPage(QWidget):
         self.page_index = 0
         self.page_size = EVIDENCE_ROWS_PER_PAGE
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(15)
+        configure_page(layout)
         layout.addWidget(label("FINDINGS / EVIDENCE LEDGER", "Eyebrow"))
         layout.addWidget(label(title, "PageTitle"))
         layout.addWidget(label(subtitle, "PageSubtitle"))
@@ -1963,8 +2071,7 @@ class ReportsPage(QWidget):
         super().__init__()
         self.app = app
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(16)
+        configure_page(layout)
         layout.addWidget(label("WORKSPACE / REPORTS", "Eyebrow"))
         layout.addWidget(label("Audit reports", "PageTitle"))
         layout.addWidget(
@@ -1975,7 +2082,7 @@ class ReportsPage(QWidget):
         )
         summary = card()
         summary_layout = QHBoxLayout(summary)
-        summary_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(summary_layout)
         summary_text = QVBoxLayout()
         summary_text.addWidget(label("Current session report", "SectionTitle"))
         self.summary = label("No audit has been completed in this session.", "Muted")
@@ -1988,7 +2095,7 @@ class ReportsPage(QWidget):
 
         reasoning = card()
         reasoning_layout = QVBoxLayout(reasoning)
-        reasoning_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(reasoning_layout)
         reasoning_layout.addWidget(label("Audit reasoning trace", "SectionTitle"))
         reasoning_layout.addWidget(
             label(
@@ -2024,8 +2131,7 @@ class IntegrationsPage(QWidget):
         super().__init__()
         self.app = app
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(16)
+        configure_page(layout)
         layout.addWidget(label("WORKSPACE / INTEGRATIONS", "Eyebrow"))
         layout.addWidget(label("Optional integrations", "PageTitle"))
         layout.addWidget(
@@ -2036,7 +2142,7 @@ class IntegrationsPage(QWidget):
         )
         github_card = card()
         card_layout = QVBoxLayout(github_card)
-        card_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(card_layout)
         top = QHBoxLayout()
         top.addWidget(label("GitHub pull requests", "SectionTitle"))
         top.addStretch()
@@ -2082,8 +2188,7 @@ class ReadinessPage(QWidget):
         self.app = app
         self.statuses: list[ScannerStatus] = []
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(16)
+        configure_page(layout)
         layout.addWidget(label("WORKSPACE / READINESS", "Eyebrow"))
 
         header = QHBoxLayout()
@@ -2187,9 +2292,19 @@ class SettingsPage(QWidget):
     def __init__(self, app: "AegisScanWindow") -> None:
         super().__init__()
         self.app = app
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(16)
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("Canvas")
+        page_layout.addWidget(self.scroll_area)
+
+        layout = QVBoxLayout(self.scroll_content)
+        configure_page(layout)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         layout.addWidget(label("WORKSPACE / SETTINGS", "Eyebrow"))
         layout.addWidget(label("Application settings", "PageTitle"))
         layout.addWidget(
@@ -2203,7 +2318,7 @@ class SettingsPage(QWidget):
         grid.setSpacing(14)
         ai = card()
         ai_layout = QVBoxLayout(ai)
-        ai_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(ai_layout, 8)
         ai_layout.addWidget(label("AI provider", "SectionTitle"))
         self.ai_triage = QCheckBox("Use AI for contextual triage")
         self.ai_triage.setChecked(app.ai_triage)
@@ -2254,26 +2369,34 @@ class SettingsPage(QWidget):
 
         audit = card()
         audit_layout = QVBoxLayout(audit)
-        audit_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(audit_layout, 8)
         audit_layout.addWidget(label("Audit defaults", "SectionTitle"))
-        audit_layout.addWidget(label("Findings per batch", "Muted"))
+
+        defaults_grid = QGridLayout()
+        defaults_grid.setContentsMargins(0, 0, 0, 0)
+        defaults_grid.setHorizontalSpacing(12)
+        defaults_grid.setVerticalSpacing(5)
+        defaults_grid.addWidget(label("Findings per batch", "Muted"), 0, 0)
+        defaults_grid.addWidget(label("Maximum Semgrep file size (MB)", "Muted"), 0, 1)
         self.batch = QSpinBox()
         self.batch.setRange(1, 15)
         self.batch.setValue(app.batch_size)
         self.batch.setEnabled(app.ai_triage)
         self.batch.valueChanged.connect(app.set_batch_size)
-        audit_layout.addWidget(self.batch)
-        audit_layout.addWidget(label("Maximum Semgrep file size (MB)", "Muted"))
+        self.batch.setMinimumHeight(40)
+        defaults_grid.addWidget(self.batch, 1, 0)
         self.max_target_mb = QSpinBox()
         self.max_target_mb.setRange(1, 100)
         self.max_target_mb.setValue(app.max_target_mb)
         self.max_target_mb.valueChanged.connect(app.set_max_target_mb)
-        audit_layout.addWidget(self.max_target_mb)
-        audit_layout.addWidget(label("Semgrep exclusions (comma-separated)", "Muted"))
+        self.max_target_mb.setMinimumHeight(40)
+        defaults_grid.addWidget(self.max_target_mb, 1, 1)
+        defaults_grid.addWidget(label("Semgrep exclusions (comma-separated)", "Muted"), 2, 0)
+        defaults_grid.addWidget(label("Semgrep rule mode", "Muted"), 2, 1)
         self.exclusions = QLineEdit(app.exclusion_text)
         self.exclusions.textChanged.connect(app.set_exclusion_text)
-        audit_layout.addWidget(self.exclusions)
-        audit_layout.addWidget(label("Semgrep rule mode", "Muted"))
+        self.exclusions.setMinimumHeight(40)
+        defaults_grid.addWidget(self.exclusions, 3, 0)
         self.rule_mode = QComboBox()
         self.rule_mode.addItem("Reproducible · bundled rules only", "bundled")
         self.rule_mode.addItem("Extended · live registry augmentation", "extended")
@@ -2282,7 +2405,10 @@ class SettingsPage(QWidget):
         self.rule_mode.currentIndexChanged.connect(
             lambda _index: app.set_semgrep_rule_mode(str(self.rule_mode.currentData()))
         )
-        audit_layout.addWidget(self.rule_mode)
+        self.rule_mode.setMinimumHeight(40)
+        defaults_grid.addWidget(self.rule_mode, 3, 1)
+        audit_layout.addLayout(defaults_grid)
+        audit_layout.addSpacing(2)
         self.dependency_scan = QCheckBox("Enable OSV dependency scanning")
         self.dependency_scan.setChecked(app.dependency_scan)
         self.dependency_scan.toggled.connect(app.set_dependency_scan)
@@ -2297,21 +2423,37 @@ class SettingsPage(QWidget):
         audit_layout.addWidget(self.auto_fix)
         audit_layout.addStretch()
         grid.addWidget(audit, 0, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
         about = card()
         about_layout = QVBoxLayout(about)
-        about_layout.setContentsMargins(22, 20, 22, 20)
+        configure_card(about_layout, 8)
         about_layout.addWidget(label("Protection layers", "SectionTitle"))
-        about_layout.addWidget(label("✓  Explicit Semgrep completeness status", "Good"))
-        about_layout.addWidget(label("✓  Per-candidate disposition ledger", "Good"))
-        about_layout.addWidget(label("✓  Runtime / fixture scope classification", "Good"))
-        about_layout.addWidget(label("✓  Evidence-backed confirmation gate", "Good"))
-        about_layout.addWidget(label("✓  Manual secret-remediation gate", "Good"))
-        about_layout.addWidget(label("✓  OSV dependency advisory matching", "Good"))
-        about_layout.addWidget(label("✓  Redacted current/history secret detection", "Good"))
+        protection_grid = QGridLayout()
+        protection_grid.setHorizontalSpacing(28)
+        protection_grid.setVerticalSpacing(6)
+        protections = (
+            "Explicit Semgrep completeness status",
+            "Per-candidate disposition ledger",
+            "Runtime / fixture scope classification",
+            "Evidence-backed confirmation gate",
+            "Manual secret-remediation gate",
+            "OSV dependency advisory matching",
+            "Redacted current/history secret detection",
+            "Session-only credential handling",
+        )
+        for index, protection in enumerate(protections):
+            protection_grid.addWidget(
+                label(f"✓  {protection}", "Good"), index % 4, index // 4
+            )
+        protection_grid.setColumnStretch(0, 1)
+        protection_grid.setColumnStretch(1, 1)
+        about_layout.addLayout(protection_grid)
         grid.addWidget(about, 1, 0, 1, 2)
         layout.addLayout(grid)
         layout.addStretch()
+        self.scroll_area.setWidget(self.scroll_content)
 
     def sync_api_key(self, value: str) -> None:
         self.api_key.blockSignals(True)
@@ -2388,11 +2530,24 @@ class AegisScanWindow(QMainWindow):
         self.page_indexes: dict[str, int] = {}
 
         self.setWindowTitle("AegisScan")
+        if sys.platform == "darwin":
+            # PySide 6.11 still associates the expanded-client-area value with
+            # an older deprecated enum alias even though Qt 6.9+ documents the
+            # new hint. Suppress only that binding-level compatibility warning.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*MaximizeUsingFullscreenGeometryHint.*",
+                    category=DeprecationWarning,
+                )
+                self.setWindowFlag(Qt.WindowType.ExpandedClientAreaHint, True)
+                self.setWindowFlag(Qt.WindowType.NoTitleBarBackgroundHint, True)
         self.resize(1360, 840)
         self.setMinimumSize(QSize(1100, 700))
         self.setStyleSheet(APP_STYLE)
         self._build_menu()
         self._build_shell()
+        hide_macos_visual_window_title(self)
         restored_section = str(self.settings.value("last_section", "dashboard"))
         self.navigate(restored_section if restored_section in self.page_indexes else "dashboard")
 
@@ -2441,9 +2596,9 @@ class AegisScanWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(246)
+        sidebar.setFixedWidth(252)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(16, 20, 16, 18)
+        sidebar_layout.setContentsMargins(16, 22 + MACOS_TITLEBAR_INSET, 16, 18)
         sidebar_layout.setSpacing(4)
         brand_row = QHBoxLayout()
         mark = QLabel("✣")
@@ -2494,7 +2649,13 @@ class AegisScanWindow(QMainWindow):
         protection = card(soft=True)
         protection_layout = QVBoxLayout(protection)
         protection_layout.setContentsMargins(12, 11, 12, 11)
-        protection_layout.addWidget(label("PROTECTION ACTIVE", "Eyebrow"))
+        protection_header = QHBoxLayout()
+        protection_header.setSpacing(6)
+        protection_header.addWidget(label("SYSTEM STATUS", "Eyebrow"))
+        protection_header.addStretch()
+        self.global_status = StatusIndicator()
+        protection_header.addWidget(self.global_status)
+        protection_layout.addLayout(protection_header)
         sidebar_health = QProgressBar()
         sidebar_health.setRange(0, 100)
         sidebar_health.setValue(100)
@@ -2509,27 +2670,6 @@ class AegisScanWindow(QMainWindow):
         main_layout = QVBoxLayout(main)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        topbar = QFrame()
-        topbar.setObjectName("Topbar")
-        topbar.setFixedHeight(66)
-        topbar_layout = QHBoxLayout(topbar)
-        topbar_layout.setContentsMargins(26, 0, 26, 0)
-        banner_title = QLabel("AegisScan security workspace")
-        banner_title.setStyleSheet(
-            "color: #141413; font-family: 'Iowan Old Style', Georgia, serif; "
-            "font-size: 18px; font-weight: 400;"
-        )
-        topbar_layout.addWidget(banner_title)
-        topbar_layout.addSpacing(18)
-        self.breadcrumb = label("Dashboard", "Muted")
-        self.breadcrumb.setWordWrap(False)
-        topbar_layout.addWidget(self.breadcrumb)
-        topbar_layout.addStretch()
-        self.global_status = StatusIndicator()
-        topbar_layout.addWidget(self.global_status)
-        quick_scan = primary_button("New audit", lambda: self.navigate("new_scan"))
-        topbar_layout.addWidget(quick_scan)
-        main_layout.addWidget(topbar)
 
         self.stack = FadeStackedWidget()
         self.dashboard = DashboardPage(self)
@@ -2582,20 +2722,6 @@ class AegisScanWindow(QMainWindow):
         self.settings.setValue("last_section", key)
         for button in self.nav_buttons:
             button.set_active(button.page_key == key)
-        names = {
-            "dashboard": "Dashboard",
-            "new_scan": "Scans  /  New audit",
-            "activity": "Scans  /  Activity",
-            "findings": "Findings  /  Confirmed",
-            "high_risk": "Findings  /  Critical & high",
-            "review_queue": "Findings  /  Needs review",
-            "non_runtime": "Findings  /  Non-runtime",
-            "reports": "Workspace  /  Reports",
-            "integrations": "Workspace  /  Integrations",
-            "readiness": "Workspace  /  Scanner readiness",
-            "settings": "Workspace  /  Settings",
-        }
-        self.breadcrumb.setText(names[key])
         page = self.stack.currentWidget()
         refresh = getattr(page, "refresh", None)
         if refresh:

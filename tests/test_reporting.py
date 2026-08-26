@@ -91,7 +91,7 @@ def test_json_report_records_reproducible_rule_identity():
     assert payload["summary"]["firmware_findings"] == 0
     assert payload["summary"]["needs_review"] == 1
     assert payload["summary"]["provenance"] == {
-            "aegisscan_version": "0.4.0",
+        "aegisscan_version": "0.4.1",
         "scan_started_at": "2026-08-20T10:00:00+00:00",
         "scan_completed_at": "2026-08-20T10:01:00+00:00",
         "repository_name": "juice-shop",
