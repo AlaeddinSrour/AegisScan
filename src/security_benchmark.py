@@ -14,6 +14,7 @@ class Finding:
     line: int
     status: str = "DETECTED"
     fingerprint: str = ""
+    suppressed: bool = False
 
 
 def _normalized_path(value: str) -> str:
@@ -70,6 +71,10 @@ def findings_from_sarif(payload: dict[str, Any]) -> tuple[list[Finding], dict[st
                 status=str(result.get("properties", {}).get("status", "UNKNOWN")),
                 fingerprint=str(
                     result.get("partialFingerprints", {}).get("aegisscanFindingId", "")
+                ),
+                suppressed=any(
+                    item.get("status") == "accepted"
+                    for item in result.get("suppressions", [])
                 ),
             )
         )
@@ -137,9 +142,11 @@ def evaluate(
     scoped = [
         finding
         for finding in findings
-        if (not prefixes and not exact_rules)
+        if not finding.suppressed
+        and finding.status not in {"FALSE_POSITIVE", "DUPLICATE", "NON_RUNTIME"}
+        and ((not prefixes and not exact_rules)
         or finding.rule_id in exact_rules
-        or finding.rule_id.startswith(prefixes)
+        or finding.rule_id.startswith(prefixes))
     ]
     unique: list[Finding] = []
     seen: set[tuple[str, str, int, str]] = set()

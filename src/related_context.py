@@ -27,8 +27,9 @@ def _contained_file(root: Path, source: Path, module: str) -> Path | None:
         candidates.extend(base / f"index{suffix}" for suffix in _SOURCE_SUFFIXES)
     for candidate in candidates:
         try:
+            candidate = candidate.resolve(strict=True)
             candidate.relative_to(root)
-        except ValueError:
+        except (ValueError, OSError, RuntimeError):
             continue
         if candidate.is_file() and candidate.suffix.casefold() in _SOURCE_SUFFIXES:
             return candidate

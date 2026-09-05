@@ -113,7 +113,7 @@ def test_apply_auto_fixes_skips_manual_secret_remediation():
     assert apply_auto_fixes([issue]) is False
 
 
-def test_individual_patch_eligibility_accepts_safe_runtime_fix():
+def test_individual_patch_eligibility_requires_language_validation():
     issue = ReviewIssue(
         file="routes/search.ts",
         line=12,
@@ -128,8 +128,8 @@ def test_individual_patch_eligibility_accepts_safe_runtime_fix():
 
     eligible, reason = auto_fix_eligibility(issue)
 
-    assert eligible is True
-    assert "passed" in reason
+    assert eligible is False
+    assert "no local patch syntax validator" in reason
 
 
 def test_individual_patch_eligibility_explains_manual_gate():
@@ -150,7 +150,7 @@ def test_individual_patch_eligibility_explains_manual_gate():
     assert "manual remediation" in reason
 
 
-def test_individual_patch_changes_only_the_selected_finding(tmp_path):
+def test_unvetted_model_patch_does_not_modify_any_file(tmp_path):
     first = tmp_path / "first.py"
     second = tmp_path / "second.py"
     first.write_text("dangerous_one()\n", encoding="utf-8")
@@ -167,8 +167,8 @@ def test_individual_patch_changes_only_the_selected_finding(tmp_path):
         code_role="RUNTIME",
     )
 
-    assert apply_auto_fixes([selected], str(tmp_path)) is True
-    assert first.read_text(encoding="utf-8") == "safe_one()\n"
+    assert apply_auto_fixes([selected], str(tmp_path)) is False
+    assert first.read_text(encoding="utf-8") == "dangerous_one()\n"
     assert second.read_text(encoding="utf-8") == "dangerous_two()\n"
 
 
@@ -287,3 +287,31 @@ def test_post_inline_comments_fallback_on_failure():
     fallback_body = mock_pr.create_issue_comment.call_args[0][0]
     assert "AegisScan" in fallback_body
     assert "test.py" in fallback_body
+
+
+@pytest.mark.parametrize("suffix", [".ts", ".js", ".java", ".go", ".cs", ".yaml"])
+def test_patch_validation_fails_closed_for_unsupported_languages(suffix):
+    from pathlib import Path
+    from src.github_ops import _validate_patched_content
+
+    assert _validate_patched_content(Path("app" + suffix), "invalid code {")[0] is False
+
+
+@pytest.mark.parametrize("suffix, source", [(".py", "if broken:"), (".json", '{"bad":}')])
+def test_supported_patch_validators_reject_invalid_syntax(suffix, source):
+    from pathlib import Path
+    from src.github_ops import _validate_patched_content
+
+    assert _validate_patched_content(Path("app" + suffix), source)[0] is False
+
+
+def test_known_looking_rule_id_does_not_authorize_model_patch():
+    issue = ReviewIssue(
+        file="app.py", line=1, severity="HIGH", issue_name="Injection",
+        description="Untrusted input", original_code="unsafe(value)",
+        suggested_fix="safe(value)", confidence="HIGH", code_role="RUNTIME",
+        rule_id="aegisscan.python.user-input-to-network-request",
+    )
+    eligible, reason = auto_fix_eligibility(issue)
+    assert not eligible
+    assert "No vetted automatic transformation" in reason

@@ -319,7 +319,11 @@ def build_sarif_payload(
             "ruleId": rule_id,
             "level": level,
             "message": {"text": issue.description},
-            "locations": _location(issue.sink_file or issue.file, issue.sink_line or issue.line),
+            "locations": (
+                _location(issue.file, issue.line)
+                if issue.rule_id == "aegisscan.javascript.hardcoded-private-key"
+                else _location(issue.sink_file or issue.file, issue.sink_line or issue.line)
+            ),
             "partialFingerprints": {"aegisscanFindingId": issue.finding_id or rule_id},
             "properties": {
                 "status": "CONFIRMED",
@@ -338,6 +342,12 @@ def build_sarif_payload(
                 ),
             },
         }
+        if (
+            issue.rule_id == "aegisscan.javascript.hardcoded-private-key"
+            and issue.sink_line and issue.sink_line != issue.line
+        ):
+            result["relatedLocations"] = _location(issue.sink_file or issue.file, issue.sink_line)
+            result["relatedLocations"][0]["message"] = {"text": "Credential use"}
         if is_dependency:
             result["properties"].update(
                 {

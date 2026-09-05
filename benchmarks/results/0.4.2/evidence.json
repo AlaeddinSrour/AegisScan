@@ -1,0 +1,26 @@
+{
+  "reports": [
+    {
+      "benchmark": "juice-shop",
+      "report": "juice-shop.sarif",
+      "sha256": "4600631188f5ef6b498fcbb58aa5e65d78213af19c4e21d9bfcd0ad3749158c9",
+      "pinned_commit": "5658473cf8814459bf89000ce373b20ed0b4eb37",
+      "matched": 12
+    },
+    {
+      "benchmark": "webgoat",
+      "report": "webgoat.json",
+      "sha256": "5f9217280801fd9442bd04825f6ebe5b2343761d0ba2584ed96f3aaca1d7a51b",
+      "pinned_commit": "7517acca95d9851da706452454c223dd13545ef4",
+      "matched": 1
+    },
+    {
+      "benchmark": "iotgoat",
+      "report": "iotgoat.sarif",
+      "sha256": "ad5b3ca0d7051416e531e763822243c6fec1be2843953573746f83fc6e86da06",
+      "pinned_commit": "f67b7f961301d7a56b435fd7cffac73600f0c97b",
+      "matched": 19
+    }
+  ],
+  "rules_sha256": "8e2fd5b92dd84aa94ef3310fcc7ca64933bf695f97dc9ef1e5c9dff0ddb7a62e"
+}

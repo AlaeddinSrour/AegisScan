@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.2 beta — 2026-09-05
+
+### Benchmark reliability
+
+- Exclude suppressed, duplicate, false-positive, and non-runtime evidence from
+  active benchmark scoring without letting it satisfy expected findings.
+- Preserve private-key declaration locations in SARIF and retain credential
+  use sites as related locations.
+- Keep runtime candidates visible when AI incorrectly classifies them as
+  non-runtime, and confirm narrowly proven adjacent Sequelize interpolation.
+- Recognize closed alphanumeric extension allowlists in path-traversal rules.
+
+### Security
+
+- Resolve expanded JavaScript/TypeScript imports before checking containment,
+  preventing symlinks from adding files outside the repository to AI context.
+- Redact quoted JSON keys, unquoted YAML/environment values, and escaped quoted
+  credentials before prompts and report serialization.
+- Pause automatic patching and audit PR publishing until rule-specific
+  transformations are vetted. Findings retain manual remediation guidance.
+- Reject unsupported patch syntax formats and require manual review for process
+  execution, including imported aliases and explicit shell executables.
+
 ## 0.4.1 — 2026-08-26
 
 ### Changed

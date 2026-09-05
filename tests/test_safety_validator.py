@@ -3,7 +3,7 @@ from src.safety import is_suggested_fix_safe
 
 
 def test_safety_validator_safe_code():
-    suggested_fix = "subprocess.run(['git', 'status'], shell=False)"
+    suggested_fix = "value = 1"
     is_safe, reason = is_suggested_fix_safe(suggested_fix)
     assert is_safe is True
     assert reason == ""
@@ -30,10 +30,10 @@ def test_safety_validator_blocks_permissive_chmod():
     assert "permissive" in reason.lower()
 
 
-def test_safety_validator_allows_subprocess_module():
+def test_safety_validator_blocks_subprocess_module():
     suggested_fix = "import subprocess\nsubprocess.Popen(['ls'])"
     is_safe, reason = is_suggested_fix_safe(suggested_fix)
-    assert is_safe is True
+    assert is_safe is False
 
 
 # --- New tests for enhanced safety patterns ---
@@ -98,3 +98,14 @@ def test_safety_validator_blocks_marshal_loads():
 def test_safety_validator_blocks_unprovable_side_effects(suggested_fix):
     is_safe, _ = is_suggested_fix_safe(suggested_fix)
     assert is_safe is False
+
+
+@pytest.mark.parametrize("suggested_fix", [
+    "from os import system\nsystem(command)",
+    "from os import system as execute\nexecute(command)",
+    "import subprocess as sp\nsp.run(command)",
+    'subprocess.run(["sh", "-c", command], shell=False)',
+    'subprocess.Popen(["bash", "-c", command])',
+])
+def test_process_execution_requires_manual_review(suggested_fix):
+    assert is_suggested_fix_safe(suggested_fix)[0] is False

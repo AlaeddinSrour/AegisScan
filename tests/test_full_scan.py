@@ -972,7 +972,7 @@ def test_manual_remediation_replaces_patch_fragments_with_actionable_guidance():
     assert "redirect" in normalized.remediation_guidance.casefold()
 
 
-def test_automatic_remediation_always_has_a_fix_and_validation_guidance():
+def test_unvetted_automatic_remediation_is_downgraded_to_manual():
     issue = ReviewIssue(
         file="routes/search.ts",
         line=23,
@@ -989,8 +989,8 @@ def test_automatic_remediation_always_has_a_fix_and_validation_guidance():
         ReviewReport(analysis_scratchpad="sqli", issues=[issue])
     ).issues[0]
 
-    assert normalized.remediation_type == "AUTOMATIC"
-    assert normalized.suggested_fix
+    assert normalized.remediation_type == "MANUAL_REQUIRED"
+    assert not normalized.suggested_fix
     assert "parameterized" in normalized.remediation_guidance.casefold()
     assert "tests" in normalized.remediation_guidance.casefold()
     assert "os.path" not in normalized.remediation_guidance
@@ -2514,3 +2514,57 @@ def test_distinct_openwrt_advisories_at_same_recipe_line_remain_separate(tmp_pat
         "FW-cve-2019-5102",
     }
     assert all(item.status == "CONFIRMED" for item in merged.dispositions)
+
+
+@pytest.mark.parametrize("options", [{"apply_fixes": True}, {"create_pull_request": True}])
+def test_paused_mutation_modes_fail_before_scanning(tmp_path, options):
+    with patch("src.full_scan.run_semgrep_scan") as scanner:
+        with pytest.raises(ValueError, match="paused until vetted"):
+            run_full_scan(str(tmp_path), "", ai_triage=False, **options)
+        scanner.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", ["--apply-fixes", "--create-pull-request"])
+def test_cli_explains_paused_mutation_modes(tmp_path, monkeypatch, caplog, flag):
+    from src.full_scan import main
+
+    report = tmp_path / "report.json"
+    monkeypatch.setattr("sys.argv", [
+        "aegisscan", "--repo", str(tmp_path), "--detector-only",
+        "--report", str(report), flag,
+    ])
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+    assert exit_info.value.code == 1
+    assert "paused until vetted" in caplog.text
+    assert not report.exists()
+
+
+def test_ai_cannot_hide_runtime_finding_as_non_runtime(tmp_path):
+    from src.full_scan import SemgrepCandidate, FindingBatch, _reconcile_batch_report
+    source = tmp_path / 'app.java'
+    source.write_text('networkCall(input);\n')
+    candidate = SemgrepCandidate(finding_id='SG-1', rule_id='aegisscan.java.user-input-to-network-request',
+        file='app.java', line=1, message='SSRF', code_role='RUNTIME', raw_text='')
+    report = ReviewReport(analysis_scratchpad='', issues=[], dispositions=[
+        FindingDisposition(finding_id='SG-1', status='NON_RUNTIME', reason='Training application')])
+    reconciled = _reconcile_batch_report(report, FindingBatch(findings=[candidate], files={'app.java'}), tmp_path)
+    assert reconciled.dispositions[0].status == 'NEEDS_REVIEW'
+
+
+@pytest.mark.parametrize('middle,query,confirmed', [
+    ("criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)\n", 'models.sequelize.query(`SELECT * FROM Products WHERE name = \'${criteria}\'`)', True),
+    ('', 'models.sequelize.query(`SELECT * FROM Products WHERE name = \'${criteria}\'`)', True),
+    ('criteria = escapeSql(criteria)\n', 'models.sequelize.query(`SELECT * FROM Products WHERE name = \'${criteria}\'`)', False),
+    ('', 'models.sequelize.query("SELECT * FROM Products WHERE name = ?", {replacements: [criteria]})', False),
+])
+def test_deterministic_sql_requires_proven_adjacent_unescaped_flow(tmp_path, middle, query, confirmed):
+    from src.full_scan import SemgrepCandidate, _deterministic_sequelize_template_issue
+    text = "let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''\n" + middle + query + '\n'
+    (tmp_path / 'app.ts').write_text(text)
+    candidate = SemgrepCandidate(finding_id='SG-1', rule_id='aegisscan.javascript.express-sequelize-taint-sqli',
+        file='app.ts', line=len(text.splitlines()), message='SQL injection', code_role='RUNTIME', raw_text='')
+    issue = _deterministic_sequelize_template_issue(tmp_path, candidate)
+    assert (issue is not None) == confirmed
+    if issue:
+        assert issue.remediation_type == 'MANUAL_REQUIRED'

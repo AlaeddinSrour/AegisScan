@@ -1,0 +1,40 @@
+{
+  "benchmark": "OWASP IoTGoat firmware detector baseline",
+  "passed": true,
+  "metrics": {
+    "expected": 19,
+    "matched": 19,
+    "actual_scoped": 19,
+    "unique_scoped": 19,
+    "recall": 1.0,
+    "precision": 1.0,
+    "duplicate_count": 0,
+    "duplicate_rate": 0.0,
+    "unresolved": 0,
+    "unexpected": 0,
+    "forbidden": 0,
+    "execution_successful": true,
+    "errors": 0,
+    "provider_request_attempts": 0,
+    "provider_failures": 0,
+    "provider_prompt_tokens": 0,
+    "provider_completion_tokens": 0,
+    "provider_total_tokens": 0,
+    "provider_cost_usd": 0.0,
+    "ai_batches": 0,
+    "duration_seconds": 7.0,
+    "repository_dirty": false,
+    "semgrep_rule_mode": "bundled",
+    "scanner_diagnostics": 0,
+    "inventory_coverage_ratio": 1.0,
+    "kernel_versions": [
+      "4.14.95",
+      "4.9.152"
+    ],
+    "kernel_advisory_matches": 6
+  },
+  "missing": [],
+  "unexpected": [],
+  "forbidden": [],
+  "failures": []
+}

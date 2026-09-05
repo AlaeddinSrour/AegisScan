@@ -36,9 +36,11 @@ _JWT = re.compile(
     r"[0-9A-Za-z_-]{8,}(?![A-Za-z0-9_-])"
 )
 _NAMED_SECRET = re.compile(
-    r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
-    r"private[_-]?key|secret|password|passwd|pwd)\b\s*(?:=|:)\s*)"
-    r"(?P<quote>['\"`])[^'\"`\r\n]+(?P=quote)"
+    r"(?i)((?<![\w-])(?P<key_quote>['\"]?)(?:api[_-]?key|access[_-]?token|"
+    r"auth[_-]?token|client[_-]?secret|private[_-]?key|secret|password|passwd|pwd)"
+    r"(?P=key_quote)\s*(?:=|:)\s*)"
+    r"(?:(?P<quote>['\"`])(?:\\.|(?!(?P=quote))[^\\\r\n])*(?P=quote)"
+    r"|(?P<bare>\[REDACTED SECRET\]|[^\s,;}\]\"'`]+))"
 )
 _HMAC_SECRET = re.compile(
     r"(?i)(\bcreateHmac\s*\(\s*['\"][^'\"]+['\"]\s*,\s*)"
@@ -92,7 +94,8 @@ def redact_text(value: str) -> str:
     redacted = _JWT.sub(REDACTED_SECRET, redacted)
     redacted = _NAMED_SECRET.sub(
         lambda match: (
-            f"{match.group(1)}{match.group('quote')}{REDACTED_SECRET}{match.group('quote')}"
+            f"{match.group(1)}{match.group('quote') or ''}{REDACTED_SECRET}"
+            f"{match.group('quote') or ''}"
         ),
         redacted,
     )

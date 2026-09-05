@@ -138,3 +138,32 @@ def test_webgoat_manifest_pins_raw_detector_findings_without_triage_statuses():
     assert len(manifest["expected"]) == 1
     assert all("status" not in item for item in manifest["expected"])
     assert manifest["gates"]["max_unresolved"] == 0
+
+
+def test_suppressed_evidence_is_not_scored_as_active_or_used_to_satisfy_expected():
+    manifest = {
+        "expected": [{"rule_id": "rule", "path": "app.py", "line": 1}],
+        "forbidden": [{"rule_id": "fp", "path": "app.py"}],
+        "gates": {"min_recall": 1, "max_forbidden": 0},
+    }
+    findings = [Finding("rule", "app.py", 1, "FALSE_POSITIVE"),
+                Finding("fp", "app.py", 2, "FALSE_POSITIVE"),
+                Finding("fp", "app.py", 3, "DUPLICATE"),
+                Finding("fp", "app.py", 4, "NON_RUNTIME"),
+                Finding("fp", "app.py", 5, "CONFIRMED", suppressed=True)]
+    report = evaluate(findings, manifest, {})
+    assert report['metrics']['actual_scoped'] == 0
+    assert report['metrics']['forbidden'] == 0
+    assert report['metrics']['matched'] == 0
+    assert not report['passed']
+    active = evaluate([Finding("fp", "app.py", 2, "CONFIRMED")], manifest, {})
+    assert active['metrics']['forbidden'] == 1
+
+
+def test_sarif_only_accepted_suppressions_hide_active_results():
+    payload = {'runs': [{'results': [
+        {'ruleId': 'r', 'properties': {'status': 'CONFIRMED'},
+         'suppressions': [{'status': status}]} for status in ['accepted', 'underReview', 'rejected']
+    ]}]}
+    findings, _ = findings_from_sarif(payload)
+    assert [item.suppressed for item in findings] == [True, False, False]

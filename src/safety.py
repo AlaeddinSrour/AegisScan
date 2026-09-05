@@ -14,6 +14,9 @@ def is_suggested_fix_safe(suggested_fix: str) -> tuple[bool, str]:
     """
     Validate that an AI-synthesized fix does not introduce dangerous patterns.
 
+    This denylist is defense in depth, not proof of safety or authorization to
+    apply a patch. The application gate must require a vetted transformation.
+
     Returns:
         (True, "") if the fix is safe.
         (False, reason) if the fix contains a blocked pattern.
@@ -112,6 +115,12 @@ def is_suggested_fix_safe(suggested_fix: str) -> tuple[bool, str]:
         tree = None
     if tree is not None:
         for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess", "pty"}:
+                return False, "Process-module imports require manual review, including aliases."
+            if isinstance(node, ast.Import) and any(
+                alias.name in {"os", "subprocess", "pty"} for alias in node.names
+            ):
+                return False, "Process-module imports require manual review, including aliases."
             if not isinstance(node, ast.Call):
                 continue
             name = _python_call_name(node.func)
@@ -122,20 +131,7 @@ def is_suggested_fix_safe(suggested_fix: str) -> tuple[bool, str]:
                 "subprocess.check_output",
             }:
                 continue
-            if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
-                return False, "Suggested subprocess call does not use a literal argument list."
-            elements = node.args[0].elts
-            if (
-                not elements
-                or not isinstance(elements[0], ast.Constant)
-                or not isinstance(elements[0].value, str)
-            ):
-                return False, "Suggested subprocess executable is not a fixed literal."
-            for keyword in node.keywords:
-                if keyword.arg == "shell" and not (
-                    isinstance(keyword.value, ast.Constant) and keyword.value.value is False
-                ):
-                    return False, "Suggested subprocess call does not enforce shell=False."
+            return False, "Process execution requires manual review, even with shell=False."
 
     return True, ""
 

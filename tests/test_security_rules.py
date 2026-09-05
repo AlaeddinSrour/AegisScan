@@ -197,3 +197,31 @@ def test_juice_shop_regression_floor_covers_high_value_javascript_categories(
     )
     assert findings == expected
     assert payload["errors"] == []
+
+
+def test_path_extension_allowlist_sanitizes_only_closed_safe_values(tmp_path):
+    semgrep = shutil.which('semgrep')
+    if not semgrep:
+        pytest.skip('Semgrep is not installed')
+    cases = {
+        'safe': "['jpg', 'png'].includes(value) ? value : 'jpg'",
+        'unsafe_allowlist': "['jpg', '../escape'].includes(value) ? value : 'jpg'",
+        'unsafe_fallback': "['jpg', 'png'].includes(value) ? value : value",
+        'unsafe_other_value': "['jpg', 'png'].includes(value) ? req.query.other : 'jpg'",
+    }
+    for name, expression in cases.items():
+        (tmp_path / f'{name}.ts').write_text(
+            "function upload(req, res) { const value = req.query.ext; "
+            f"const ext = {expression}; fs.createWriteStream(`/uploads/image.${{ext}}`); }}\n"
+        )
+    env = os.environ.copy()
+    env['SEMGREP_LOG_FILE'] = str(tmp_path / 'semgrep.log')
+    if Path('/etc/ssl/cert.pem').is_file():
+        env.setdefault('SSL_CERT_FILE', '/etc/ssl/cert.pem')
+    result = subprocess.run([semgrep, 'scan', '--config', str(_aegisscan_rules_path()),
+        '--metrics', 'off', '--disable-version-check', '--json', '--quiet', str(tmp_path)],
+        capture_output=True, text=True, timeout=30, env=env)
+    assert result.returncode == 0, result.stderr
+    found = {Path(item['path']).stem for item in json.loads(result.stdout)['results']
+             if 'express-path-traversal' in item['check_id']}
+    assert found == {'unsafe_allowlist', 'unsafe_fallback', 'unsafe_other_value'}

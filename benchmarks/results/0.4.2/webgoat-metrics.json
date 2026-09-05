@@ -1,0 +1,23 @@
+{
+  "benchmark": "OWASP WebGoat Java detector baseline",
+  "passed": true,
+  "metrics": {
+    "expected": 1,
+    "matched": 1,
+    "actual_scoped": 1,
+    "unique_scoped": 1,
+    "recall": 1.0,
+    "precision": 1.0,
+    "duplicate_count": 0,
+    "duplicate_rate": 0.0,
+    "unresolved": 0,
+    "unexpected": 0,
+    "forbidden": 0,
+    "execution_successful": true,
+    "errors": 0
+  },
+  "missing": [],
+  "unexpected": [],
+  "forbidden": [],
+  "failures": []
+}

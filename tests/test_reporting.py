@@ -91,7 +91,7 @@ def test_json_report_records_reproducible_rule_identity():
     assert payload["summary"]["firmware_findings"] == 0
     assert payload["summary"]["needs_review"] == 1
     assert payload["summary"]["provenance"] == {
-        "aegisscan_version": "0.4.1",
+        "aegisscan_version": "0.4.2",
         "scan_started_at": "2026-08-20T10:00:00+00:00",
         "scan_completed_at": "2026-08-20T10:01:00+00:00",
         "repository_name": "juice-shop",
@@ -465,3 +465,15 @@ def test_json_and_sarif_exports_redact_secret_material():
     assert private_key not in json_payload
     assert private_key not in sarif_payload
     assert "[REDACTED SECRET]" in json_payload
+
+
+def test_private_key_export_preserves_declaration_anchor():
+    outcome = _outcome()
+    issue = outcome.report.issues[0].model_copy(update={
+        'file': 'lib/security.ts', 'line': 21, 'sink_file': 'lib/security.ts', 'sink_line': 54,
+        'rule_id': 'aegisscan.javascript.hardcoded-private-key',
+    })
+    outcome.report = ReviewReport(analysis_scratchpad='', issues=[issue])
+    result = build_sarif_payload(outcome)['runs'][0]['results'][0]
+    assert result['locations'][0]['physicalLocation']['region']['startLine'] == 21
+    assert result['relatedLocations'][0]['physicalLocation']['region']['startLine'] == 54

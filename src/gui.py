@@ -1412,12 +1412,15 @@ class NewScanPage(QWidget):
         self.readiness_button.clicked.connect(lambda: app.navigate("readiness"))
         config_layout.addWidget(self.readiness_button)
 
-        self.apply_fixes = QCheckBox("Apply fixes that pass deterministic safety checks")
+        self.apply_fixes = QCheckBox("Automatic fixes paused — manual remediation required")
+        self.apply_fixes.setEnabled(False)
         self.apply_fixes.setMinimumHeight(24)
         self.apply_fixes.setChecked(app.apply_fixes)
         self.apply_fixes.toggled.connect(app.set_apply_fixes)
         config_layout.addWidget(self.apply_fixes)
         self.publish_pr = QCheckBox("Publish changed files as a new GitHub pull request")
+        self.publish_pr.setEnabled(False)
+        self.publish_pr.setToolTip("Unavailable while automatic fixes are paused.")
         self.publish_pr.setMinimumHeight(24)
         self.publish_pr.setChecked(app.create_pr)
         self.publish_pr.toggled.connect(self._publish_toggled)
@@ -2168,6 +2171,8 @@ class IntegrationsPage(QWidget):
         self.token.textChanged.connect(app.set_github_token)
         card_layout.addWidget(self.token)
         enable = QCheckBox("Enable pull-request publishing for the next audit")
+        enable.setEnabled(False)
+        enable.setToolTip("Unavailable while automatic fixes are paused.")
         enable.setChecked(app.create_pr)
         enable.toggled.connect(self._toggle)
         card_layout.addWidget(enable)
@@ -2417,7 +2422,8 @@ class SettingsPage(QWidget):
         self.secret_scan.setChecked(app.secret_scan)
         self.secret_scan.toggled.connect(app.set_secret_scan)
         audit_layout.addWidget(self.secret_scan)
-        self.auto_fix = QCheckBox("Apply safe fixes by default")
+        self.auto_fix = QCheckBox("Automatic fixes paused — manual remediation required")
+        self.auto_fix.setEnabled(False)
         self.auto_fix.setChecked(app.apply_fixes)
         self.auto_fix.toggled.connect(app.set_apply_fixes)
         audit_layout.addWidget(self.auto_fix)
@@ -2519,7 +2525,7 @@ class AegisScanWindow(QMainWindow):
         self.semgrep_rule_mode = (
             configured_rule_mode if configured_rule_mode in SEMGREP_RULE_MODES else "bundled"
         )
-        self.apply_fixes = str(self.settings.value("apply_fixes", "false")).lower() == "true"
+        self.apply_fixes = False
         self.create_pr = False
         self.outcome: ScanOutcome | None = None
         self.history = load_history(self.settings.value("audit_history", "[]"))
@@ -2850,6 +2856,7 @@ class AegisScanWindow(QMainWindow):
             self.app_settings.secret_scan.setChecked(checked)
 
     def set_apply_fixes(self, checked: bool) -> None:
+        checked = False  # No vetted transformations are available in this release.
         self.apply_fixes = checked
         self.settings.setValue("apply_fixes", checked)
         if hasattr(self, "new_scan") and self.new_scan.apply_fixes.isChecked() != checked:
@@ -2858,6 +2865,7 @@ class AegisScanWindow(QMainWindow):
             self.app_settings.auto_fix.setChecked(checked)
 
     def set_create_pr(self, checked: bool) -> None:
+        checked = False
         self.create_pr = checked
         if checked:
             self.set_apply_fixes(True)

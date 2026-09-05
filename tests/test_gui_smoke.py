@@ -460,3 +460,25 @@ def test_large_evidence_ledgers_are_lazy_and_paginated(tmp_path):
 
     window.close()
     application.processEvents()
+
+
+def test_saved_auto_fix_preference_cannot_reenable_paused_patching(tmp_path):
+    application = QApplication.instance() or QApplication([])
+    settings = _test_settings(tmp_path)
+    settings.setValue("apply_fixes", True)
+    window = AegisScanWindow(settings)
+    try:
+        window.set_apply_fixes(True)
+        window.set_create_pr(True)
+        assert not window.apply_fixes
+        assert not window.create_pr
+        for control in (
+            window.new_scan.apply_fixes,
+            window.new_scan.publish_pr,
+            window.app_settings.auto_fix,
+        ):
+            assert not control.isEnabled()
+            assert not control.isChecked()
+    finally:
+        window.close()
+        application.processEvents()

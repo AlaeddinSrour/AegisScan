@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/macOS-12%2B-111111" alt="macOS 12 or newer">
 </p>
 
-> **v0.4.1 beta** — suitable for evaluation and controlled security review. It is
+> **v0.4.2 beta** — suitable for evaluation and controlled security review. It is
 > not a replacement for penetration testing or human verification.
 
 <p align="center">
@@ -268,19 +268,16 @@ therefore requires network access.
 <details>
 <summary><strong>Safe fixes and pull requests</strong></summary>
 
-AegisScan only applies deterministic fixes that pass secret, ambiguity,
-control-flow, and syntax checks:
+Automatic fixes and audit pull-request publishing are temporarily paused. No
+rule-specific transformation has been vetted for automatic application yet;
+model-written patches passing a denylist are insufficient to authorize changes.
+The desktop controls are disabled, and the CLI rejects `--apply-fixes` and
+`--create-pull-request` with an explanation.
 
-```bash
-python -m src.full_scan \
-  --repo /path/to/repository \
-  --detector-only \
-  --apply-fixes \
-  --report aegisscan-report.json
-```
-
-Add `--create-pull-request` with `GITHUB_TOKEN` and `GITHUB_REPOSITORY` to publish
-only files changed by the current audit. Review and test every generated change.
+Audits still provide findings, evidence, manual remediation guidance, and
+JSON/SARIF exports. Implement and test changes through your normal review flow.
+Future automatic transformations must be explicitly vetted and have local
+language syntax validation; unsupported formats fail closed.
 
 </details>
 
@@ -316,7 +313,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and
 - Secret findings identify credential-shaped data; they do not test validity.
 - Parser errors, resource limits, unsupported manifests, and provider failures are
   reported as coverage gaps rather than clean results.
-- Safe fixes can still change behavior and must be reviewed.
+- Automatic application is paused; manual changes must be reviewed and tested.
 
 ## License
 

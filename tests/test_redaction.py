@@ -85,3 +85,29 @@ def test_review_report_redaction_covers_retained_and_exported_fields():
     assert PRIVATE_KEY not in serialized
     assert REDACTED_SECRET in serialized
     assert PRIVATE_KEY in report.issues[0].original_code
+
+
+def test_redaction_covers_config_formats_and_is_idempotent():
+    samples = [
+        '{"password": "hunter2", "port": 443}',
+        "password: hunter2 # configuration",
+        "PASSWORD=hunter2\nPORT=443",
+        "export API_KEY=hunter2",
+        "{'client-secret': 'hunter2'}",
+        r'{"password": "hun\"ter2"}',
+    ]
+    for sample in samples:
+        redacted = redact_text(sample)
+        assert "hunter2" not in redacted
+        assert "ter2" not in redacted
+        assert REDACTED_SECRET in redacted
+        assert redact_text(redacted) == redacted
+    assert '"port": 443' in redact_text(samples[0])
+    assert "PORT=443" in redact_text(samples[2])
+
+
+def test_config_secrets_are_removed_from_prompt_and_report():
+    secret = '{"password": "hunter2"}'
+    assert "hunter2" not in build_full_scan_prompt(secret, "password: hunter2", 1, 1)
+    report = ReviewReport(analysis_scratchpad=secret, issues=[])
+    assert "hunter2" not in redact_review_report(report).model_dump_json()

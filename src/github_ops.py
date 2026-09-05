@@ -50,7 +50,11 @@ def auto_fix_eligibility(issue: ReviewIssue) -> tuple[bool, str]:
     is_safe, reason = is_suggested_fix_safe(issue.suggested_fix)
     if not is_safe:
         return False, f"Safety policy rejected this patch: {reason}"
-    return True, "Patch passed the deterministic eligibility checks."
+    if Path(issue.file).suffix.casefold() not in {".py", ".json"}:
+        return False, "This language has no local patch syntax validator; manual review is required."
+    # No rule-specific transformation has been vetted yet. Model prose, a rule
+    # ID, and passing a denylist are not authority to modify repository code.
+    return False, "No vetted automatic transformation is available; manual remediation is required."
 
 
 def run_cmd(
@@ -245,6 +249,8 @@ def _validate_patched_content(file_path: Path, content: str) -> tuple[bool, str]
             ast.parse(content, filename=str(file_path))
         elif suffix == ".json":
             json.loads(content)
+        else:
+            return False, "No local syntax validator is available for this file type."
     except (SyntaxError, json.JSONDecodeError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
     return True, ""

@@ -23,6 +23,7 @@ from .ast_context import build_ast_context
 from .gemini_client import FAILOVER_MODELS, call_gemini_with_failover
 from .github_ops import (
     apply_auto_fixes_with_paths,
+    auto_fix_eligibility,
     push_audit_fixes,
     validate_publishable_worktree,
 )
@@ -513,6 +514,12 @@ def _manual_remediation_guidance(issue: ReviewIssue) -> str:
     """Return actionable prose where a safe local replacement needs app context."""
     evidence = " ".join((issue.issue_name, issue.description, issue.rule_id)).casefold()
     affected_file = (issue.sink_file or issue.file).casefold()
+    if any(term in evidence for term in ("sql injection", "sqli", "sequelize")):
+        return (
+            "Use parameterized queries with the database driver's binding API. Keep SQL "
+            "structure separate from request values and allowlist dynamic identifiers. "
+            "Add injection regression tests and verify normal query behavior."
+        )
     if any(term in evidence for term in ("path traversal", "zip slip")):
         if affected_file.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
             boundary = (
@@ -607,7 +614,7 @@ def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
     """Make every remediation mode internally complete and actionable."""
     issues: list[ReviewIssue] = []
     for issue in report.issues:
-        if issue.remediation_type == "AUTOMATIC" and issue.suggested_fix.strip():
+        if auto_fix_eligibility(issue)[0]:
             issues.append(
                 issue.model_copy(
                     update={
@@ -618,8 +625,8 @@ def _normalize_manual_remediations(report: ReviewReport) -> ReviewReport:
                 )
             )
             continue
-        # An automatic remediation without an actual replacement cannot be
-        # applied. Preserve the finding, but represent it honestly as manual.
+        # Preserve findings but do not advertise unvetted model patches as
+        # automatic remediations, including in exported reports and the UI.
         remediation_type = "MANUAL_REQUIRED"
         trusted_manual_guidance = issue.rule_id.startswith(
             ("aegisscan.firmware.", "aegisscan.openwrt.")
@@ -1470,6 +1477,68 @@ def _deterministic_basket_idor_issue(
     )
 
 
+def _deterministic_sequelize_template_issue(
+    repo_path: Path, candidate: SemgrepCandidate,
+) -> ReviewIssue | None:
+    """Confirm a narrow adjacent request-to-SQL interpolation flow.
+
+    Only direct request assignment and an optional length cap are understood.
+    Any intervening escaping, reassignment, binding options, or more complex
+    expression stays with normal evidence-gated triage.
+    """
+    if candidate.rule_id != "aegisscan.javascript.express-sequelize-taint-sqli":
+        return None
+    if not is_runtime_role(candidate.code_role):
+        return None
+    lines, _ = _candidate_source(repo_path, candidate)
+    if not lines or not 1 <= candidate.line <= len(lines):
+        return None
+    sink = lines[candidate.line - 1].strip()
+    query = re.fullmatch(
+        r"(?:[A-Za-z_$][\w$]*\.)*sequelize\.query\(`(?P<sql>[^`]+)`\)\s*;?\s*(?://.*)?", sink
+    )
+    if not query or not re.match(r"(?:SELECT|UPDATE|DELETE|INSERT)\b", query['sql'], re.I):
+        return None
+    variables = re.findall(r"\$\{([^}]+)\}", query['sql'])
+    if not variables or len(set(variables)) != 1 or not re.fullmatch(r"[A-Za-z_$][\w$]*", variables[0]):
+        return None
+    variable = re.escape(variables[0])
+    preceding = candidate.line - 2
+    if preceding < 0:
+        return None
+    cap = re.fullmatch(
+        rf"{variable}\s*=\s*\({variable}\.length\s*<=\s*(?P<limit>\d+)\)"
+        rf"\s*\?\s*{variable}\s*:\s*{variable}\.substring\(0,\s*(?P=limit)\)\s*;?",
+        lines[preceding].strip(),
+    )
+    if cap:
+        if int(cap['limit']) == 0:
+            return None
+        preceding -= 1
+    if preceding < 0:
+        return None
+    assignment = re.fullmatch(
+        rf"(?:const|let)\s+{variable}(?:\s*:\s*(?:any|string|unknown))?\s*=\s*"
+        r"(?P<source>[A-Za-z_$][\w$]*\.(?:query|body|params)\.[A-Za-z_$][\w$]*)"
+        r"(?:\s*===\s*'undefined'\s*\?\s*''\s*:\s*(?P=source))?"
+        r"(?:\s*\?\?\s*'')?\s*;?", lines[preceding].strip(),
+    )
+    if not assignment:
+        return None
+    return ReviewIssue(
+        file=candidate.file, line=candidate.line,
+        sink_file=candidate.file, sink_line=candidate.line,
+        severity="HIGH", issue_name="SQL Injection",
+        description="Request input is interpolated into a raw Sequelize SQL query without parameter binding.",
+        original_code="", suggested_fix="", finding_id=candidate.finding_id,
+        rule_id=candidate.rule_id, confidence="HIGH", code_role=candidate.code_role,
+        source_evidence=f"{assignment['source']} is assigned to {variables[0]} at {candidate.file}:{preceding + 1}.",
+        sink_evidence=f"sequelize.query interpolates ${{{variables[0]}}} into SQL at {candidate.file}:{candidate.line}.",
+        reachability_evidence="Adjacent statements pass the request value to raw SQL; the optional length cap does not escape SQL syntax.",
+        remediation_type="MANUAL_REQUIRED",
+    )
+
+
 def _deterministic_runtime_issue(
     repo_path: Path,
     candidate: SemgrepCandidate,
@@ -1477,6 +1546,7 @@ def _deterministic_runtime_issue(
     """Return locally proven issues that must not depend on provider prose."""
     return (
         _deterministic_credential_issue(repo_path, candidate)
+        or _deterministic_sequelize_template_issue(repo_path, candidate)
         or _deterministic_javascript_ssrf_issue(repo_path, candidate)
         or _deterministic_javascript_open_redirect_issue(repo_path, candidate)
         or _deterministic_basket_idor_issue(repo_path, candidate)
@@ -1831,6 +1901,12 @@ def _reconcile_batch_report(
             continue
         status = disposition.status
         reason = disposition.reason.strip()
+        if status == "NON_RUNTIME" and is_runtime_role(candidate.code_role):
+            status = "NEEDS_REVIEW"
+            reason = (
+                "AI classified a deterministically runtime-scoped candidate as non-runtime; "
+                "the candidate is retained for manual review."
+            )
         if not reason or reason.casefold().replace("_", " ") in {
             "confirmed",
             "duplicate",
@@ -2670,6 +2746,12 @@ def run_full_scan(
     root = Path(repo_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Repository directory does not exist: {root}")
+    if apply_fixes or create_pull_request:
+        raise ValueError(
+            "Automatic fixes and audit PR publishing are paused until vetted "
+            "transformations are available. Run without --apply-fixes and "
+            "--create-pull-request to audit and export manual remediation guidance."
+        )
     provider_order = (
         _resolve_ai_provider_order(
             ai_provider,
@@ -3489,8 +3571,14 @@ def main() -> None:
             "security-audit and Python registry packs"
         ),
     )
-    parser.add_argument("--apply-fixes", action="store_true")
-    parser.add_argument("--create-pull-request", action="store_true")
+    parser.add_argument(
+        "--apply-fixes", action="store_true",
+        help="Currently unavailable: use manual remediation",
+    )
+    parser.add_argument(
+        "--create-pull-request", action="store_true",
+        help="Currently unavailable: automatic fixes are paused",
+    )
     parser.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN", ""))
     parser.add_argument("--repository", default=os.getenv("GITHUB_REPOSITORY", ""))
     parser.add_argument("--base-branch", default="")

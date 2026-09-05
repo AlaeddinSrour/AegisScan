@@ -536,6 +536,17 @@ rules:
     severity: ERROR
     mode: taint
     pattern-sources: *express_request_sources
+    pattern-sanitizers:
+      - patterns:
+          - pattern: "$ALLOW.includes($VALUE) ? $VALUE : $DEFAULT"
+          - metavariable-regex:
+              metavariable: $ALLOW
+              regex: >-
+                ^\[\s*['"][A-Za-z0-9]+['"](?:\s*,\s*['"][A-Za-z0-9]+['"])*\s*\]$
+          - metavariable-regex:
+              metavariable: $DEFAULT
+              regex: >-
+                ^['"][A-Za-z0-9]+['"]$
     pattern-sinks:
       - patterns:
           - pattern-either:
