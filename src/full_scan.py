@@ -21,6 +21,7 @@ from google import genai
 from . import __version__
 from .ast_context import build_ast_context
 from .gemini_client import FAILOVER_MODELS, call_gemini_with_failover
+from .ai_budget import AIBudgetExceeded, RequestBudget
 from .github_ops import (
     apply_auto_fixes_with_paths,
     auto_fix_eligibility,
@@ -2684,6 +2685,7 @@ def _call_ai_provider_chain(
     progress: Callable[[str], None],
     allow_semantic_repair: bool = True,
     telemetry: dict[str, int] | None = None,
+    budget: RequestBudget | None = None,
 ) -> ReviewReport:
     """Try configured providers in order while preserving provider-local retries."""
     if len(provider_order) == 1:
@@ -2695,10 +2697,12 @@ def _call_ai_provider_chain(
                 allow_data_collection=openrouter_allow_data_collection,
                 allow_semantic_repair=allow_semantic_repair,
                 telemetry=telemetry,
+                budget=budget,
             )
         if gemini_client is None:
             raise RuntimeError("Gemini client initialization failed.")
-        return call_gemini_with_failover(gemini_client, prompt, progress=progress)
+        return call_gemini_with_failover(gemini_client, prompt, progress=progress,
+                                         telemetry=telemetry, budget=budget)
 
     failures: dict[str, str] = {}
     for provider in provider_order:
@@ -2711,10 +2715,14 @@ def _call_ai_provider_chain(
                     allow_data_collection=openrouter_allow_data_collection,
                     allow_semantic_repair=allow_semantic_repair,
                     telemetry=telemetry,
+                    budget=budget,
                 )
             if gemini_client is None:
                 raise RuntimeError("Gemini client initialization failed.")
-            return call_gemini_with_failover(gemini_client, prompt, progress=progress)
+            return call_gemini_with_failover(gemini_client, prompt, progress=progress,
+                                             telemetry=telemetry, budget=budget)
+        except AIBudgetExceeded:
+            raise
         except RuntimeError as exc:
             reason = " ".join(str(exc).split())[:500]
             failures[provider] = reason
@@ -2752,6 +2760,9 @@ def run_full_scan(
 ) -> ScanOutcome:
     """Scan an entire repository, triage bounded batches, and optionally open a PR."""
     notify = progress or logger.info
+    batch_request_limit = int(os.environ.get("AEGISSCAN_BATCH_REQUEST_LIMIT", "6"))
+    if batch_request_limit < 1:
+        raise ValueError("AEGISSCAN_BATCH_REQUEST_LIMIT must be a positive integer")
     audit_started = monotonic()
     scan_started_at = datetime.now(UTC).isoformat(timespec="seconds")
     root = Path(repo_path).expanduser().resolve()
@@ -2963,6 +2974,7 @@ def run_full_scan(
     attempted_ai_batches = 0
     successful_ai_batches = 0
     ai_telemetry: dict[str, int] = {}
+    ai_telemetry["batch_request_limit"] = batch_request_limit
 
     def refine_repaired_candidates(
         report: ReviewReport,
@@ -3002,6 +3014,11 @@ def run_full_scan(
         )
         refined = report
         for finding_id in selected_ids:
+            if batch_budget.used >= batch_budget.limit:
+                ai_telemetry["budget_exhaustions"] = ai_telemetry.get("budget_exhaustions", 0) + 1
+                notify("[REFINE] AI batch request limit reached; remaining candidates stay Needs review")
+                break
+            batch_budget.phase = "refinement"
             candidate = candidate_by_id[finding_id]
             singleton = FindingBatch(findings=[candidate], files={candidate.file})
             strict_prompt = build_full_scan_prompt(
@@ -3027,6 +3044,7 @@ def run_full_scan(
                         progress=notify,
                         allow_semantic_repair=False,
                         telemetry=ai_telemetry,
+                        budget=batch_budget,
                     )
                 )
             except RuntimeError as exc:
@@ -3050,6 +3068,7 @@ def run_full_scan(
         return refined
 
     for index, batch in enumerate(batches, start=1):
+        batch_budget = RequestBudget(batch_request_limit, batch=index)
         batch_started = monotonic()
         files = sorted(batch.files)
         file_summary = ", ".join(files[:4])
@@ -3163,6 +3182,7 @@ def run_full_scan(
                     gemini_client=gemini_client,
                     progress=notify,
                     telemetry=ai_telemetry,
+                    budget=batch_budget,
                 )
             )
             report = refine_repaired_candidates(
@@ -3180,10 +3200,16 @@ def run_full_scan(
             def recover_findings(candidates: list[SemgrepCandidate], label: str) -> None:
                 if not candidates:
                     return
+                if batch_budget.used >= batch_budget.limit:
+                    ai_telemetry["budget_exhaustions"] = ai_telemetry.get("budget_exhaustions", 0) + 1
+                    unrecovered.extend((candidate, "AI batch request limit reached")
+                                       for candidate in candidates)
+                    return
                 recovery_batch = FindingBatch(
                     findings=candidates,
                     files={candidate.file for candidate in candidates if candidate.file},
                 )
+                batch_budget.phase = "recovery"
                 notify(
                     f"[RECOVER] Batch {index}/{len(batches)} {label} · retrying "
                     f"{len(candidates)} finding(s)"
@@ -3207,6 +3233,7 @@ def run_full_scan(
                             gemini_client=gemini_client,
                             progress=notify,
                             telemetry=ai_telemetry,
+                            budget=batch_budget,
                         )
                     )
                 except RuntimeError as recovery_error:

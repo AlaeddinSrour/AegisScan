@@ -15,6 +15,7 @@ from google import genai
 from google.genai import types
 
 from .models import ReviewReport
+from .ai_budget import AIBudgetExceeded, RequestBudget, ensure_budget, timed_request
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,9 @@ def call_gemini_with_failover(
     client: genai.Client,
     prompt: str,
     progress: Callable[[str], None] | None = None,
+    *,
+    telemetry: dict[str, int] | None = None,
+    budget: RequestBudget | None = None,
 ) -> ReviewReport:
     """
     Send the review prompt to Gemini, trying multiple models with retries.
@@ -116,7 +120,10 @@ def call_gemini_with_failover(
     for model_name in FAILOVER_MODELS:
         retry_delay = INITIAL_BACKOFF_SECONDS
         for attempt in range(MAX_RETRIES):
+            ensure_budget(telemetry, budget)
             try:
+                if telemetry is not None:
+                    telemetry["request_attempts"] = telemetry.get("request_attempts", 0) + 1
                 notify(
                     f"[AI] Model {model_name} · attempt {attempt + 1}/{MAX_RETRIES} · "
                     f"timeout {API_TIMEOUT_SECONDS}s"
@@ -127,11 +134,12 @@ def call_gemini_with_failover(
                 )
                 # The SDK enforces this at the HTTP transport layer, so a timed-out
                 # attempt does not leave a worker thread that blocks executor shutdown.
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
+                with timed_request(telemetry, "gemini", budget):
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config,
+                    )
 
                 if response.parsed is None and not response.text:
                     raise ValueError(
@@ -153,6 +161,8 @@ def call_gemini_with_failover(
                 )
                 return report
 
+            except AIBudgetExceeded:
+                raise
             except Exception as e:
                 logger.warning(f"Request to {model_name} failed: {e}")
                 reason = _safe_error_summary(e)
@@ -164,7 +174,7 @@ def call_gemini_with_failover(
                         "skipping remaining attempts for this model"
                     )
                     break
-                if attempt < MAX_RETRIES - 1:
+                if attempt < MAX_RETRIES - 1 and (budget is None or budget.used < budget.limit):
                     notify(f"[AI] Retrying in {retry_delay}s with exponential backoff")
                     time.sleep(retry_delay)
                     retry_delay *= 2

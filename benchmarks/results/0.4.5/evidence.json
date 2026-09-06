@@ -1,0 +1,12 @@
+{
+  "reports": [{
+    "benchmark": "juice-shop",
+    "report": "juice-shop.sarif",
+    "sha256": "e6a8fdd551d502d72425c492584d0d9f3c6cae7550ceb71f8a9f07837c1dc75e",
+    "reported_app_version": "0.4.4",
+    "build_context": "Local timing and retry-budget test build before 0.4.5 version bump",
+    "pinned_commit": "5658473cf8814459bf89000ce373b20ed0b4eb37",
+    "matched": 12
+  }],
+  "rules_sha256": "8e2fd5b92dd84aa94ef3310fcc7ca64933bf695f97dc9ef1e5c9dff0ddb7a62e"
+}

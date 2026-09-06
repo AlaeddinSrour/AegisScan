@@ -14,6 +14,7 @@ from typing import Callable
 import requests
 
 from .models import FindingDisposition, ReviewIssue, ReviewReport
+from .ai_budget import AIBudgetExceeded, RequestBudget, ensure_budget, timed_request
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +446,7 @@ def call_openrouter_with_failover(
     allow_data_collection: bool = False,
     allow_semantic_repair: bool = True,
     telemetry: dict[str, int] | None = None,
+    budget: RequestBudget | None = None,
 ) -> ReviewReport:
     """Call configured OpenRouter models without retaining prompt content locally."""
     if not api_key.strip():
@@ -464,6 +466,7 @@ def call_openrouter_with_failover(
         retry_delay = INITIAL_BACKOFF_SECONDS
         retry_instruction = ""
         for attempt in range(MAX_RETRIES):
+            ensure_budget(telemetry, budget)
             try:
                 _increment_telemetry(telemetry, "request_attempts")
                 _increment_telemetry(telemetry, f"{request_kind}_request_attempts")
@@ -472,42 +475,41 @@ def call_openrouter_with_failover(
                     f"{attempt + 1}/{MAX_RETRIES} · timeout {request_timeout}s · "
                     f"{candidate_count or 1} candidate(s)"
                 )
-                response = _post_with_deadline(
-                    deadline_seconds=request_timeout,
-                    url=OPENROUTER_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {api_key.strip()}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "https://github.com/AlaeddinSrour/AegisScan",
-                        "X-OpenRouter-Title": "AegisScan",
-                    },
-                    json={
-                        "model": model_name,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": prompt + retry_instruction,
-                            }
-                        ],
-                        "max_tokens": MAX_OUTPUT_TOKENS,
-                        "temperature": 0,
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "aegisscan_review_report",
-                                "strict": True,
-                                "schema": schema,
+                with timed_request(telemetry, "openrouter", budget):
+                    response = _post_with_deadline(
+                        deadline_seconds=request_timeout,
+                        url=OPENROUTER_API_URL,
+                        headers={
+                            "Authorization": f"Bearer {api_key.strip()}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://github.com/AlaeddinSrour/AegisScan",
+                            "X-OpenRouter-Title": "AegisScan",
+                        },
+                        json={
+                            "model": model_name,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": prompt + retry_instruction,
+                                }
+                            ],
+                            "max_tokens": MAX_OUTPUT_TOKENS,
+                            "temperature": 0,
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "aegisscan_review_report",
+                                    "strict": True,
+                                    "schema": schema,
+                                },
+                            },
+                            "provider": {
+                                "require_parameters": True,
+                                "data_collection": ("allow" if allow_data_collection else "deny"),
                             },
                         },
-                        "provider": {
-                            "require_parameters": True,
-                            "data_collection": (
-                                "allow" if allow_data_collection else "deny"
-                            ),
-                        },
-                    },
-                    timeout=(15, request_timeout),
-                )
+                        timeout=(15, request_timeout),
+                    )
                 if not response.ok:
                     raise OpenRouterRequestError(_response_error(response), response.status_code)
                 try:
@@ -549,6 +551,8 @@ def call_openrouter_with_failover(
                     + (f" via {routed_provider}" if routed_provider else "")
                 )
                 return report
+            except AIBudgetExceeded:
+                raise
             except Exception as exc:
                 if isinstance(exc, OpenRouterDeadlineExceeded):
                     _increment_telemetry(telemetry, "deadline_failures")
@@ -580,7 +584,7 @@ def call_openrouter_with_failover(
                         "skipping remaining attempts for this model"
                     )
                     break
-                if attempt < MAX_RETRIES - 1:
+                if attempt < MAX_RETRIES - 1 and (budget is None or budget.used < budget.limit):
                     if isinstance(exc, OpenRouterSemanticError):
                         notify(
                             "[AI] Retrying OpenRouter immediately after semantic validation failure"

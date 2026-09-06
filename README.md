@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/macOS-12%2B-111111" alt="macOS 12 or newer">
 </p>
 
-> **v0.4.4 beta** — suitable for evaluation and controlled security review. It is
+> **v0.4.5 beta** — suitable for evaluation and controlled security review. It is
 > not a replacement for penetration testing or human verification.
 
 <p align="center">
@@ -256,6 +256,7 @@ runtime coverage failures.
 | `AEGISSCAN_OPENROUTER_MAX_FINDINGS_PER_BATCH` | Provider request size before adaptive splitting | `3` |
 | `AEGISSCAN_GEMINI_MODELS` | Gemini failover order | `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash` |
 | `AEGISSCAN_AI_RETRIAGE_LIMIT` | Strict singleton recovery cap | `6` |
+| `AEGISSCAN_BATCH_REQUEST_LIMIT` | Total provider attempts per original batch, including fallback, splits, and re-triage | `6` |
 | `AEGISSCAN_SEMGREP_TIMEOUT` | Semgrep process timeout | `300` seconds |
 | `AEGISSCAN_OSV_TIMEOUT` | OSV-Scanner timeout | `300` seconds |
 | `AEGISSCAN_BETTERLEAKS_TIMEOUT` | Betterleaks timeout per mode | `300` seconds |

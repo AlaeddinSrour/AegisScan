@@ -36,6 +36,23 @@ QT_QPA_PLATFORM=offscreen python -m pytest \
 
 ## Pull requests
 
+To check repeated AI audits, export SARIF reports from the same clean repository
+revision, bundled rules, model, and settings, then run:
+
+```bash
+python scripts/compare_audits.py first.sarif second.sarif third.sarif \
+  --manifest benchmarks/juice-shop-v19.json
+```
+
+This checks exported statuses and locations alongside benchmark gates and flags
+configuration differences. It does not run AI requests. Audit `aiTelemetry`
+contains per-request transport milliseconds, provider, batch number, and phase
+(`initial`, `recovery`, or `refinement`). Durations exclude response validation
+and retry backoff; transport failure flags do not describe semantic validation.
+The shared batch request cap preserves unresolved candidates as Needs review;
+unrecovered batches still mark the audit incomplete. Raising the cap increases
+potential latency and cost. It is an attempt cap, not a whole-scan wall-clock deadline.
+
 - Add or update regression tests for behavior changes.
 - Preserve repository-boundary, disposition-ledger, and patch-safety guarantees.
 - Never commit credentials, private repositories, exported reports, build output,

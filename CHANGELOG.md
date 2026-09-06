@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.5 beta — 2026-09-06
+
+- Cap provider attempts across retries, fallback, split recovery, and refinement
+  per original batch; retain unresolved findings when the budget is exhausted.
+- Record content-free per-request transport timing with batch and phase metadata.
+- Add a repeated-SARIF comparison command for verdict, location, and benchmark consistency.
+- Compare severity and retain repeated fingerprints without depending on result order.
+
 ## 0.4.4 beta — 2026-09-06
 
 - Keep request-ID data-access findings anchored to the detector's lookup location
