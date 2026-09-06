@@ -8,8 +8,22 @@ about their security and privacy effects.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-dev.lock
 ```
+
+The `.txt` requirements are dependency inputs; the `.lock` files pin transitive
+versions and hashes for local builds and GitHub Actions. To intentionally update
+them with Python 3.11 or newer:
+
+```bash
+python -m pip install uv==0.12.10
+PYTHON_BIN=python ./scripts/lock_dependencies.sh --upgrade
+```
+
+Commit both locks together and rerun the quality gates. The universal resolver
+includes platform-specific dependencies; actual platform compatibility is checked
+by CI and release builds. The independent fixture benchmark exercises vulnerable
+and safe SQL, file-path, and network-request cases using the bundled rules.
 
 Run the quality gates before opening a pull request:
 

@@ -15,7 +15,7 @@ else
 fi
 
 "$python_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else "Python 3.11 or newer is required")'
-"$python_bin" -m pip install -r requirements-dev.txt
+"$python_bin" -m pip install --require-hashes -r requirements-dev.lock
 "$python_bin" -m PyInstaller --clean --noconfirm AegisScan.spec
 
 printf '%s\n' "Built $project_dir/dist/AegisScan.app"

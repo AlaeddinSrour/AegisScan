@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/macOS-12%2B-111111" alt="macOS 12 or newer">
 </p>
 
-> **v0.4.2 beta** — suitable for evaluation and controlled security review. It is
+> **v0.4.3 beta** — suitable for evaluation and controlled security review. It is
 > not a replacement for penetration testing or human verification.
 
 <p align="center">
@@ -108,12 +108,12 @@ git clone https://github.com/AlaeddinSrour/AegisScan.git
 cd AegisScan
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
 brew install osv-scanner betterleaks
 python -m src
 ```
 
-Semgrep is installed by `requirements.txt`. The desktop Scanner Readiness page
+Semgrep is installed by `requirements.lock`. The desktop Scanner Readiness page
 checks Semgrep, OSV-Scanner, Betterleaks, and the Gitleaks fallback before an
 audit.
 
@@ -140,6 +140,13 @@ python -m src.full_scan \
   --report aegisscan-report.json \
   --sarif aegisscan-results.sarif
 ```
+
+For CI, add `--fail-on high` to fail on confirmed runtime High/Critical issues.
+Add `--fail-on-needs-review` to also fail on unresolved runtime candidates,
+including detector-only results. The severity threshold defaults to `none` and
+accepts `info`, `warning`, `high`, or `critical`. Reports are saved before a policy
+failure. Exit codes are 0 for success, 1 for execution errors, 2 for an incomplete
+audit, and 3 for findings exceeding policy; incomplete audits take precedence.
 
 For contextual triage, configure Gemini or OpenRouter:
 
@@ -284,7 +291,7 @@ language syntax validation; unsupported formats fail closed.
 ## Build and contribute
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-dev.lock
 python -m compileall -q src aegisscan_app.py
 python -m ruff check src tests aegisscan_app.py
 QT_QPA_PLATFORM=offscreen python -m pytest \

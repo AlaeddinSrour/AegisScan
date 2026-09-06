@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "Independent source and sink regression cases",
+  "scope": {"include_rule_prefixes": ["aegisscan."]},
+  "expected": [
+    {"rule_id": "aegisscan.javascript.express-sequelize-taint-sqli", "path": "catalog.ts", "line": 4},
+    {"rule_id": "aegisscan.javascript.express-path-traversal", "path": "catalog.ts", "line": 14},
+    {"rule_id": "aegisscan.python.user-input-to-network-request", "path": "preview.py", "line": 7},
+    {"rule_id": "aegisscan.java.user-input-to-network-request", "path": "Preview.java", "line": 4}
+  ],
+  "gates": {
+    "min_recall": 1.0,
+    "min_precision": 1.0,
+    "max_unexpected": 0,
+    "max_unresolved": 0,
+    "max_duplicate_rate": 0.0,
+    "require_complete": true
+  }
+}

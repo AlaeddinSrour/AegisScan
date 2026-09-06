@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.3 beta — 2026-09-06
+
+- Use hashed transitive dependency locks for installation, macOS builds, and CI.
+- Add CLI severity and Needs review failure policies with exit code 3, preserving
+  exit code 2 for incomplete audits and writing reports before policy failures.
+- Add independent vulnerable/safe regression fixtures for SQL injection, path
+  traversal, and Python/Java network requests.
+
 ## 0.4.2 beta — 2026-09-05
 
 ### Benchmark reliability

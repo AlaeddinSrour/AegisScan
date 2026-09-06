@@ -3518,6 +3518,28 @@ def _write_report(outcome: ScanOutcome, output_path: str) -> None:
     write_json_report(outcome, output_path)
 
 
+def audit_exit_code(
+    outcome: ScanOutcome, *, fail_on: str = "none", fail_on_needs_review: bool = False,
+) -> int:
+    """Keep incomplete audits distinct from findings that exceed CI policy."""
+    ranks = {"info": 0, "warning": 1, "high": 2, "critical": 3}
+    if fail_on not in {"none", *ranks}:
+        raise ValueError(f"Unknown severity threshold: {fail_on}")
+    if outcome.audit_degraded:
+        return 2
+    if fail_on != "none" and any(
+        is_runtime_role(issue.code_role) and ranks[issue.severity.lower()] >= ranks[fail_on]
+        for issue in outcome.report.issues
+    ):
+        return 3
+    if fail_on_needs_review and any(
+        item.status == "NEEDS_REVIEW" and is_runtime_role(item.code_role)
+        for item in outcome.report.dispositions
+    ):
+        return 3
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run an AegisScan audit against an entire local repository."
@@ -3584,6 +3606,14 @@ def main() -> None:
     parser.add_argument("--base-branch", default="")
     parser.add_argument("--report", default="aegisscan-report.json")
     parser.add_argument(
+        "--fail-on", choices=("none", "info", "warning", "high", "critical"), default="none",
+        help="Exit 3 for confirmed runtime findings at or above this severity (default: none)",
+    )
+    parser.add_argument(
+        "--fail-on-needs-review", action="store_true",
+        help="Also exit 3 for runtime Needs review candidates, including detector-only results",
+    )
+    parser.add_argument(
         "--sarif",
         default="",
         help="Optional SARIF 2.1.0 output path for GitHub Code Scanning and CI tools",
@@ -3622,6 +3652,11 @@ def main() -> None:
                 args.report,
             )
             sys.exit(2)
+        if audit_exit_code(
+            outcome, fail_on=args.fail_on, fail_on_needs_review=args.fail_on_needs_review,
+        ) == 3:
+            logger.error("Audit findings exceeded the configured CI policy; reports were saved.")
+            sys.exit(3)
     except (RuntimeError, ValueError, OSError) as exc:
         logger.error("Full-repository audit failed: %s", exc)
         sys.exit(1)
