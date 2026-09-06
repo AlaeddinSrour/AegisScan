@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/macOS-12%2B-111111" alt="macOS 12 or newer">
 </p>
 
-> **v0.4.3 beta** — suitable for evaluation and controlled security review. It is
+> **v0.4.4 beta** — suitable for evaluation and controlled security review. It is
 > not a replacement for penetration testing or human verification.
 
 <p align="center">

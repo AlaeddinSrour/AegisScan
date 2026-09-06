@@ -1738,6 +1738,17 @@ def _anchor_issue_sink(
     candidate: SemgrepCandidate,
 ) -> tuple[str, int, str]:
     """Anchor model-proposed sinks to exact source or a family-specific call site."""
+    if candidate.rule_id == "aegisscan.javascript.express-id-to-data-access":
+        # This taint rule focuses the request-controlled ID at the data lookup.
+        # Keep that detector location even when AI quotes the input assignment
+        # or another lookup in the same file as its proposed sink.
+        evidence = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(issue.sink_file or issue.file)}:"
+            rf"{issue.sink_line or issue.line}(?!\d)",
+            f"{candidate.file}:{candidate.line}",
+            issue.sink_evidence,
+        )
+        return candidate.file, candidate.line, evidence
     sink_file = issue.sink_file or issue.file
     proposed_line = issue.sink_line or issue.line
     try:

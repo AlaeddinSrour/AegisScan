@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.4 beta — 2026-09-06
+
+- Keep request-ID data-access findings anchored to the detector's lookup location
+  when AI triage proposes the input assignment or another nearby lookup.
+
 ## 0.4.3 beta — 2026-09-06
 
 - Use hashed transitive dependency locks for installation, macOS builds, and CI.
