@@ -43,7 +43,7 @@ def test_comparison_preserves_severity_and_duplicate_fingerprints(tmp_path, chan
     if change == "level":
         run["results"][0]["level"] = "warning"
     elif change == "score":
-        run["tool"]["driver"]["rules"][0]["properties"]["security-severity"] = "9.5"
+        run["results"][0]["properties"]["security-severity"] = "9.5"
     else:
         duplicate = deepcopy(run["results"][0])
         if change == "duplicate_verdict":

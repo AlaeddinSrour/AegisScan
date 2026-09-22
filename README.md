@@ -206,6 +206,14 @@ python scripts/evaluate_security_benchmark.py \
   --output benchmark-metrics.json
 ```
 
+The original Juice Shop v19 contract records the historical expected verdicts.
+The revised `benchmarks/juice-shop-triage-v2.json` contract preserves those
+reports and treats the two guarded path-traversal candidates as Needs review
+pending broader HTTP and deployment testing. The handler-level evidence and
+limitations are recorded in
+`benchmarks/reviews/juice-shop-path-traversal.md`, with the reproducible trace
+in `benchmarks/reviews/juice-shop-path-traversal-results.json`.
+
 These are regression baselines for versioned detector behavior—not claims that
 AegisScan discovers every vulnerability in each training application.
 
@@ -311,6 +319,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## Limitations
+
+Locally proven findings use the severity assigned by their versioned local
+validator; AI prose cannot override it. Other AI-triaged findings can still vary
+between runs. SARIF scores (Critical 9.5, High 8.0, Warning 5.0, Info 2.0) are
+category mappings, not calculated CVSS vectors.
 
 - Static analysis cannot prove complete runtime exploitability or replace manual
   review, dynamic testing, penetration testing, and production monitoring.

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- Add a versioned Juice Shop triage contract for the guarded path-traversal
+  adjudication, preserving the original v19 contract and its historical reports.
+- Add a reproducible handler-level traversal harness and record its limits,
+  source hashes, cache behavior, malformed-input errors, and positive controls.
+
+- Run local evidence validation after failed AI batches and request-budget
+  exhaustion; retain proven findings while keeping unresolved peers marked as
+  Needs review and the audit degraded.
+
+- Locally confirm direct request interpolation into raw Sequelize SQL, including
+  model/plain result options, when provider evidence is incomplete. Escaping
+  calls, parameterized queries, and unknown options remain outside this check.
+
+- Anchor bundled Express path-traversal findings to their detector file and
+  operation before consolidation, preserving independent filesystem sinks when
+  AI proposes a similar operation elsewhere.
+
+- Keep locally validated severity for deterministically proven findings even when
+  AI triage proposes a different severity for the same evidence.
+- Export security severity on each SARIF result so findings sharing a rule do
+  not inherit another finding's score.
+
 ## 0.4.5 beta — 2026-09-06
 
 - Cap provider attempts across retries, fallback, split recovery, and refinement

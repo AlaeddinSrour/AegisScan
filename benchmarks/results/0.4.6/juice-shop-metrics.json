@@ -1,0 +1,28 @@
+{
+  "benchmark": "OWASP Juice Shop pinned triage contract v2 — guarded traversal adjudication",
+  "manifest": "benchmarks/juice-shop-triage-v2.json",
+  "manifest_sha256": "eaa1fad16a9d4b455c9adc6479c44e99d939df98adff7502cfec1167d0a8d2d3",
+  "report_sha256": "39ec9a5e0e27f1337052376f00f5e2792f33426e2cc951f206b60bd39581791b",
+  "repository_commit": "5658473cf8814459bf89000ce373b20ed0b4eb37",
+  "passed": true,
+  "metrics": {
+    "expected": 12,
+    "matched": 12,
+    "actual_scoped": 12,
+    "unique_scoped": 12,
+    "recall": 1.0,
+    "precision": 1.0,
+    "unresolved": 3,
+    "unexpected": 0,
+    "forbidden": 0,
+    "duplicate_count": 0,
+    "duplicate_rate": 0.0,
+    "execution_successful": true,
+    "repository_dirty": false,
+    "runtime_scan_gaps": 0,
+    "duration_seconds": 677.0,
+    "provider_request_attempts": 14,
+    "provider_failures": 1,
+    "provider_cost_usd": 0.013132
+  }
+}

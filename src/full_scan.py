@@ -1483,7 +1483,7 @@ def _deterministic_sequelize_template_issue(
 ) -> ReviewIssue | None:
     """Confirm a narrow adjacent request-to-SQL interpolation flow.
 
-    Only direct request assignment and an optional length cap are understood.
+    Direct request interpolation, or assignment and an optional length cap, are understood.
     Any intervening escaping, reassignment, binding options, or more complex
     expression stays with normal evidence-gated triage.
     """
@@ -1496,11 +1496,34 @@ def _deterministic_sequelize_template_issue(
         return None
     sink = lines[candidate.line - 1].strip()
     query = re.fullmatch(
-        r"(?:[A-Za-z_$][\w$]*\.)*sequelize\.query\(`(?P<sql>[^`]+)`\)\s*;?\s*(?://.*)?", sink
+        r"(?:[A-Za-z_$][\w$]*\.)*sequelize\.query\(`(?P<sql>[^`]+)`"
+        r"(?:,\s*\{\s*model:\s*[A-Za-z_$][\w$]*,\s*plain:\s*(?:true|false)\s*\})?"
+        r"\)\s*;?\s*(?://.*)?", sink
     )
     if not query or not re.match(r"(?:SELECT|UPDATE|DELETE|INSERT)\b", query['sql'], re.I):
         return None
     variables = re.findall(r"\$\{([^}]+)\}", query['sql'])
+    # One unescaped request expression is sufficient even when other values are
+    # hashed. Only allow the understood model/plain options above; arbitrary
+    # options, tagged templates, escaping calls, and nested templates fail closed.
+    direct_sources = [expression for expression in variables if re.fullmatch(
+        r"[A-Za-z_$][\w$]*\.(?:body|query|params)\.[A-Za-z_$][\w$]*"
+        r"(?:\s*(?:\|\||\?\?)\s*(?:''|\"\"))?", expression.strip()
+    )]
+    if direct_sources and "\\" not in query['sql']:
+        location = f"{candidate.file}:{candidate.line}"
+        return ReviewIssue(
+            file=candidate.file, line=candidate.line,
+            sink_file=candidate.file, sink_line=candidate.line,
+            severity="HIGH", issue_name="SQL Injection",
+            description="Request input is directly interpolated into raw Sequelize SQL without parameter binding.",
+            original_code="", suggested_fix="", finding_id=candidate.finding_id,
+            rule_id=candidate.rule_id, confidence="HIGH", code_role=candidate.code_role,
+            source_evidence=f"{direct_sources[0]} supplies raw request input at {location}.",
+            sink_evidence=f"sequelize.query interpolates that request expression into SQL at {location}.",
+            reachability_evidence="The bundled taint rule and local query expression establish direct request-to-SQL flow; model/plain options do not bind parameters.",
+            remediation_type="MANUAL_REQUIRED",
+        )
     if not variables or len(set(variables)) != 1 or not re.fullmatch(r"[A-Za-z_$][\w$]*", variables[0]):
         return None
     variable = re.escape(variables[0])
@@ -1752,6 +1775,18 @@ def _anchor_issue_sink(
         return candidate.file, candidate.line, evidence
     sink_file = issue.sink_file or issue.file
     proposed_line = issue.sink_line or issue.line
+    if candidate.rule_id == "aegisscan.javascript.express-path-traversal":
+        # The bundled taint rule already locates the filesystem path sink.
+        # Related context may contain similar operations in independent routes;
+        # provider-selected files and offsets must not replace this identity.
+        issue = issue.model_copy(update={
+            "sink_evidence": re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(sink_file)}:{proposed_line}(?!\d)",
+                f"{candidate.file}:{candidate.line}", issue.sink_evidence,
+            )
+        })
+        sink_file = candidate.file
+        proposed_line = candidate.line
     try:
         lines = (repo_path / sink_file).read_text(
             encoding="utf-8", errors="replace"
@@ -2058,6 +2093,14 @@ def _reconcile_batch_report(
                 "sink_file": sink_file,
                 "sink_line": sink_line,
                 "description": grounded_description,
+                # Locally proven findings retain the local validator's severity
+                # across provider retries and model changes. Prose is not proof
+                # of additional impact that warrants a severity override.
+                "severity": (
+                    deterministic_issues[candidate.finding_id].severity
+                    if candidate.finding_id in deterministic_issues
+                    else normalized_issue.severity
+                ),
                 "remediation_type": remediation_type,
             }
         )
@@ -3276,6 +3319,28 @@ def run_full_scan(
             else:
                 unrecovered.append((triage_batch.findings[0], initial_reason))
 
+            # Provider failure must not bypass the same local proof used for
+            # successful responses. Retain unresolved candidates as failures;
+            # only locally confirmed candidates can leave that set.
+            if unrecovered:
+                local_batch = FindingBatch(
+                    findings=[candidate for candidate, _ in unrecovered],
+                    files={candidate.file for candidate, _ in unrecovered},
+                )
+                local_report = _reconcile_batch_report(
+                    ReviewReport(analysis_scratchpad="Local validation after provider failure", issues=[]),
+                    local_batch, root,
+                )
+                proven_ids = {issue.finding_id for issue in local_report.issues}
+                if proven_ids:
+                    local_report.dispositions = [
+                        item for item in local_report.dispositions if item.finding_id in proven_ids
+                    ]
+                    recovered_reports.append(local_report)
+                    unrecovered = [(candidate, reason) for candidate, reason in unrecovered
+                                   if candidate.finding_id not in proven_ids]
+                    notify(f"[RECOVER] Local evidence confirmed {len(proven_ids)} finding(s) after provider failure")
+
             if recovered_reports:
                 recovered_reports[0].dispositions.extend(deterministic_dispositions)
                 reports.extend((index, item) for item in recovered_reports)
@@ -3350,7 +3415,7 @@ def run_full_scan(
     if attempted_ai_batches and not successful_ai_batches:
         notify(
             "[WARNING] AI triage is unavailable. The audit will finish in degraded "
-            "mode and every untriaged runtime candidate will remain in Needs review."
+            "mode; runtime candidates without local proof will remain in Needs review."
         )
 
     merged = redact_review_report(_normalize_manual_remediations(_merge_reports(reports, root)))

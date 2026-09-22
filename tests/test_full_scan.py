@@ -1882,7 +1882,8 @@ def test_destination_policy_prevents_deterministic_ssrf_confirmation(tmp_path):
     assert outcome.report.dispositions[0].status == "NEEDS_REVIEW"
 
 
-def test_bypassable_redirect_guard_overrides_invalid_model_duplicate(tmp_path):
+@pytest.mark.parametrize("provider_severity", [None, "CRITICAL", "HIGH", "WARNING", "INFO"])
+def test_bypassable_redirect_guard_overrides_invalid_model_duplicate(tmp_path, provider_severity):
     route = tmp_path / "routes" / "redirect.ts"
     policy = tmp_path / "lib" / "insecurity.ts"
     route.parent.mkdir(parents=True)
@@ -1931,6 +1932,19 @@ def test_bypassable_redirect_guard_overrides_invalid_model_duplicate(tmp_path):
         ],
     )
 
+    if provider_severity is not None:
+        from src.full_scan import _deterministic_runtime_issue
+
+        local_issue = _deterministic_runtime_issue(
+            tmp_path, batch_findings([finding])[0].findings[0]
+        )
+        assert local_issue is not None
+        invalid_duplicate = ReviewReport(
+            analysis_scratchpad="Provider severity variation for identical source evidence.",
+            issues=[local_issue.model_copy(update={"severity": provider_severity})],
+            dispositions=[],
+        )
+
     with patch("src.full_scan.run_semgrep_scan", return_value=finding):
         with patch(
             "src.full_scan.call_gemini_with_failover",
@@ -1941,6 +1955,7 @@ def test_bypassable_redirect_guard_overrides_invalid_model_duplicate(tmp_path):
     assert len(outcome.report.issues) == 1
     issue = outcome.report.issues[0]
     assert issue.issue_name == "Open Redirect"
+    assert issue.severity == "HIGH"
     assert "includes()" in issue.reachability_evidence
     assert outcome.report.dispositions[0].status == "CONFIRMED"
     assert outcome.report.dispositions[0].confidence == "HIGH"
@@ -2568,3 +2583,107 @@ def test_deterministic_sql_requires_proven_adjacent_unescaped_flow(tmp_path, mid
     assert (issue is not None) == confirmed
     if issue:
         assert issue.remediation_type == 'MANUAL_REQUIRED'
+
+
+@pytest.mark.parametrize("other_file", [True, False])
+def test_path_traversal_provider_cannot_merge_distinct_detector_sinks(tmp_path, other_file):
+    first_path = "routes/first.ts"
+    second_path = "routes/second.ts" if other_file else first_path
+    (tmp_path / "routes").mkdir()
+    code = "const path = req.query.path\nfs.readFileSync(path)\n\nfs.readFileSync(path)\n"
+    (tmp_path / first_path).write_text(code)
+    (tmp_path / second_path).write_text(code)
+    findings = [
+        _finding(1, first_path, 2).replace("test.rule", "aegisscan.javascript.express-path-traversal"),
+        _finding(2, second_path, 4).replace("test.rule", "aegisscan.javascript.express-path-traversal"),
+    ]
+    candidates = batch_findings(findings)[0].findings
+    issues = [ReviewIssue(
+        file=candidate.file, line=candidate.line,
+        sink_file=second_path, sink_line=4,
+        severity="HIGH", issue_name="Path Traversal",
+        description="Request input reaches a file read.",
+        original_code="fs.readFileSync(path)", suggested_fix="",
+        finding_id=candidate.finding_id, confidence="HIGH",
+        source_evidence="req.query.path controls path",
+        sink_evidence=f"fs.readFileSync(path) at {second_path}:4",
+        reachability_evidence="The request handler reads the requested path.",
+        remediation_type="MANUAL_REQUIRED",
+    ) for candidate in candidates]
+    report = ReviewReport(analysis_scratchpad="Two independent file reads.", issues=issues)
+    with patch("src.full_scan.run_semgrep_scan", return_value="\n\n".join(findings)):
+        with patch("src.full_scan.call_gemini_with_failover", return_value=report):
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+    assert {(issue.file, issue.line) for issue in outcome.report.issues} == {
+        (first_path, 2), (second_path, 4),
+    }
+    assert outcome.disposition_count("CONFIRMED") == 2
+    assert outcome.disposition_count("DUPLICATE") == 0
+
+
+@pytest.mark.parametrize("query,confirmed", [
+    ("db.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${hash(req.body.password)}'`, { model: User, plain: true })", True),
+    ("db.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email}'`)", True),
+    ("db.sequelize.query(`SELECT * FROM Users WHERE email = ${escape(req.body.email)}`)", False),
+    ('db.sequelize.query("SELECT * FROM Users WHERE email = ?", { replacements: [req.body.email] })', False),
+    ("db.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email}'`, options)", False),
+    ("db.sequelize.query(`SELECT * FROM Users WHERE email = '\\${req.body.email}'`)", False),
+])
+def test_direct_request_sql_local_proof(tmp_path, query, confirmed):
+    from src.full_scan import SemgrepCandidate, _deterministic_sequelize_template_issue
+    (tmp_path / "auth.ts").write_text(query + "\n")
+    candidate = SemgrepCandidate(
+        finding_id="SG-auth", rule_id="aegisscan.javascript.express-sequelize-taint-sqli",
+        file="auth.ts", line=1, message="SQL injection", code_role="RUNTIME", raw_text="",
+    )
+    issue = _deterministic_sequelize_template_issue(tmp_path, candidate)
+    assert (issue is not None) == confirmed
+
+
+def test_direct_login_sql_survives_incomplete_ai_evidence(tmp_path):
+    query = "models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}'`, { model: UserModel, plain: true })"
+    (tmp_path / "auth.ts").write_text(query + "\n")
+    finding = _finding(1, "auth.ts", 1).replace(
+        "test.rule", "aegisscan.javascript.express-sequelize-taint-sqli",
+    )
+    report = ReviewReport(analysis_scratchpad="Incomplete provider response", issues=[])
+    with patch("src.full_scan.run_semgrep_scan", return_value=finding):
+        with patch("src.full_scan.call_gemini_with_failover", return_value=report):
+            outcome = run_full_scan(str(tmp_path), "", client=MagicMock())
+    assert len(outcome.report.issues) == 1
+    assert outcome.report.issues[0].severity == "HIGH"
+    assert outcome.disposition_count("CONFIRMED") == 1
+
+
+@pytest.mark.parametrize('budget_exhausted', [False, True])
+@pytest.mark.parametrize('with_peer', [False, True])
+def test_local_sql_proof_survives_provider_failure_with_unresolved_peer(tmp_path, budget_exhausted, with_peer):
+    from src.ai_budget import AIBudgetExceeded
+    (tmp_path / 'auth.ts').write_text(
+        "models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email}'`)\n"
+    )
+    (tmp_path / 'other.ts').write_text('unknownOperation(input)\n')
+    findings = [
+        _finding(1, 'auth.ts', 1).replace('test.rule', 'aegisscan.javascript.express-sequelize-taint-sqli'),
+        _finding(2, 'other.ts', 1),
+    ]
+
+    if not with_peer:
+        findings = findings[:1]
+
+    def fail(*args, **kwargs):
+        if budget_exhausted:
+            kwargs['budget'].used = kwargs['budget'].limit
+            raise AIBudgetExceeded('AI batch request limit reached')
+        raise RuntimeError('provider unavailable')
+
+    with patch('src.full_scan.run_semgrep_scan', return_value='\n\n'.join(findings)):
+        with patch('src.full_scan._call_ai_provider_chain', side_effect=fail):
+            outcome = run_full_scan(str(tmp_path), '', client=MagicMock())
+    assert [(issue.file, issue.line, issue.severity) for issue in outcome.report.issues] == [
+        ('auth.ts', 1, 'HIGH')]
+    assert outcome.disposition_count('CONFIRMED') == 1
+    assert outcome.disposition_count('NEEDS_REVIEW') == int(with_peer)
+    assert bool(outcome.failed_batches) == with_peer
+    assert outcome.ai_triage_degraded == with_peer
+    assert 'auth.ts' not in [d.file for d in outcome.report.dispositions if d.status == 'NEEDS_REVIEW']

@@ -1,0 +1,1435 @@
+{
+  "repository": "/Users/alaasrour/playground/juice-shop",
+  "commit": "5658473cf8814459bf89000ce373b20ed0b4eb37",
+  "node_version": "v26.7.0",
+  "generated_at": "2026-09-18T10:37:41.878Z",
+  "source_sha256": {
+    "routes/vulnCodeFixes.ts": "ccba56128112fadf0644832fa3f1d855336fca049dba1094aebd8c5af8636267",
+    "routes/vulnCodeSnippet.ts": "1521983d9a9e6e6f967b8bf7df2c655e7af0aed9976abfe464d3244c6b3e265c",
+    "lib/codingChallenges.ts": "16c23198570f038e077ae4169e5cd7253cb84dd175d6b96b054e4e1d438382a0"
+  },
+  "harness_sha256": "9b2b7986d038e33e7ba7dd590f76065c8c15dc12f983ea7b43bc2ae2c4bd7937",
+  "test": "original handlers with mocked collaborators and traced real filesystem APIs",
+  "limitations": [
+    "Handler-level tests, not HTTP or production deployment tests.",
+    "Original challenge-map builder runs before requests; map is initialized for all test requests.",
+    "YAML parser, accuracy, challenge side effects, logger, error formatter, and HTTP response are stubbed.",
+    "No symlink mutation, filesystem races, global prototype pollution, or hostile repository source changes are simulated."
+  ],
+  "challenge_keys": [
+    "accessLogDisclosureChallenge",
+    "adminSectionChallenge",
+    "changeProductChallenge",
+    "chatbotGreedyInjectionChallenge",
+    "chatbotPromptInjectionChallenge",
+    "dbSchemaChallenge",
+    "directoryListingChallenge",
+    "exposedMetricsChallenge",
+    "forgedReviewChallenge",
+    "iacLeakedKeyChallenge",
+    "localXssChallenge",
+    "loginAdminChallenge",
+    "loginBenderChallenge",
+    "loginJimChallenge",
+    "nftMintChallenge",
+    "nftUnlockChallenge",
+    "noSqlReviewsChallenge",
+    "redirectChallenge",
+    "redirectCryptoCurrencyChallenge",
+    "registerAdminChallenge",
+    "resetPasswordBenderChallenge",
+    "resetPasswordBjoernChallenge",
+    "resetPasswordBjoernOwaspChallenge",
+    "resetPasswordJimChallenge",
+    "resetPasswordMortyChallenge",
+    "resetPasswordUvoginChallenge",
+    "restfulXssChallenge",
+    "scoreBoardChallenge",
+    "tokenSaleChallenge",
+    "unionSqlInjectionChallenge",
+    "vulnerableDockerImageChallenge",
+    "weakPasswordChallenge",
+    "web3SandboxChallenge",
+    "web3WalletChallenge",
+    "xssBonusChallenge"
+  ],
+  "inputs": [
+    {
+      "phase": "first-pass",
+      "key": "loginAdminChallenge",
+      "fix": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false,
+          "explanation": "ok"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ],
+          [
+            "readFileSync",
+            "data/static/codefixes/loginAdminChallenge_1.ts"
+          ],
+          [
+            "readFileSync",
+            "data/static/codefixes/loginAdminChallenge_2.ts"
+          ],
+          [
+            "readFileSync",
+            "data/static/codefixes/loginAdminChallenge_3.ts"
+          ],
+          [
+            "readFileSync",
+            "data/static/codefixes/loginAdminChallenge_4_correct.ts"
+          ],
+          [
+            "existsSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFileSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false
+        },
+        "calls": [
+          [
+            "stat",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFile",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "../../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "..\\outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ..\\outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "%2e%2e%2foutside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: %2e%2e%2foutside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "%252e%252e%252foutside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: %252e%252e%252foutside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "../outside\u0000",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../outside\u0000"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "loginAdminChallenge/../../../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge/../../../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "loginAdminChallenge\\..\\..\\outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge\\..\\..\\outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "/tmp/outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: /tmp/outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "..//outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ..//outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "./../../../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ./../../../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "__proto__",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: __proto__"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "constructor",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: constructor"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "toString",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: toString"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "hasOwnProperty",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: hasOwnProperty"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "valueOf",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: valueOf"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "prototype",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: prototype"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": null,
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: null"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": [],
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: "
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": {},
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: [object Object]"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": 0,
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: 0"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": true,
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: true"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": [
+        "loginAdminChallenge"
+      ],
+      "fix": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false,
+          "explanation": "ok"
+        },
+        "calls": [
+          [
+            "existsSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFileSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": [
+        "loginAdminChallenge",
+        "../outside"
+      ],
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": [
+          [
+            "readdirSync",
+            "data/static/codefixes"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge,../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": [
+        "../outside"
+      ],
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": {
+        "toString": "../outside"
+      },
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "TypeError: Cannot convert object to primitive value"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "first-pass",
+      "key": "loginAdminChallenge",
+      "fix": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false,
+          "explanation": "ok"
+        },
+        "calls": [
+          [
+            "existsSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFileSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false
+        },
+        "calls": [
+          [
+            "stat",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFile",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "loginAdminChallenge",
+      "fix": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false,
+          "explanation": "ok"
+        },
+        "calls": [
+          [
+            "existsSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFileSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false
+        },
+        "calls": [
+          [
+            "stat",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFile",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "../../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "..\\outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ..\\outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "%2e%2e%2foutside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: %2e%2e%2foutside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "%252e%252e%252foutside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: %252e%252e%252foutside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "../outside\u0000",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../outside\u0000"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "loginAdminChallenge/../../../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge/../../../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "loginAdminChallenge\\..\\..\\outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge\\..\\..\\outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "/tmp/outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: /tmp/outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "..//outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ..//outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "./../../../outside",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ./../../../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "__proto__",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: __proto__"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "constructor",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: constructor"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "toString",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: toString"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "hasOwnProperty",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: hasOwnProperty"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "valueOf",
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: valueOf"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "prototype",
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: prototype"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": null,
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: null"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": [],
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: "
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": {},
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: [object Object]"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": 0,
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: 0"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": true,
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: true"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": [
+        "loginAdminChallenge"
+      ],
+      "fix": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false,
+          "explanation": "ok"
+        },
+        "calls": [
+          [
+            "existsSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFileSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": [
+        "loginAdminChallenge",
+        "../outside"
+      ],
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: loginAdminChallenge,../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": [
+        "../outside"
+      ],
+      "fix": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "error": "No fixes found for the snippet!"
+        },
+        "calls": []
+      },
+      "snippet": {
+        "status": 404,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "No code challenge for challenge key: ../outside"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": {
+        "toString": "../outside"
+      },
+      "fix": {
+        "status": null,
+        "error": "TypeError",
+        "calls": []
+      },
+      "snippet": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "status": "error",
+          "error": "TypeError: Cannot convert object to primitive value"
+        },
+        "calls": []
+      }
+    },
+    {
+      "phase": "cached-repeat",
+      "key": "loginAdminChallenge",
+      "fix": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false,
+          "explanation": "ok"
+        },
+        "calls": [
+          [
+            "existsSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFileSync",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      },
+      "snippet": {
+        "status": 200,
+        "error": null,
+        "body": {
+          "verdict": false
+        },
+        "calls": [
+          [
+            "stat",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ],
+          [
+            "readFile",
+            "./data/static/codefixes/loginAdminChallenge.info.yml"
+          ]
+        ]
+      }
+    }
+  ],
+  "controls": {
+    "vulnerable_escape_detected": true,
+    "guarded_escape_blocked": true,
+    "guarded_valid_read_passed": true,
+    "positive_control_calls": [
+      [
+        "readFileSync",
+        "/var/folders/jw/wflv7n9n7lvcz4lq66_b8dx80000gn/T/aegisscan-path-control-hhvWDi/outside.info.yml"
+      ]
+    ]
+  },
+  "summary": {
+    "handler_invocations": 112,
+    "fix_handler_exceptions": 12,
+    "outside_handler_reads": 0
+  },
+  "conclusion": "No tested input reached a filesystem read outside the intended directory."
+}

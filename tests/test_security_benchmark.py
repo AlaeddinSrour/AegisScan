@@ -48,6 +48,28 @@ def test_benchmark_measures_recall_precision_duplicates_and_unresolved():
     assert report["unexpected"][0]["rule_id"] == "aegisscan.java.extra"
 
 
+def test_juice_shop_v2_contract_preserves_guarded_traversal_uncertainty():
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "benchmarks/juice-shop-triage-v2.json").read_text()
+    )
+    expected = {
+        (item["rule_id"], item["path"], item["line"]): item["status"]
+        for item in manifest["expected"]
+    }
+    assert expected[(
+        "aegisscan.javascript.express-path-traversal",
+        "routes/vulnCodeFixes.ts",
+        81,
+    )] == "NEEDS_REVIEW"
+    assert expected[(
+        "aegisscan.javascript.express-path-traversal",
+        "routes/vulnCodeSnippet.ts",
+        90,
+    )] == "NEEDS_REVIEW"
+    assert manifest["supersedes"] == "juice-shop-v19.json"
+    assert manifest["gates"]["max_unresolved"] == 3
+
+
 def test_sarif_completeness_requires_success_without_runtime_gaps():
     payload = {
         "version": "2.1.0",

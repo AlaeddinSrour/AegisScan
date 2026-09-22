@@ -327,6 +327,7 @@ def build_sarif_payload(
             "partialFingerprints": {"aegisscanFindingId": issue.finding_id or rule_id},
             "properties": {
                 "status": "CONFIRMED",
+                "security-severity": security_severity,
                 "confidence": issue.confidence,
                 "codeRole": issue.code_role,
                 "remediationType": issue.remediation_type,

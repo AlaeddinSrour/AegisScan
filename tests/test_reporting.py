@@ -477,3 +477,20 @@ def test_private_key_export_preserves_declaration_anchor():
     result = build_sarif_payload(outcome)['runs'][0]['results'][0]
     assert result['locations'][0]['physicalLocation']['region']['startLine'] == 21
     assert result['relatedLocations'][0]['physicalLocation']['region']['startLine'] == 54
+
+
+def test_sarif_scores_are_per_result_for_shared_rule():
+    outcome = _outcome()
+    original = outcome.report.issues[0]
+    outcome.report.issues.append(original.model_copy(update={
+        "finding_id": "SG-second", "line": 25, "sink_line": 25, "severity": "CRITICAL",
+    }))
+    for issues in (list(outcome.report.issues), list(reversed(outcome.report.issues))):
+        outcome.report.issues = issues
+        results = build_sarif_payload(outcome)["runs"][0]["results"]
+        scores = {
+            result["partialFingerprints"]["aegisscanFindingId"]:
+                result["properties"]["security-severity"]
+            for result in results if result["properties"]["status"] == "CONFIRMED"
+        }
+        assert scores == {"SG-confirmed": "8.0", "SG-second": "9.5"}
