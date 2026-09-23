@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.6 beta — 2026-09-23
+
 - Add a versioned Juice Shop triage contract for the guarded path-traversal
   adjudication, preserving the original v19 contract and its historical reports.
 - Add a reproducible handler-level traversal harness and record its limits,
